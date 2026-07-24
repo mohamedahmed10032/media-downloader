@@ -1,0 +1,105 @@
+<resources>
+    <string name="app_name">Media Downloader</string>
+    <string name="developer_name">Mohamed El-Meligy</string>
+    <string name="built_by">Built by Mohamed El-Meligy</string>
+    <string name="about_developer">About the Developer</string>
+    <string name="developer_credit">Designed &amp; developed by Mohamed El-Meligy</string>
+
+    <!-- Navigation -->
+    <string name="nav_home">Home</string>
+    <string name="nav_browser">Browser</string>
+    <string name="nav_downloads">Downloads</string>
+    <string name="nav_library">Library</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Home -->
+    <string name="home_title">Media Downloader</string>
+    <string name="home_paste_hint">Paste a media link here</string>
+    <string name="home_detect">Detect &amp; Download</string>
+    <string name="home_paste_from_clipboard">Paste from clipboard</string>
+    <string name="home_open_browser">Open in-app browser</string>
+    <string name="home_recent">Recent downloads</string>
+
+    <!-- Browser -->
+    <string name="browser_search_hint">Search or type a URL</string>
+    <string name="browser_new_tab">New tab</string>
+    <string name="browser_tabs">Tabs</string>
+    <string name="browser_bookmarks">Bookmarks</string>
+    <string name="browser_add_bookmark">Add bookmark</string>
+    <string name="browser_download_found">Media found on this page</string>
+    <string name="browser_download">Download</string>
+
+    <!-- Quality selection -->
+    <string name="quality_title">Choose format</string>
+    <string name="quality_video">Video</string>
+    <string name="quality_audio">Audio only</string>
+    <string name="quality_image">Images</string>
+    <string name="quality_download">Start download</string>
+    <string name="quality_estimated_size">~%1$s</string>
+    <string name="quality_unknown_size">Size unknown</string>
+
+    <!-- Downloads -->
+    <string name="downloads_title">Downloads</string>
+    <string name="downloads_empty">No downloads yet</string>
+    <string name="downloads_pause">Pause</string>
+    <string name="downloads_resume">Resume</string>
+    <string name="downloads_cancel">Cancel</string>
+    <string name="downloads_retry">Retry</string>
+    <string name="downloads_clear_completed">Clear completed</string>
+
+    <!-- Library -->
+    <string name="library_title">Library</string>
+    <string name="library_videos">Videos</string>
+    <string name="library_audio">Audio</string>
+    <string name="library_images">Images</string>
+    <string name="library_empty">Nothing here yet</string>
+    <string name="action_play">Play</string>
+    <string name="action_share">Share</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_open_with">Open with</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_default_quality">Default video quality</string>
+    <string name="settings_default_audio_bitrate">Default audio bitrate</string>
+    <string name="settings_save_location">Save location</string>
+    <string name="settings_max_concurrent">Max concurrent downloads</string>
+    <string name="settings_retry_count">Auto-retry attempts</string>
+    <string name="settings_theme">Theme</string>
+    <string name="settings_theme_system">Follow system</string>
+    <string name="settings_theme_dark">Dark</string>
+    <string name="settings_theme_light">Light</string>
+    <string name="settings_clear_cache">Clear cache</string>
+    <string name="settings_legal">Legal &amp; disclaimer</string>
+
+    <!-- Permissions -->
+    <string name="perm_notifications_title">Allow notifications</string>
+    <string name="perm_notifications_rationale">Media Downloader shows download progress, speed and completion in a notification. Please allow notifications so you can track downloads while the app is in the background.</string>
+    <string name="perm_storage_title">Allow storage access</string>
+    <string name="perm_storage_rationale">Storage access is needed to save downloaded files to your device on this Android version.</string>
+    <string name="perm_grant">Grant</string>
+    <string name="perm_not_now">Not now</string>
+    <string name="perm_combined_title">Permissions needed</string>
+    <string name="perm_combined_rationale">Media Downloader needs storage access to save your downloads and notification access to show download progress. Please grant these to continue.</string>
+
+    <!-- Errors -->
+    <string name="error_no_internet">No internet connection. Check your network and try again.</string>
+    <string name="error_invalid_link">That link doesn\'t look valid. Please check it and try again.</string>
+    <string name="error_no_media_found">No downloadable media was found at this link.</string>
+    <string name="error_unsupported_site">This source isn\'t supported yet. You can still paste a direct media link.</string>
+    <string name="error_geo_blocked">This content appears to be unavailable in your region.</string>
+    <string name="error_expired_link">This link has expired. Please refresh the source and try again.</string>
+    <string name="error_insufficient_storage">Not enough free storage to complete this download.</string>
+    <string name="error_generic">Something went wrong. Please try again.</string>
+
+    <!-- Notifications -->
+    <string name="notif_channel_downloads">Downloads</string>
+    <string name="notif_channel_downloads_desc">Shows active and completed download progress.</string>
+    <string name="notif_downloading">Downloading</string>
+    <string name="notif_download_complete">Download complete</string>
+    <string name="notif_download_failed">Download failed</string>
+
+    <!-- Legal -->
+    <string name="disclaimer_body">This app is a general-purpose download manager and web browser. Only download content you own or have the right to download. You are solely responsible for complying with the terms of service of any website or platform you access, and with all applicable copyright laws. This app does not bypass digital rights management (DRM) or platform access controls.</string>
+</resources>

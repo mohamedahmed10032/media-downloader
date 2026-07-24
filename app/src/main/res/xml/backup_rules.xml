@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Do not back up the encrypted preferences keystore material or the WIP cache. -->
+    <exclude domain="sharedpref" path="secure_settings.xml" />
+    <exclude domain="file" path="datastore/" />
+</full-backup-content>
