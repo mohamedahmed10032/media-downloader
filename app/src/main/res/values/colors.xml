@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Cold-start window background (branded dark splash) -->
+    <color name="splash_background">#0E1117</color>
+    <color name="ic_launcher_background">#6D5DF6</color>
+    <color name="brand_primary">#6D5DF6</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+</resources>
