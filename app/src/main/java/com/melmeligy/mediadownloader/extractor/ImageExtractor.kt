@@ -24,19 +24,20 @@ class ImageExtractor @Inject constructor(
 
     override suspend fun extract(url: String): ResolvedMedia? {
         val ext = UrlUtils.fileExtension(url)
-        val info = http.probe(url)
-        val contentType = info.contentType.orEmpty()
+        val info = runCatching { http.probe(url) }.getOrNull()
+        val contentType = info?.contentType.orEmpty()
+        if (contentType.startsWith("text/html")) return null
         val isImage = contentType.startsWith("image/") || ext in UrlUtils.IMAGE_EXTENSIONS
         if (!isImage) return null
 
         val container = ext ?: contentType.substringAfter('/', "jpg").ifBlank { "jpg" }
         val stream = MediaStream(
             id = "image-0",
-            url = info.finalUrl,
+            url = info?.finalUrl ?: url,
             type = MediaType.IMAGE,
             container = container,
             label = "Original image",
-            sizeBytes = info.contentLength.takeIf { it > 0 }
+            sizeBytes = info?.contentLength?.takeIf { it > 0 }
         )
         return ResolvedMedia(
             sourceUrl = url,

@@ -112,7 +112,10 @@ fun AppNavHost(
                         launchSingleTop = true
                     }
                 },
-                onBack = { navController.popBackStack() }
+                onBack = { navController.popBackStack() },
+                onOpenInBrowser = { targetUrl ->
+                    navController.navigate(Routes.browser(targetUrl))
+                }
             )
         }
 

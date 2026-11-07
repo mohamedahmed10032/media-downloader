@@ -51,6 +51,13 @@ class BlobBridgeInterface(
         requestResolve(objectUrl)
     }
 
+    @JavascriptInterface
+    fun onHttpMediaDetected(url: String, mime: String, pageUrl: String) {
+        if (url.isBlank() || !(url.startsWith("http://") || url.startsWith("https://"))) return
+        val headers = HeaderExtractor.forUrl(url, pageUrl.ifBlank { engine.currentPageUrl }, null)
+        engine.submitUrl(url = url, mimeType = mime.ifBlank { null }, headers = headers)
+    }
+
     /**
      * A MediaSource object URL means MSE streaming: the blob is only a handle and cannot be
      * downloaded. The real HLS/DASH manifest is captured by the network interceptors, so

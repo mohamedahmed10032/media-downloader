@@ -27,8 +27,8 @@ class DirectMediaExtractor @Inject constructor(
 
     override suspend fun extract(url: String): ResolvedMedia? {
         val ext = UrlUtils.fileExtension(url)
-        val info = http.probe(url)
-        val contentType = info.contentType.orEmpty()
+        val info = runCatching { http.probe(url) }.getOrNull()
+        val contentType = info?.contentType.orEmpty()
 
         // A page, not a file: let the HTML extractor take over.
         if (contentType.startsWith("text/html")) return null
@@ -45,11 +45,11 @@ class DirectMediaExtractor @Inject constructor(
         val fileName = UrlUtils.fileNameFromUrl(url)
         val stream = MediaStream(
             id = "direct-0",
-            url = info.finalUrl,
+            url = info?.finalUrl ?: url,
             type = type,
             container = container,
             label = if (type == MediaType.VIDEO) "Original quality" else "Original audio",
-            sizeBytes = info.contentLength.takeIf { it > 0 }
+            sizeBytes = info?.contentLength?.takeIf { it > 0 }
         )
         return ResolvedMedia(
             sourceUrl = url,

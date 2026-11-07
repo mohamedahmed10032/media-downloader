@@ -41,19 +41,19 @@ class InterceptedMediaExtractor @Inject constructor(
         return when (payload.streamType) {
             StreamType.HLS -> hlsExtractor.extract(payload.url, headers)
             StreamType.DASH -> dashExtractor.extract(payload.url, headers)
-            StreamType.PROGRESSIVE -> progressive(payload.url, headers, payload.mimeType)
+            StreamType.PROGRESSIVE -> progressive(payload, headers)
             // Blob media is already local; it is imported directly by BlobImporter.
             StreamType.BLOB, StreamType.UNKNOWN -> null
         }
     }
 
     private fun progressive(
-        url: String,
-        headers: Map<String, String>,
-        knownMime: String?
+        payload: com.melmeligy.mediadownloader.intercept.MediaStreamPayload,
+        headers: Map<String, String>
     ): ResolvedMedia? {
-        val info = http.probe(url, headers)
-        val contentType = info.contentType ?: knownMime.orEmpty()
+        val url = payload.url
+        val info = runCatching { http.probe(url, headers) }.getOrNull()
+        val contentType = info?.contentType ?: payload.mimeType.orEmpty()
         if (contentType.startsWith("text/html")) return null
 
         val extension = UrlUtils.fileExtension(url)
@@ -61,13 +61,14 @@ class InterceptedMediaExtractor @Inject constructor(
             contentType.startsWith("video/") -> MediaType.VIDEO
             contentType.startsWith("audio/") -> MediaType.AUDIO
             contentType.startsWith("image/") -> MediaType.IMAGE
-            else -> return null
+            else -> MediaType.VIDEO
         }
 
         val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, url, contentType)
+        val sizeBytes = info?.contentLength?.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
         val stream = MediaStream(
             id = "intercepted-0",
-            url = info.finalUrl,
+            url = info?.finalUrl ?: url,
             type = type,
             container = container,
             label = when (type) {
@@ -75,14 +76,14 @@ class InterceptedMediaExtractor @Inject constructor(
                 MediaType.AUDIO -> "Original audio"
                 MediaType.IMAGE -> "Original image"
             },
-            sizeBytes = info.contentLength.takeIf { it > 0 },
+            sizeBytes = sizeBytes,
             isHls = false,
             headers = headers
         )
 
         return ResolvedMedia(
             sourceUrl = url,
-            title = UrlUtils.fileNameFromUrl(url),
+            title = payload.pageTitle?.takeIf { it.isNotBlank() } ?: UrlUtils.fileNameFromUrl(url),
             streams = listOf(stream),
             extractor = name
         )

@@ -39,11 +39,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Pulls a shared link out of an ACTION_SEND intent ("Share -> Media Downloader"). */
+    /** Pulls a shared link out of an ACTION_SEND or ACTION_VIEW intent ("Share -> Media Downloader"). */
     private fun extractSharedUrl(intent: Intent?): String? {
         if (intent == null) return null
         return when (intent.action) {
-            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+            Intent.ACTION_SEND -> {
+                val raw = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: return null
+                com.melmeligy.mediadownloader.core.util.UrlUtils.extractFirstUrl(raw) ?: raw
+            }
+            Intent.ACTION_VIEW -> intent.dataString?.trim()?.takeIf { it.isNotEmpty() }
             else -> null
         }
     }

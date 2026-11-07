@@ -51,9 +51,10 @@ class SegmentedDownloader @Inject constructor(
         var total = knownTotal
         var ranged = acceptsRanges
         if (total <= 0 || !ranged) {
-            val info = http.probe(url, headers)
-            if (total <= 0) total = info.contentLength
-            ranged = ranged || info.acceptsRanges
+            runCatching { http.probe(url, headers) }.getOrNull()?.let { info ->
+                if (total <= 0) total = info.contentLength
+                ranged = ranged || info.acceptsRanges
+            }
         }
 
         val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1
@@ -102,29 +103,40 @@ class SegmentedDownloader @Inject constructor(
         index: Int,
         downloaded: AtomicLong
     ) {
-        val (start, endInclusive) = bound
-        if (positions[index] > endInclusive) return // already complete
+        val (_, endInclusive) = bound
+        var attempt = 0
+        while (positions[index] <= endInclusive) {
+            currentCoroutineContext().ensureActive()
+            try {
+                val request = http.buildRequest(url, headers)
+                    .header("Range", "bytes=${positions[index]}-$endInclusive")
+                    .build()
 
-        val request = http.buildRequest(url, headers)
-            .header("Range", "bytes=${positions[index]}-$endInclusive")
-            .build()
-
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
-            val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
-            RandomAccessFile(dest, "rw").use { raf ->
-                raf.seek(positions[index])
-                val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
-                body.byteStream().use { input ->
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        raf.write(buffer, 0, read)
-                        positions[index] += read
-                        downloaded.addAndGet(read.toLong())
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
+                    val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
+                    RandomAccessFile(dest, "rw").use { raf ->
+                        raf.seek(positions[index])
+                        val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
+                        body.byteStream().use { input ->
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                raf.write(buffer, 0, read)
+                                positions[index] += read
+                                downloaded.addAndGet(read.toLong())
+                            }
+                        }
                     }
                 }
+                break
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                attempt++
+                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                delay(400L * attempt)
             }
         }
     }

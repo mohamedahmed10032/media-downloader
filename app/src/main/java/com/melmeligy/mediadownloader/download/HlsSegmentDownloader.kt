@@ -49,12 +49,6 @@ class HlsSegmentDownloader @Inject constructor(
             text = http.fetchString(mediaUrl, headers)
         }
 
-        if (text.contains("#EXT-X-MAP")) {
-            throw MediaException(
-                AppError.GENERIC,
-                "This HLS stream uses fMP4 segments, which can't be merged without a muxer."
-            )
-        }
         if (isEncrypted(text)) {
             throw MediaException(
                 AppError.GENERIC,
@@ -90,18 +84,31 @@ class HlsSegmentDownloader @Inject constructor(
                 val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
                 for (segmentUrl in segments) {
                     currentCoroutineContext().ensureActive()
-                    val request = http.buildRequest(segmentUrl, headers).build()
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) throw http.mapHttpError(response.code)
-                        val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
-                        body.byteStream().use { input ->
-                            while (true) {
-                                currentCoroutineContext().ensureActive()
-                                val read = input.read(buffer)
-                                if (read == -1) break
-                                output.write(buffer, 0, read)
-                                written.addAndGet(read.toLong())
+                    var attempt = 0
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        try {
+                            val request = http.buildRequest(segmentUrl, headers).build()
+                            client.newCall(request).execute().use { response ->
+                                if (!response.isSuccessful) throw http.mapHttpError(response.code)
+                                val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
+                                body.byteStream().use { input ->
+                                    while (true) {
+                                        currentCoroutineContext().ensureActive()
+                                        val read = input.read(buffer)
+                                        if (read == -1) break
+                                        output.write(buffer, 0, read)
+                                        written.addAndGet(read.toLong())
+                                    }
+                                }
                             }
+                            break
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            attempt++
+                            if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                            delay(400L * attempt)
                         }
                     }
                     completed.incrementAndGet()
@@ -146,10 +153,24 @@ class HlsSegmentDownloader @Inject constructor(
             line.startsWith("#EXT-X-KEY") && !line.contains("METHOD=NONE")
         }
 
-    private fun parseSegments(mediaText: String, baseUrl: String): List<String> =
-        mediaText.lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("#") }
-            .map { UrlUtils.resolveUrl(baseUrl, it) }
-            .toList()
+    private fun parseSegments(mediaText: String, baseUrl: String): List<String> {
+        val result = mutableListOf<String>()
+        val mapRegex = Regex("URI=\"([^\"]+)\"")
+        for (rawLine in mediaText.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) continue
+            if (line.startsWith("#EXT-X-MAP:")) {
+                val mapUri = mapRegex.find(line)?.groupValues?.getOrNull(1)
+                if (!mapUri.isNullOrBlank()) {
+                    val resolvedMap = UrlUtils.resolveUrl(baseUrl, mapUri)
+                    if (result.firstOrNull() != resolvedMap) {
+                        result.add(resolvedMap)
+                    }
+                }
+            } else if (!line.startsWith("#")) {
+                result.add(UrlUtils.resolveUrl(baseUrl, line))
+            }
+        }
+        return result
+    }
 }

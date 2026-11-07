@@ -53,4 +53,11 @@ class UrlUtilsTest {
             UrlUtils.resolveUrl("https://a.com/dir/index.m3u8", "seg.ts")
         )
     }
+
+    @Test
+    fun extractFirstUrl_extractsEmbeddedUrlFromSharedText() {
+        val shared = "Check out this video! https://example.com/watch?v=123&feature=share #awesome"
+        assertEquals("https://example.com/watch?v=123&feature=share", UrlUtils.extractFirstUrl(shared))
+        assertEquals("https://example.com/watch?v=123&feature=share", UrlUtils.normalize(shared))
+    }
 }

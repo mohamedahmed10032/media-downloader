@@ -21,10 +21,11 @@ object Constants {
     const val WRITE_TIMEOUT_SECONDS = 30L
 
     // Downloads
-    const val DEFAULT_SEGMENT_COUNT = 4
-    const val MIN_SEGMENT_SIZE_BYTES = 1_048_576L // 1 MB - below this, download single-threaded
-    const val DOWNLOAD_BUFFER_SIZE = 64 * 1024
-    const val PROGRESS_THROTTLE_MS = 500L
+    const val DEFAULT_SEGMENT_COUNT = 6
+    const val MIN_SEGMENT_SIZE_BYTES = 512 * 1024L // 512 KB - below this, download single-threaded
+    const val DOWNLOAD_BUFFER_SIZE = 128 * 1024
+    const val PROGRESS_THROTTLE_MS = 300L
+    const val SEGMENT_MAX_RETRIES = 3
 
     // Storage
     const val SHARED_SUBFOLDER = "MediaDownloader"

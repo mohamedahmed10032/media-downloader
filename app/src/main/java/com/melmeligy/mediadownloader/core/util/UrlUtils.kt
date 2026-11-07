@@ -13,10 +13,16 @@ object UrlUtils {
     val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic")
 
     private val urlLikeRegex = Regex("^[\\w.-]+\\.[a-zA-Z]{2,}(/.*)?$")
+    private val embeddedHttpUrlRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
+
+    /** Extracts the first http(s) URL embedded inside arbitrary share text, if any. */
+    fun extractFirstUrl(input: String): String? =
+        embeddedHttpUrlRegex.find(input)?.value?.trimEnd('.', ',', ';', ')', ']')
 
     /** True if the input looks like a URL or bare domain rather than a search phrase. */
     fun isProbablyUrl(input: String): Boolean {
         val trimmed = input.trim()
+        if (embeddedHttpUrlRegex.containsMatchIn(trimmed)) return true
         if (trimmed.contains(' ')) return false
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return true
         return urlLikeRegex.matches(trimmed)
@@ -26,9 +32,10 @@ object UrlUtils {
     fun normalize(input: String): String? {
         val trimmed = input.trim()
         if (trimmed.isEmpty()) return null
+        val candidate = extractFirstUrl(trimmed) ?: trimmed
         val withScheme = when {
-            trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
-            isProbablyUrl(trimmed) -> "https://$trimmed"
+            candidate.startsWith("http://") || candidate.startsWith("https://") -> candidate
+            !candidate.contains(' ') && isProbablyUrl(candidate) -> "https://$candidate"
             else -> return null
         }
         return runCatching {

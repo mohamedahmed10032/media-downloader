@@ -7,13 +7,22 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -26,17 +35,21 @@ import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.MovieCreation
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Tab
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.BottomAppBar
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -48,9 +61,11 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -259,34 +274,99 @@ fun BrowserScreen(
                     }
                 }
             }
-        },
-        floatingActionButton = {
-            if (detections.isNotEmpty()) {
-                ExtendedFloatingActionButton(
-                    onClick = { showDetections = true },
-                    icon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-                    text = { Text("${detections.size} media found") }
-                )
-            } else if (hasMedia) {
-                ExtendedFloatingActionButton(
-                    onClick = { onDownload(detectedDownloadUrl ?: currentUrl) },
-                    icon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-                    text = { Text("Download") }
-                )
-            }
         }
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            if (progress > 0f && progress < 1f) {
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth()
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                if (progress > 0f && progress < 1f) {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                AndroidView(
+                    factory = { webView },
+                    modifier = Modifier.fillMaxSize()
                 )
             }
-            AndroidView(
-                factory = { webView },
-                modifier = Modifier.fillMaxSize()
-            )
+
+            // Snaptube-style Floating Download Bar when media is detected on the current page
+            AnimatedVisibility(
+                visible = detections.isNotEmpty() || hasMedia,
+                enter = slideInVertically(initialOffsetY = { it }),
+                exit = slideOutVertically(targetOffsetY = { it }),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = pageTitle.ifBlank { UrlUtils.host(currentUrl) ?: "Media Ready" },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = if (detections.isNotEmpty()) {
+                                    "${detections.size} stream(s) detected • Tap to choose quality"
+                                } else {
+                                    "Video/Audio detected on page"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+
+                        if (detections.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = { showDetections = true },
+                                shape = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("${detections.size}")
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+
+                        Button(
+                            onClick = {
+                                val firstNonBlob = detections.firstOrNull { it.streamType != StreamType.BLOB }
+                                when {
+                                    detections.size > 1 -> showDetections = true
+                                    firstNonBlob != null -> onDownload(firstNonBlob.url)
+                                    detections.firstOrNull()?.streamType == StreamType.BLOB ->
+                                        viewModel.importBlob(detections.first())
+                                    else -> onDownload(detectedDownloadUrl ?: currentUrl)
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Download", fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -306,6 +386,7 @@ fun BrowserScreen(
         ModalBottomSheet(onDismissRequest = { showDetections = false }) {
             DetectionsSheet(
                 detections = detections,
+                pageUrl = currentUrl,
                 onPick = { payload ->
                     showDetections = false
                     if (payload.streamType == StreamType.BLOB) {
@@ -314,6 +395,10 @@ fun BrowserScreen(
                     } else {
                         onDownload(payload.url)
                     }
+                },
+                onScanPage = {
+                    showDetections = false
+                    onDownload(currentUrl)
                 },
                 onClear = {
                     viewModel.clearDetections()
@@ -382,39 +467,82 @@ private fun TabsSheet(
 @Composable
 private fun DetectionsSheet(
     detections: List<MediaStreamPayload>,
+    pageUrl: String,
     onPick: (MediaStreamPayload) -> Unit,
+    onScanPage: () -> Unit,
     onClear: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
-        Text(
-            "Detected media",
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "Download Options (${detections.size})",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            TextButton(onClick = onClear) {
+                Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                Text(" Clear", style = MaterialTheme.typography.labelLarge)
+            }
+        }
+
+        if (pageUrl.startsWith("http")) {
+            OutlinedButton(
+                onClick = onScanPage,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Scan Full Page for All Video & Audio Qualities")
+            }
+        }
+
         detections.forEach { payload ->
             val size = payload.sizeBytes?.let { " • " + FormatUtils.formatBytes(it) }.orEmpty()
             ListItem(
                 headlineContent = {
-                    Text(payload.suggestedTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        payload.suggestedTitle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = FontWeight.Medium
+                    )
                 },
                 supportingContent = {
                     Text(
-                        payload.streamType.name + size,
-                        style = MaterialTheme.typography.bodySmall
+                        "${payload.streamType.name}$size",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
                     )
                 },
-                leadingContent = { Icon(Icons.Rounded.MovieCreation, contentDescription = null) },
+                leadingContent = {
+                    Icon(
+                        Icons.Rounded.MovieCreation,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                },
                 trailingContent = {
-                    IconButton(onClick = { onPick(payload) }) {
-                        Icon(Icons.Rounded.Download, contentDescription = "Download")
+                    Button(
+                        onClick = { onPick(payload) },
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Icon(Icons.Rounded.Download, contentDescription = "Download", modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Get")
                     }
                 },
                 modifier = Modifier.clickableRow { onPick(payload) }
             )
-        }
-        TextButton(onClick = onClear, modifier = Modifier.padding(horizontal = 12.dp)) {
-            Icon(Icons.Rounded.Close, contentDescription = null)
-            Text("  Clear list", modifier = Modifier.padding(start = 4.dp))
         }
     }
 }

@@ -62,20 +62,62 @@ object BlobBridge {
   PatchedBlob.prototype = NativeBlob.prototype;
   window.Blob = PatchedBlob;
 
-  /* 3. Watch players that pick up a blob source -------------------------- */
+  /* 3. Watch players and XHR/fetch that pick up blob or http(s) media ---- */
+  var seenUrls = {};
+  var mediaPattern = /\.(m3u8|mpd|mp4|m4a|mp3|webm|mov|aac)(\?|#|$)/i;
+
+  function reportUrl(rawUrl, fallbackMime) {
+    safe(function () {
+      if (!rawUrl || typeof rawUrl !== 'string') return;
+      var a = document.createElement('a');
+      a.href = rawUrl;
+      var full = a.href || rawUrl;
+      if (seenUrls[full]) return;
+      if (full.indexOf('blob:') === 0) {
+        seenUrls[full] = true;
+        B.onBlobDetectedInPlayer(full, location.href);
+      } else if ((full.indexOf('http://') === 0 || full.indexOf('https://') === 0) && B.onHttpMediaDetected) {
+        seenUrls[full] = true;
+        B.onHttpMediaDetected(full, fallbackMime || '', location.href);
+      }
+    });
+  }
+
+  if (window.fetch) {
+    var origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      safe(function () {
+        var u = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        if (mediaPattern.test(u)) reportUrl(u, '');
+      });
+      return origFetch(input, init);
+    };
+  }
+
+  if (window.XMLHttpRequest && XMLHttpRequest.prototype.open) {
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      safe(function () {
+        if (typeof url === 'string' && mediaPattern.test(url)) reportUrl(url, '');
+      });
+      return origOpen.apply(this, arguments);
+    };
+  }
+
   function scanMedia() {
     safe(function () {
       var nodes = document.querySelectorAll('video, audio, source');
       for (var i = 0; i < nodes.length; i++) {
-        var src = nodes[i].src || nodes[i].currentSrc || '';
-        if (src.indexOf('blob:') === 0) {
-          B.onBlobDetectedInPlayer(src, location.href);
-        }
+        var src = nodes[i].currentSrc || nodes[i].src || '';
+        if (!src) continue;
+        var mime = nodes[i].type || (nodes[i].tagName === 'AUDIO' ? 'audio/mp4' : 'video/mp4');
+        reportUrl(src, mime);
       }
     });
   }
-  setInterval(scanMedia, 1500);
+  setInterval(scanMedia, 1200);
   document.addEventListener('loadedmetadata', scanMedia, true);
+  document.addEventListener('play', scanMedia, true);
 
   /* 4. Resolve a blob and stream it to the native layer ------------------ */
   window.__resolveBlob = function (objectUrl, taskId) {
