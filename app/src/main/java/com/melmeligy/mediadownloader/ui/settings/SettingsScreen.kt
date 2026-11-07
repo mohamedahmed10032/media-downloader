@@ -183,7 +183,7 @@ private fun <T> DropdownSetting(
     title: String,
     current: T,
     options: List<T>,
-    label: (T) -> String,
+    label: @Composable (T) -> String,
     onSelect: (T) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
