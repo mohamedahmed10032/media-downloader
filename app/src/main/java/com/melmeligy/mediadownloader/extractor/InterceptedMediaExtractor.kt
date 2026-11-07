@@ -8,6 +8,9 @@ import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.intercept.MediaInterceptionEngine
 import com.melmeligy.mediadownloader.intercept.MediaSniffer
 import com.melmeligy.mediadownloader.intercept.StreamType
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -37,18 +40,17 @@ class InterceptedMediaExtractor @Inject constructor(
     override fun canHandle(url: String): Boolean =
         engine.payloadsFor(url).any { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
 
-    override suspend fun extract(url: String): ResolvedMedia? = kotlinx.coroutines.coroutineScope {
+    override suspend fun extract(url: String): ResolvedMedia? = coroutineScope {
         val candidates = engine.payloadsFor(url)
             .filter { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
             .distinctBy { MediaSniffer.cleanMediaUrl(it.url).substringBefore('?') }
 
         if (candidates.isEmpty()) return@coroutineScope null
 
-        val resolvedStreams = mutableListOf<MediaStream>()
         var pageTitle: String? = null
 
-        val deferredList = candidates.take(10).mapIndexed { idx, payload ->
-            kotlinx.coroutines.async {
+        val resolvedStreams = candidates.take(10).mapIndexed { idx, payload ->
+            async {
                 if (pageTitle == null && !payload.pageTitle.isNullOrBlank()) {
                     pageTitle = payload.pageTitle
                 }
@@ -61,9 +63,7 @@ class InterceptedMediaExtractor @Inject constructor(
                     StreamType.BLOB, StreamType.UNKNOWN -> emptyList()
                 }
             }
-        }
-
-        deferredList.forEach { d -> resolvedStreams.addAll(d.await()) }
+        }.awaitAll().flatten()
 
         // Deduplicate by bare URL and filter out tiny tracking fragments (< 15 KB if size is known)
         val filtered = resolvedStreams
