@@ -46,8 +46,18 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
 
-            <!-- Accept links shared from other apps ("Share -> Media Downloader"). -->
+        <!-- Snaptube-style floating overlay sheet when sharing links from any app ("Share -> Media Downloader"). -->
+        <activity
+            android:name=".ui.share.ShareDialogActivity"
+            android:exported="true"
+            android:taskAffinity=".ChooseFormat"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density"
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
+            android:theme="@style/Theme.MediaDownloader.TranslucentSheet">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

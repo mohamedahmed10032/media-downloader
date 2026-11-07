@@ -78,6 +78,10 @@ fun QualityScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
+    androidx.compose.runtime.LaunchedEffect(url) {
+        if (url.isNotBlank()) viewModel.resolve(url)
+    }
+
     androidx.compose.runtime.LaunchedEffect(Unit) {
         viewModel.queued.collect { onQueued() }
     }
@@ -94,42 +98,72 @@ fun QualityScreen(
             )
         }
     ) { padding ->
-        when (val s = state) {
-            is Resource.Loading -> LoadingState(
-                modifier = Modifier.padding(padding),
-                message = "Resolving available formats & sizes…"
+        ChooseFormatStateContent(
+            state = state,
+            url = url,
+            contentPadding = padding,
+            onRetry = { viewModel.resolve(url) },
+            onOpenInBrowser = onOpenInBrowser,
+            onDownload = viewModel::download
+        )
+    }
+}
+
+/**
+ * Reusable Snaptube-style Choose Format UI used by:
+ * 1. [com.melmeligy.mediadownloader.ui.share.ShareDialogActivity] (floating overlay sheet over any app),
+ * 2. [com.melmeligy.mediadownloader.ui.browser.BrowserScreen] (in-browser modal sheet), and
+ * 3. [QualityScreen].
+ *
+ * Strictly renders ONLY real Video streams on top and real Audio streams below with their actual sizes.
+ */
+@Composable
+fun ChooseFormatStateContent(
+    state: Resource<ResolvedMedia>,
+    url: String,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
+    onRetry: () -> Unit,
+    onOpenInBrowser: ((String) -> Unit)? = null,
+    onDownload: (MediaStream) -> Unit
+) {
+    when (state) {
+        is Resource.Loading -> LoadingState(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(280.dp)
+                .padding(contentPadding),
+            message = "Analyzing link & fetching real video/audio sizes…"
+        )
+        is Resource.Error -> Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(contentPadding)
+                .padding(horizontal = 24.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            ErrorState(
+                message = state.error.asMessage(),
+                icon = Icons.Rounded.SearchOff,
+                modifier = Modifier.fillMaxWidth(),
+                onRetry = onRetry
             )
-            is Resource.Error -> Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(horizontal = 24.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                ErrorState(
-                    message = s.error.asMessage(),
-                    icon = Icons.Rounded.SearchOff,
-                    modifier = Modifier.weight(1f, fill = false),
-                    onRetry = viewModel::resolve
-                )
-                if (onOpenInBrowser != null && url.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = { onOpenInBrowser(url) },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("Open in Browser to Auto-Catch Stream")
-                    }
+            if (onOpenInBrowser != null && url.isNotBlank()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = { onOpenInBrowser(url) },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("Open in Browser to Auto-Catch Stream")
                 }
             }
-            is Resource.Success -> QualityContent(
-                resolved = s.data,
-                contentPadding = padding,
-                onDownload = viewModel::download
-            )
         }
+        is Resource.Success -> QualityContent(
+            resolved = state.data,
+            contentPadding = contentPadding,
+            onDownload = onDownload
+        )
     }
 }
 
@@ -139,32 +173,40 @@ private fun QualityContent(
     contentPadding: PaddingValues,
     onDownload: (MediaStream) -> Unit
 ) {
-    val video = resolved.streams.filter { it.type == MediaType.VIDEO }
-    val audio = resolved.streams.filter { it.type == MediaType.AUDIO }
-    val image = resolved.streams.filter { it.type == MediaType.IMAGE }
+    // Strictly Video on top and Audio below — no fake or placeholder items
+    val video = remember(resolved) {
+        resolved.streams
+            .filter { it.type == MediaType.VIDEO }
+            .distinctBy { it.url.substringBefore('?') }
+    }
+    val audio = remember(resolved) {
+        resolved.streams
+            .filter { it.type == MediaType.AUDIO }
+            .distinctBy { it.url.substringBefore('?') }
+    }
+    val allValid = remember(video, audio) { video + audio }
 
-    var selectedStream by remember(resolved) {
-        mutableStateOf(resolved.streams.firstOrNull())
+    var selectedStream by remember(allValid) {
+        mutableStateOf(allValid.firstOrNull())
     }
 
     val videoTitle = stringResource(R.string.quality_video)
     val audioTitle = stringResource(R.string.quality_audio)
-    val imageTitle = stringResource(R.string.quality_image)
 
     Column(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
             .padding(contentPadding)
     ) {
         LazyColumn(
             modifier = Modifier
-                .weight(1f)
+                .weight(1f, fill = false)
                 .fillMaxWidth(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
-                MediaPreviewCard(resolved = resolved)
+                MediaPreviewCard(resolved = resolved, formatCount = allValid.size)
             }
             section(
                 title = videoTitle,
@@ -178,14 +220,6 @@ private fun QualityContent(
                 title = audioTitle,
                 icon = Icons.Rounded.Audiotrack,
                 streams = audio,
-                selectedId = selectedStream?.id,
-                onSelect = { selectedStream = it },
-                onQuickDownload = onDownload
-            )
-            section(
-                title = imageTitle,
-                icon = Icons.Rounded.Image,
-                streams = image,
                 selectedId = selectedStream?.id,
                 onSelect = { selectedStream = it },
                 onQuickDownload = onDownload
@@ -240,7 +274,7 @@ private fun QualityContent(
 }
 
 @Composable
-private fun MediaPreviewCard(resolved: ResolvedMedia) {
+private fun MediaPreviewCard(resolved: ResolvedMedia, formatCount: Int = resolved.streams.size) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -288,7 +322,7 @@ private fun MediaPreviewCard(resolved: ResolvedMedia) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "${resolved.extractor} • ${resolved.streams.size} formats available",
+                    text = "${resolved.extractor} • $formatCount formats available",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

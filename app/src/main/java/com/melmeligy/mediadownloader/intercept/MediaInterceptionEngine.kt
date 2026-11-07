@@ -75,11 +75,17 @@ class MediaInterceptionEngine @Inject constructor() {
     /** Entry point for every producer. Returns true when the payload was accepted. */
     fun submit(payload: MediaStreamPayload): Boolean {
         if (!MediaSniffer.isMedia(payload.streamType)) return false
-        if (!accept(payload.fingerprint)) return false
+        val cleanedUrl = if (payload.streamType == StreamType.BLOB) {
+            payload.url
+        } else {
+            MediaSniffer.cleanMediaUrl(payload.url)
+        }
+        val normalizedPayload = payload.copy(url = cleanedUrl)
+        if (!accept(normalizedPayload.fingerprint)) return false
 
-        val enriched = payload.copy(
-            pageUrl = payload.pageUrl ?: currentPageUrl,
-            pageTitle = payload.pageTitle ?: currentPageTitle
+        val enriched = normalizedPayload.copy(
+            pageUrl = normalizedPayload.pageUrl ?: currentPageUrl,
+            pageTitle = normalizedPayload.pageTitle ?: currentPageTitle
         )
 
         registry[enriched.url] = enriched
@@ -91,23 +97,45 @@ class MediaInterceptionEngine @Inject constructor() {
     fun submitUrl(
         url: String,
         mimeType: String? = null,
-        headers: Map<String, String> = emptyMap()
-    ): Boolean = submit(
-        MediaStreamPayload(
-            url = url,
-            streamType = MediaSniffer.classify(url, mimeType),
-            headersMap = headers,
-            mimeType = mimeType
+        headers: Map<String, String> = emptyMap(),
+        sizeBytes: Long? = null
+    ): Boolean {
+        val cleaned = MediaSniffer.cleanMediaUrl(url)
+        return submit(
+            MediaStreamPayload(
+                url = cleaned,
+                streamType = MediaSniffer.classify(cleaned, mimeType),
+                headersMap = headers,
+                mimeType = mimeType,
+                sizeBytes = sizeBytes
+            )
         )
-    )
+    }
 
     // ---- Lookup, used by InterceptedMediaExtractor ----
 
     /** Returns the captured payload for [url], if the interception layer saw it. */
     fun lookup(url: String): MediaStreamPayload? {
+        val cleaned = MediaSniffer.cleanMediaUrl(url)
+        registry[cleaned]?.let { return it }
         registry[url]?.let { return it }
-        val bare = url.substringBefore('?')
+        val bare = cleaned.substringBefore('?')
         return registry.values.firstOrNull { it.url.substringBefore('?') == bare }
+    }
+
+    /** Returns all captured payloads for the active page or matching [url]. */
+    fun payloadsFor(url: String): List<MediaStreamPayload> {
+        val current = _detections.value
+        val cleaned = MediaSniffer.cleanMediaUrl(url)
+        if (url == currentPageUrl || cleaned == currentPageUrl) {
+            return current
+        }
+        val matched = lookup(cleaned)
+        if (matched != null) {
+            val samePage = current.filter { it.pageUrl == matched.pageUrl && matched.pageUrl != null }
+            return if (samePage.isNotEmpty()) samePage else listOf(matched)
+        }
+        return emptyList()
     }
 
     /** Headers captured for [url], or an empty map. */

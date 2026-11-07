@@ -42,13 +42,52 @@ object MediaSniffer {
         "google-analytics.com", "googletagmanager.com", "doubleclick.net", "/beacon", "/pixel"
     )
 
+    private val RANGE_QUERY_PARAMS = setOf(
+        "bytestart", "byteend", "range", "rn", "rbuf"
+    )
+
+    private val rangeParamRegex =
+        Regex("([?&])(bytestart|byteend|range|rn|rbuf)=[^&#]*", RegexOption.IGNORE_CASE)
+
+    /**
+     * Strips byte-range slicing query parameters (`bytestart`, `byteend`, `range`) used by
+     * Instagram, Facebook, and YouTube/TikTok MSE players so that:
+     * 1. 8 separate chunk requests for the same video collapse into 1 canonical URL, and
+     * 2. Downloading the URL fetches the entire media file instead of a partial byte slice.
+     */
+    fun cleanMediaUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim()
+        if (!trimmed.contains('?')) return trimmed
+        var cleaned = rangeParamRegex.replace(trimmed) { match ->
+            if (match.groupValues[1] == "?") "?" else ""
+        }
+        cleaned = cleaned.replace("?&", "?").trimEnd('?', '&')
+        return cleaned
+    }
+
+    /** Heuristic to detect whether a CDN MP4 URL is actually an audio-only DASH track. */
+    fun isAudioTrackUrl(rawUrl: String, mimeType: String? = null): Boolean {
+        val mime = mimeType?.lowercase().orEmpty()
+        if (mime.startsWith("audio/")) return true
+        val lower = rawUrl.lowercase()
+        if (lower.contains(".m4a") || lower.contains(".mp3") || lower.contains(".aac") || lower.contains(".ogg") || lower.contains(".opus")) {
+            return true
+        }
+        // Instagram / Facebook DASH audio tracks embed audio indicators in efg or path
+        if (lower.contains("audio") || lower.contains("_a.mp4") || lower.contains("dash_ln_heaac") || lower.contains("heaac") || lower.contains("ln_aac")) {
+            return true
+        }
+        return false
+    }
+
     fun classify(rawUrl: String, mimeType: String? = null): StreamType {
         if (rawUrl.isBlank()) return StreamType.UNKNOWN
-        val url = rawUrl.lowercase()
+        val cleaned = cleanMediaUrl(rawUrl)
+        val url = cleaned.lowercase()
         if (NOISE_HINTS.any { url.contains(it) }) return StreamType.UNKNOWN
 
         val mime = mimeType?.lowercase()?.substringBefore(';')?.trim()
-        val path = runCatching { Uri.parse(url).path.orEmpty() }.getOrDefault(url)
+        val path = url.substringBefore('?').substringBefore('#')
         val ext = path.substringAfterLast('.', "")
 
         return when {
@@ -76,9 +115,10 @@ object MediaSniffer {
         StreamType.HLS -> "ts"
         StreamType.DASH -> "mp4"
         else -> {
-            val path = runCatching { Uri.parse(url).path.orEmpty() }.getOrDefault(url)
+            val path = url.substringBefore('?').substringBefore('#')
             val ext = path.substringAfterLast('.', "").lowercase()
             when {
+                isAudioTrackUrl(url, mimeType) && (ext == "mp4" || ext.isBlank()) -> "m4a"
                 ext in PROGRESSIVE_EXT -> ext
                 mimeType?.contains("webm") == true -> "webm"
                 mimeType?.startsWith("audio/") == true -> "m4a"

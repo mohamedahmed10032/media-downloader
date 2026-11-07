@@ -25,7 +25,9 @@ data class BrowserTab(val id: Long, val url: String, val title: String)
 class BrowserViewModel @Inject constructor(
     private val bookmarkRepository: BookmarkRepository,
     private val interceptionEngine: MediaInterceptionEngine,
-    private val blobImporter: BlobImporter
+    private val blobImporter: BlobImporter,
+    private val mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository,
+    private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager
 ) : ViewModel() {
 
     private var nextId = 2L
@@ -33,11 +35,44 @@ class BrowserViewModel @Inject constructor(
     /** Everything the interception layer found on the page currently being viewed. */
     val detections: StateFlow<List<MediaStreamPayload>> = interceptionEngine.detections
 
+    private val _formatState = MutableStateFlow<com.melmeligy.mediadownloader.core.Resource<com.melmeligy.mediadownloader.domain.model.ResolvedMedia>>(
+        com.melmeligy.mediadownloader.core.Resource.Loading
+    )
+    val formatState: StateFlow<com.melmeligy.mediadownloader.core.Resource<com.melmeligy.mediadownloader.domain.model.ResolvedMedia>> =
+        _formatState.asStateFlow()
+
     private val _blobMessage = MutableStateFlow<String?>(null)
     val blobMessage: StateFlow<String?> = _blobMessage.asStateFlow()
 
     /** Shared engine instance handed to the WebView client and the JS bridge. */
     fun engine(): MediaInterceptionEngine = interceptionEngine
+
+    fun resolveForSheet(targetUrl: String) {
+        viewModelScope.launch {
+            _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
+            _formatState.value = try {
+                com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
+            } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+                com.melmeligy.mediadownloader.core.Resource.Error(e.error)
+            } catch (e: Exception) {
+                com.melmeligy.mediadownloader.core.Resource.Error(
+                    com.melmeligy.mediadownloader.core.AppError.GENERIC,
+                    e.message
+                )
+            }
+        }
+    }
+
+    fun downloadStream(
+        stream: com.melmeligy.mediadownloader.domain.model.MediaStream,
+        onStarted: () -> Unit
+    ) {
+        val resolved = (_formatState.value as? com.melmeligy.mediadownloader.core.Resource.Success)?.data ?: return
+        viewModelScope.launch {
+            downloadManager.enqueue(resolved, stream)
+            onStarted()
+        }
+    }
 
     /**
      * Blob media is already resolved to a local file by the JS bridge, so it is imported

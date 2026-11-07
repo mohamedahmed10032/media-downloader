@@ -26,7 +26,8 @@ import javax.inject.Singleton
 class HtmlMediaExtractor @Inject constructor(
     private val http: ExtractorHttp,
     private val hlsExtractor: HlsExtractor,
-    private val dashExtractor: DashExtractor
+    private val dashExtractor: DashExtractor,
+    private val headlessWebExtractor: HeadlessWebExtractor
 ) : MediaExtractor {
 
     override val name = "Web page"
@@ -41,7 +42,10 @@ class HtmlMediaExtractor @Inject constructor(
     override fun canHandle(url: String): Boolean = url.startsWith("http")
 
     override suspend fun extract(url: String): ResolvedMedia? = coroutineScope {
-        val html = http.fetchString(url)
+        val html = runCatching { http.fetchString(url) }.getOrNull().orEmpty()
+        if (html.isBlank()) {
+            return@coroutineScope runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+        }
         val doc = Jsoup.parse(html, url)
         val found = LinkedHashMap<String, MediaStream>()
         val pageHeaders = mapOf("Referer" to url)
@@ -57,16 +61,18 @@ class HtmlMediaExtractor @Inject constructor(
             bitrateKbps: Int? = null,
             isHls: Boolean = false
         ) {
-            val cleaned = unescapeUrl(rawUrl.trim())
-            if (!cleaned.startsWith("http") || found.containsKey(cleaned)) return
+            if (type == MediaType.IMAGE) return
+            val cleaned = com.melmeligy.mediadownloader.intercept.MediaSniffer.cleanMediaUrl(unescapeUrl(rawUrl.trim()))
+            if (!cleaned.startsWith("http") || found.containsKey(cleaned.substringBefore('?'))) return
             val inferredHeight = height ?: inferResolution(cleaned, label)
             val finalLabel = when {
                 label != "Video" && label.isNotBlank() -> label
+                inferredHeight != null && inferredHeight >= 1080 -> "${inferredHeight}p FHD"
                 inferredHeight != null && inferredHeight >= 720 -> "${inferredHeight}p HD"
                 inferredHeight != null -> "${inferredHeight}p"
                 else -> label
             }
-            found[cleaned] = MediaStream(
+            found[cleaned.substringBefore('?')] = MediaStream(
                 id = "html-${counter++}",
                 url = cleaned,
                 type = type,
@@ -148,7 +154,7 @@ class HtmlMediaExtractor @Inject constructor(
             }
         }
 
-        // 3. Open Graph / Twitter card media
+        // 3. Open Graph / Twitter card media (video & audio only)
         val ogWidth = doc.select("meta[property=og:video:width]").attr("content").toIntOrNull()
         val ogHeight = doc.select("meta[property=og:video:height]").attr("content").toIntOrNull()
         doc.select("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url], meta[name=twitter:player:stream]")
@@ -161,8 +167,6 @@ class HtmlMediaExtractor @Inject constructor(
                 val content = it.attr("abs:content").ifBlank { it.attr("content") }
                 add(content, MediaType.AUDIO, containerFor(content, "mp3"), "Audio")
             }
-        doc.select("meta[property=og:image], meta[property=og:image:url], meta[name=twitter:image]")
-            .forEach { add(it.attr("abs:content"), MediaType.IMAGE, containerFor(it.attr("abs:content"), "jpg"), "Image") }
 
         // 4. Embedded URLs in scripts/attributes (including JSON-escaped URLs)
         val unescapedHtml = unescapeUrl(html)
@@ -171,8 +175,9 @@ class HtmlMediaExtractor @Inject constructor(
             val expanded = runCatching { hlsExtractor.extract(hlsUrl, pageHeaders) }.getOrNull()
             if (expanded != null && expanded.streams.isNotEmpty()) {
                 expanded.streams.forEach { variant ->
-                    if (!found.containsKey(variant.url)) {
-                        found[variant.url] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
+                    val k = variant.url.substringBefore('?')
+                    if (!found.containsKey(k)) {
+                        found[k] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
                     }
                 }
             } else {
@@ -184,8 +189,9 @@ class HtmlMediaExtractor @Inject constructor(
         for (mpdUrl in mpdUrls) {
             val expanded = runCatching { dashExtractor.extract(mpdUrl, pageHeaders) }.getOrNull()
             expanded?.streams?.forEach { variant ->
-                if (!found.containsKey(variant.url)) {
-                    found[variant.url] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
+                val k = variant.url.substringBefore('?')
+                if (!found.containsKey(k)) {
+                    found[k] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
                 }
             }
         }
@@ -201,7 +207,10 @@ class HtmlMediaExtractor @Inject constructor(
             }
         }
 
-        if (found.isEmpty()) return@coroutineScope null
+        if (found.isEmpty()) {
+            // Static HTML had no video/audio streams -> run Headless WebView to catch JS/GraphQL streams!
+            return@coroutineScope runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+        }
 
         val thumbnail = doc.select("meta[property=og:image]").attr("abs:content")
             .ifBlank { doc.select("meta[name=twitter:image]").attr("abs:content") }

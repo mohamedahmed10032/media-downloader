@@ -104,6 +104,7 @@ fun BrowserScreen(
     val activeTabId by viewModel.activeTabId.collectAsStateWithLifecycle()
     val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
     val detections by viewModel.detections.collectAsStateWithLifecycle()
+    val formatState by viewModel.formatState.collectAsStateWithLifecycle()
     val engine = remember { viewModel.engine() }
 
     var addressText by remember { mutableStateOf(initialUrl ?: Constants.DEFAULT_HOME_URL) }
@@ -117,7 +118,16 @@ fun BrowserScreen(
     var initialLoaded by remember { mutableStateOf(false) }
     var showTabs by remember { mutableStateOf(false) }
     var showBookmarks by remember { mutableStateOf(false) }
-    var showDetections by remember { mutableStateOf(false) }
+    var showFormatSheet by remember { mutableStateOf(false) }
+
+    fun openChooseFormatSheet() {
+        val target = currentUrl.takeIf { it.startsWith("http") }
+            ?: detectedDownloadUrl
+            ?: detections.firstOrNull()?.url
+            ?: return
+        showFormatSheet = true
+        viewModel.resolveForSheet(target)
+    }
 
     val webView = remember {
         WebView(context).apply {
@@ -263,12 +273,16 @@ fun BrowserScreen(
                 IconButton(onClick = { showTabs = true }) {
                     Icon(Icons.Rounded.Tab, contentDescription = "Tabs (${tabs.size})")
                 }
-                if (detections.isNotEmpty()) {
-                    IconButton(onClick = { showDetections = true }) {
-                        BadgedBox(badge = { Badge { Text("${detections.size}") } }) {
+                if (detections.isNotEmpty() || hasMedia) {
+                    IconButton(onClick = { openChooseFormatSheet() }) {
+                        BadgedBox(badge = {
+                            if (detections.isNotEmpty()) {
+                                Badge { Text("${detections.size}") }
+                            }
+                        }) {
                             Icon(
-                                Icons.Rounded.MovieCreation,
-                                contentDescription = "Detected media (${detections.size})"
+                                Icons.Rounded.Download,
+                                contentDescription = "Choose Format & Download"
                             )
                         }
                     }
@@ -316,49 +330,23 @@ fun BrowserScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                             Text(
-                                text = pageTitle.ifBlank { UrlUtils.host(currentUrl) ?: "Media Ready" },
+                                text = pageTitle.ifBlank { UrlUtils.host(currentUrl) ?: "Video Ready" },
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = if (detections.isNotEmpty()) {
-                                    "${detections.size} stream(s) detected • Tap to choose quality"
-                                } else {
-                                    "Video/Audio detected on page"
-                                },
+                                text = "Video & Audio ready • Tap Download to choose quality",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
                         }
 
-                        if (detections.isNotEmpty()) {
-                            OutlinedButton(
-                                onClick = { showDetections = true },
-                                shape = RoundedCornerShape(10.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
-                            ) {
-                                Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("${detections.size}")
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                        }
-
                         Button(
-                            onClick = {
-                                val firstNonBlob = detections.firstOrNull { it.streamType != StreamType.BLOB }
-                                when {
-                                    detections.size > 1 -> showDetections = true
-                                    firstNonBlob != null -> onDownload(firstNonBlob.url)
-                                    detections.firstOrNull()?.streamType == StreamType.BLOB ->
-                                        viewModel.importBlob(detections.first())
-                                    else -> onDownload(detectedDownloadUrl ?: currentUrl)
-                                }
-                            },
-                            shape = RoundedCornerShape(10.dp),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                            onClick = { openChooseFormatSheet() },
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
                         ) {
                             Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
@@ -382,29 +370,59 @@ fun BrowserScreen(
         }
     }
 
-    if (showDetections) {
-        ModalBottomSheet(onDismissRequest = { showDetections = false }) {
-            DetectionsSheet(
-                detections = detections,
-                pageUrl = currentUrl,
-                onPick = { payload ->
-                    showDetections = false
-                    if (payload.streamType == StreamType.BLOB) {
-                        // Already a local file: import it straight into the library.
-                        viewModel.importBlob(payload)
-                    } else {
-                        onDownload(payload.url)
+    if (showFormatSheet) {
+        val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { showFormatSheet = false },
+            sheetState = sheetState
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Rounded.Download,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Choose Format & Quality",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
-                },
-                onScanPage = {
-                    showDetections = false
-                    onDownload(currentUrl)
-                },
-                onClear = {
-                    viewModel.clearDetections()
-                    showDetections = false
+                    IconButton(onClick = { showFormatSheet = false }) {
+                        Icon(Icons.Rounded.Close, contentDescription = "Close")
+                    }
                 }
-            )
+
+                com.melmeligy.mediadownloader.ui.quality.ChooseFormatStateContent(
+                    state = formatState,
+                    url = currentUrl,
+                    onRetry = { openChooseFormatSheet() },
+                    onOpenInBrowser = null,
+                    onDownload = { stream ->
+                        viewModel.downloadStream(stream) {
+                            showFormatSheet = false
+                            android.widget.Toast.makeText(
+                                context,
+                                "Download started in background",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                )
+            }
         }
     }
 

@@ -69,9 +69,11 @@ object BlobBridge {
   function reportUrl(rawUrl, fallbackMime) {
     safe(function () {
       if (!rawUrl || typeof rawUrl !== 'string') return;
+      var unescaped = rawUrl.replace(/\\\//g, '/').replace(/\\u002F/gi, '/').replace(/\\u0026/gi, '&').replace(/&amp;/g, '&');
+      var cleaned = unescaped.replace(/([?&])(bytestart|byteend|range|rn|rbuf)=[^&#]*/gi, '$1').replace(/\?&/g, '?').replace(/[?&]+$/, '');
       var a = document.createElement('a');
-      a.href = rawUrl;
-      var full = a.href || rawUrl;
+      a.href = cleaned;
+      var full = a.href || cleaned;
       if (seenUrls[full]) return;
       if (full.indexOf('blob:') === 0) {
         seenUrls[full] = true;
@@ -83,6 +85,21 @@ object BlobBridge {
     });
   }
 
+  function scanTextForStreams(text) {
+    safe(function () {
+      if (!text || typeof text !== 'string' || text.length < 20) return;
+      var unescaped = text.replace(/\\\//g, '/').replace(/\\u002F/gi, '/').replace(/\\u0026/gi, '&').replace(/&amp;/g, '&');
+      var mp4Matches = unescaped.match(/https?:\/\/[^"'\s<>\\]+?\.(mp4|m4a|mp3|m3u8|mpd)[^"'\s<>\\]*/gi);
+      if (mp4Matches) {
+        for (var i = 0; i < mp4Matches.length && i < 15; i++) {
+          var u = mp4Matches[i];
+          var isAudio = u.indexOf('.m4a') > -1 || u.indexOf('.mp3') > -1 || u.indexOf('audio') > -1 || u.indexOf('heaac') > -1;
+          reportUrl(u, isAudio ? 'audio/mp4' : 'video/mp4');
+        }
+      }
+    });
+  }
+
   if (window.fetch) {
     var origFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
@@ -90,7 +107,15 @@ object BlobBridge {
         var u = typeof input === 'string' ? input : (input && input.url ? input.url : '');
         if (mediaPattern.test(u)) reportUrl(u, '');
       });
-      return origFetch(input, init);
+      return origFetch(input, init).then(function (resp) {
+        safe(function () {
+          var ct = (resp.headers && resp.headers.get) ? (resp.headers.get('content-type') || '') : '';
+          if (ct.indexOf('json') > -1 || resp.url.indexOf('graphql') > -1 || resp.url.indexOf('/api/') > -1) {
+            resp.clone().text().then(scanTextForStreams).catch(function(){});
+          }
+        });
+        return resp;
+      });
     };
   }
 
@@ -100,12 +125,48 @@ object BlobBridge {
       safe(function () {
         if (typeof url === 'string' && mediaPattern.test(url)) reportUrl(url, '');
       });
+      this.addEventListener('load', function () {
+        safe(function () {
+          if (typeof url === 'string' && (url.indexOf('graphql') > -1 || url.indexOf('/api/') > -1)) {
+            scanTextForStreams(this.responseText);
+          }
+        }.bind(this));
+      });
       return origOpen.apply(this, arguments);
     };
   }
 
+  function dismissAnnoyingOverlays() {
+    safe(function () {
+      var host = (location.hostname || '').toLowerCase();
+      if (host.indexOf('instagram.com') > -1 || host.indexOf('tiktok.com') > -1 || host.indexOf('facebook.com') > -1) {
+        var dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+        for (var i = 0; i < dialogs.length; i++) {
+          var d = dialogs[i];
+          var txt = (d.innerText || '').toLowerCase();
+          if (txt.indexOf('watch this reel in the app') > -1 ||
+              txt.indexOf('open instagram') > -1 ||
+              txt.indexOf('use the app') > -1 ||
+              txt.indexOf('open app') > -1 ||
+              txt.indexOf('continue in app') > -1) {
+            var closeBtn = d.querySelector('button[aria-label*="Close"], svg[aria-label*="Close"], [role="button"]');
+            if (closeBtn && (closeBtn.innerText || '').toLowerCase().indexOf('open') === -1) {
+              closeBtn.click();
+            }
+            d.style.display = 'none';
+            if (d.parentElement && d.parentElement.style && getComputedStyle(d.parentElement).position === 'fixed') {
+              d.parentElement.style.display = 'none';
+            }
+          }
+        }
+        document.body.style.overflow = 'auto';
+      }
+    });
+  }
+
   function scanMedia() {
     safe(function () {
+      dismissAnnoyingOverlays();
       var nodes = document.querySelectorAll('video, audio, source');
       for (var i = 0; i < nodes.length; i++) {
         var src = nodes[i].currentSrc || nodes[i].src || '';
@@ -113,9 +174,16 @@ object BlobBridge {
         var mime = nodes[i].type || (nodes[i].tagName === 'AUDIO' ? 'audio/mp4' : 'video/mp4');
         reportUrl(src, mime);
       }
+      var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
+      for (var j = 0; j < scripts.length; j++) {
+        var sText = scripts[j].textContent || '';
+        if (sText.indexOf('video_versions') > -1 || sText.indexOf('video_url') > -1 || sText.indexOf('playable_url') > -1 || sText.indexOf('playAddr') > -1) {
+          scanTextForStreams(sText);
+        }
+      }
     });
   }
-  setInterval(scanMedia, 1200);
+  setInterval(scanMedia, 1000);
   document.addEventListener('loadedmetadata', scanMedia, true);
   document.addEventListener('play', scanMedia, true);
 

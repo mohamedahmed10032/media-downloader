@@ -26,11 +26,11 @@ fun AppNavHost(
 ) {
     val navController = rememberNavController()
 
-    // A link shared into the app jumps straight to the quality/format screen.
+    // A link opened via "Open in Browser to Auto-Catch Stream" jumps straight to the built-in browser.
     LaunchedEffect(sharedUrl) {
         val url = sharedUrl?.trim()
         if (!url.isNullOrEmpty()) {
-            navController.navigate(Routes.quality(url))
+            navController.navigate(Routes.browser(url))
             onSharedUrlConsumed()
         }
     }

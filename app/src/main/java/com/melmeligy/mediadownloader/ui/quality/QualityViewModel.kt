@@ -27,7 +27,7 @@ class QualityViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
-    private val url: String = savedStateHandle.get<String>(Routes.ARG_URL).orEmpty()
+    private var currentUrl: String = savedStateHandle.get<String>(Routes.ARG_URL).orEmpty()
 
     private val _state = MutableStateFlow<Resource<ResolvedMedia>>(Resource.Loading)
     val state: StateFlow<Resource<ResolvedMedia>> = _state.asStateFlow()
@@ -36,14 +36,18 @@ class QualityViewModel @Inject constructor(
     val queued = _queued.receiveAsFlow()
 
     init {
-        resolve()
+        if (currentUrl.isNotBlank()) {
+            resolve(currentUrl)
+        }
     }
 
-    fun resolve() {
+    fun resolve(targetUrl: String = currentUrl) {
+        if (targetUrl.isBlank()) return
+        currentUrl = targetUrl
         viewModelScope.launch {
             _state.value = Resource.Loading
             _state.value = try {
-                Resource.Success(mediaRepository.resolve(url))
+                Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: MediaException) {
                 Resource.Error(e.error)
             } catch (e: Exception) {

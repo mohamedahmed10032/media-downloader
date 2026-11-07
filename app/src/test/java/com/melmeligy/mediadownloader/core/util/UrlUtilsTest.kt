@@ -60,4 +60,11 @@ class UrlUtilsTest {
         assertEquals("https://example.com/watch?v=123&feature=share", UrlUtils.extractFirstUrl(shared))
         assertEquals("https://example.com/watch?v=123&feature=share", UrlUtils.normalize(shared))
     }
+
+    @Test
+    fun cleanMediaUrl_stripsByteStartAndByteEndParams() {
+        val instagramChunk = "https://scontent.cdninstagram.com/v/t50.2886-16/1234.mp4?efg=eyJ2&bytestart=0&byteend=250499&oe=6789"
+        val cleaned = com.melmeligy.mediadownloader.intercept.MediaSniffer.cleanMediaUrl(instagramChunk)
+        assertEquals("https://scontent.cdninstagram.com/v/t50.2886-16/1234.mp4?efg=eyJ2&oe=6789", cleaned)
+    }
 }
