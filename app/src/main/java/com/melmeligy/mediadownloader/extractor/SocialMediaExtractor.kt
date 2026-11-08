@@ -56,7 +56,9 @@ class SocialMediaExtractor @Inject constructor(
             host.contains("x.com") ||
             host.contains("facebook.com") ||
             host.contains("fb.watch") ||
-            host.contains("fb.com")
+            host.contains("fb.com") ||
+            host.contains("pinterest.") ||
+            host.contains("pin.it")
     }
 
     override suspend fun extract(url: String): ResolvedMedia? {
@@ -68,6 +70,7 @@ class SocialMediaExtractor @Inject constructor(
                     host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") -> extractFacebook(url)
                     host.contains("twitter.com") || host.contains("x.com") -> extractTwitter(url)
                     host.contains("tiktok.com") -> extractTikTok(url)
+                    host.contains("pinterest.") || host.contains("pin.it") -> extractPinterest(url)
                     else -> null
                 }
             }
@@ -77,8 +80,8 @@ class SocialMediaExtractor @Inject constructor(
             return fastResult
         }
 
-        // For Instagram, do NOT fall back to detached Headless WebView (it cannot play media and causes a freeze)
-        if (host.contains("instagram.com")) {
+        // For Instagram & Pinterest, do NOT fall back to detached Headless WebView
+        if (host.contains("instagram.com") || host.contains("pinterest.") || host.contains("pin.it")) {
             return null
         }
 
@@ -210,8 +213,8 @@ class SocialMediaExtractor @Inject constructor(
                 "X-Requested-With" to "XMLHttpRequest",
                 "Accept" to "*/*"
             )
-            val canonicalReel = "https://www.instagram.com/reel/$shortcode/"
-            val postBody = "q=" + URLEncoder.encode(canonicalReel, "UTF-8") + "&t=media&lang=en&v=v2"
+            val canonicalUrl = if (rawUrl.contains("/p/")) "https://www.instagram.com/p/$shortcode/" else "https://www.instagram.com/reel/$shortcode/"
+            val postBody = "q=" + URLEncoder.encode(canonicalUrl, "UTF-8") + "&t=media&lang=en&v=v2"
             val respJson = http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
             val jsonRoot = JSONObject(respJson)
             if (jsonRoot.optString("status") == "ok") {
@@ -228,7 +231,7 @@ class SocialMediaExtractor @Inject constructor(
 
                     doc.select("a[href]").forEach { a ->
                         val href = a.attr("href")
-                        val title = a.attr("title").ifBlank { a.text() }
+                        val title = a.attr("title").ifBlank { a.text() }.trim()
                         if (href.startsWith("http") && !title.contains("SoundCloud", ignoreCase = true) && !title.contains("other video", ignoreCase = true)) {
                             var directMediaUrl = href
                             if (href.contains("token=")) {
@@ -246,11 +249,27 @@ class SocialMediaExtractor @Inject constructor(
                                     }
                                 }
                             }
-                            val isImage = title.contains("Image", ignoreCase = true) || title.contains("Photo", ignoreCase = true)
-                            if (isImage) {
+                            val isThumbnail = title.contains("Thumbnail", ignoreCase = true)
+                            val isExplicitImage = title.contains("Image", ignoreCase = true) || title.contains("Photo", ignoreCase = true)
+                            val urlClean = directMediaUrl.lowercase().substringBefore('?')
+                            val isImageExt = urlClean.endsWith(".jpg") || urlClean.endsWith(".jpeg") || urlClean.endsWith(".png") || urlClean.endsWith(".webp")
+                            val isVideo = title.contains("Video", ignoreCase = true) || urlClean.endsWith(".mp4")
+
+                            if (isThumbnail) {
+                                if (capturedThumb == null && directMediaUrl.startsWith("http")) {
+                                    capturedThumb = directMediaUrl
+                                }
+                                addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Cover Photo (HD)")
+                            } else if (isVideo) {
+                                addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
+                            } else if (isExplicitImage || isImageExt) {
                                 addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Photo (HD)")
                             } else {
-                                addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
+                                if (directMediaUrl.contains(".mp4")) {
+                                    addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
+                                } else {
+                                    addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Photo (HD)")
+                                }
                             }
                         }
                     }
@@ -371,15 +390,21 @@ class SocialMediaExtractor @Inject constructor(
             )
         } else if (videos.isNotEmpty()) {
             val v = videos.first()
+            val vBytes = v.sizeBytes ?: 0L
+            val estM4a = if (vBytes > 0L) (vBytes * 16L / 100L).coerceAtLeast(150_000L) else null
+            val estMp3 = if (vBytes > 0L) (vBytes * 20L / 100L).coerceAtLeast(180_000L) else null
             listOf(
                 v.copy(
                     id = "ig-audio-fast",
                     type = MediaType.AUDIO,
                     container = "m4a",
                     label = "Fast",
+                    sizeBytes = estM4a,
                     headers = v.headers + mapOf(
                         "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
-                        "X-Internal-Quick" to "true"
+                        "X-Internal-Quick" to "true",
+                        "X-Internal-Extract-Audio" to "true",
+                        "X-Internal-Video-Bytes" to vBytes.toString()
                     )
                 ),
                 v.copy(
@@ -387,9 +412,12 @@ class SocialMediaExtractor @Inject constructor(
                     type = MediaType.AUDIO,
                     container = "mp3",
                     label = "Classic MP3",
+                    sizeBytes = estMp3,
                     headers = v.headers + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
-                        "X-Internal-Quick" to "true"
+                        "X-Internal-Quick" to "true",
+                        "X-Internal-Extract-Audio" to "true",
+                        "X-Internal-Video-Bytes" to vBytes.toString()
                     )
                 )
             )
@@ -397,11 +425,13 @@ class SocialMediaExtractor @Inject constructor(
             emptyList()
         }
 
+        val images = probed.filter { it.type == MediaType.IMAGE }
+
         ResolvedMedia(
             sourceUrl = rawUrl,
-            title = capturedTitle ?: "Instagram Reel ($shortcode)",
-            thumbnailUrl = capturedThumb,
-            streams = videos + audios,
+            title = capturedTitle ?: if (videos.isNotEmpty()) "Instagram Reel ($shortcode)" else "Instagram Photo ($shortcode)",
+            thumbnailUrl = capturedThumb ?: images.firstOrNull()?.url,
+            streams = images + videos + audios,
             extractor = "Instagram"
         )
     }
@@ -869,6 +899,148 @@ class SocialMediaExtractor @Inject constructor(
             )
         }
         return list
+    }
+
+    // =========================================================================
+    // 5. PINTEREST (Original HD Photo + Pin Video extraction)
+    // =========================================================================
+    private suspend fun extractPinterest(rawUrl: String): ResolvedMedia? = coroutineScope {
+        val desktopHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+
+        val html = runCatching { http.fetchString(rawUrl, desktopHeaders) }.getOrNull().orEmpty()
+        if (html.isBlank()) return@coroutineScope null
+
+        val titleRegex = Regex("<title>([^<]+)</title>")
+        val rawTitle = titleRegex.find(html)?.groupValues?.getOrNull(1).orEmpty()
+        val cleanTitle = rawTitle.replace("| Pinterest", "").replace("- Pinterest", "").trim()
+            .ifBlank { "Pinterest Pin" }
+
+        val streams = mutableListOf<MediaStream>()
+        var thumb: String? = null
+
+        // 1. Video extraction (v.pinimg.com)
+        val videoRegex = Regex("https://[a-zA-Z0-9.-]*pinimg\\.com/[a-zA-Z0-9_/-]+\\.mp4")
+        val videoUrls = videoRegex.findAll(html).map { it.value }.distinct().toList()
+        for ((idx, vUrl) in videoUrls.withIndex()) {
+            val vInfo = runCatching { http.probe(vUrl, desktopHeaders) }.getOrNull()
+            streams += MediaStream(
+                id = "pin-video-$idx",
+                url = vUrl,
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "High quality (HD)",
+                height = 720,
+                sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
+                isHls = false
+            )
+        }
+
+        // 2. Original HD image extraction (i.pinimg.com/originals/)
+        val origRegex = Regex("https://i\\.pinimg\\.com/originals/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
+        val origUrls = origRegex.findAll(html).map { it.value }.distinct().toList()
+        for ((idx, imgUrl) in origUrls.withIndex()) {
+            if (thumb == null) thumb = imgUrl
+            val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
+            val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
+            streams += MediaStream(
+                id = "pin-img-$idx",
+                url = imgUrl,
+                type = MediaType.IMAGE,
+                container = ext,
+                label = "Photo (Original HD)",
+                sizeBytes = info?.contentLength?.takeIf { it > 0 },
+                isHls = false
+            )
+        }
+
+        // 3. Fallback high-res image (736x) if no originals found
+        if (origUrls.isEmpty()) {
+            val hiResRegex = Regex("https://i\\.pinimg\\.com/736x/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
+            val hiResUrls = hiResRegex.findAll(html).map { it.value }.distinct().toList()
+            for ((idx, imgUrl) in hiResUrls.withIndex()) {
+                if (thumb == null) thumb = imgUrl
+                val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
+                val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
+                streams += MediaStream(
+                    id = "pin-img-736-$idx",
+                    url = imgUrl,
+                    type = MediaType.IMAGE,
+                    container = ext,
+                    label = "Photo (736p HD)",
+                    sizeBytes = info?.contentLength?.takeIf { it > 0 },
+                    isHls = false
+                )
+            }
+        }
+
+        // 4. Meta tags og:image / twitter:image fallback
+        if (streams.isEmpty()) {
+            val ogImageRegex = Regex("<meta\\s+(?:property|name)=[\"'](?:og:image|twitter:image)[\"']\\s+content=[\"']([^\"']+)[\"']")
+            ogImageRegex.findAll(html).map { it.groupValues[1] }.firstOrNull { it.startsWith("http") }?.let { ogImg ->
+                thumb = ogImg
+                val ext = UrlUtils.fileExtension(ogImg) ?: "jpg"
+                val info = runCatching { http.probe(ogImg, desktopHeaders) }.getOrNull()
+                streams += MediaStream(
+                    id = "pin-img-og",
+                    url = ogImg,
+                    type = MediaType.IMAGE,
+                    container = ext,
+                    label = "Photo (HD)",
+                    sizeBytes = info?.contentLength?.takeIf { it > 0 },
+                    isHls = false
+                )
+            }
+        }
+
+        if (streams.isEmpty()) return@coroutineScope null
+
+        // 5. If video exists, synthesize companion audio options
+        val videos = streams.filter { it.type == MediaType.VIDEO }
+        val audios = if (videos.isNotEmpty()) {
+            val v = videos.first()
+            val vBytes = v.sizeBytes ?: 0L
+            val estM4a = if (vBytes > 0L) (vBytes * 16L / 100L).coerceAtLeast(150_000L) else null
+            val estMp3 = if (vBytes > 0L) (vBytes * 20L / 100L).coerceAtLeast(180_000L) else null
+            listOf(
+                v.copy(
+                    id = "pin-audio-fast",
+                    type = MediaType.AUDIO,
+                    container = "m4a",
+                    label = "Fast",
+                    sizeBytes = estM4a,
+                    headers = v.headers + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true",
+                        "X-Internal-Extract-Audio" to "true",
+                        "X-Internal-Video-Bytes" to vBytes.toString()
+                    )
+                ),
+                v.copy(
+                    id = "pin-audio-mp3",
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    sizeBytes = estMp3,
+                    headers = v.headers + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true",
+                        "X-Internal-Extract-Audio" to "true",
+                        "X-Internal-Video-Bytes" to vBytes.toString()
+                    )
+                )
+            )
+        } else emptyList()
+
+        ResolvedMedia(
+            sourceUrl = rawUrl,
+            title = cleanTitle,
+            thumbnailUrl = thumb,
+            streams = streams + audios,
+            extractor = "Pinterest"
+        )
     }
 
     private fun firstChildText(parent: Element, tag: String): String? {

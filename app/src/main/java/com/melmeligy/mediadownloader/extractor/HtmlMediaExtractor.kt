@@ -61,11 +61,11 @@ class HtmlMediaExtractor @Inject constructor(
             bitrateKbps: Int? = null,
             isHls: Boolean = false
         ) {
-            if (type == MediaType.IMAGE) return
             val cleaned = com.melmeligy.mediadownloader.intercept.MediaSniffer.cleanMediaUrl(unescapeUrl(rawUrl.trim()))
             if (!cleaned.startsWith("http") || found.containsKey(cleaned.substringBefore('?'))) return
             val inferredHeight = height ?: inferResolution(cleaned, label)
             val finalLabel = when {
+                type == MediaType.IMAGE -> if (label.isNotBlank() && label != "Video") label else "Photo (HD)"
                 label != "Video" && label.isNotBlank() -> label
                 inferredHeight != null && inferredHeight >= 1080 -> "${inferredHeight}p FHD"
                 inferredHeight != null && inferredHeight >= 720 -> "${inferredHeight}p HD"
@@ -168,6 +168,13 @@ class HtmlMediaExtractor @Inject constructor(
             .forEach {
                 val content = it.attr("abs:content").ifBlank { it.attr("content") }
                 add(content, MediaType.AUDIO, containerFor(content, "mp3"), "Audio")
+            }
+        doc.select("meta[property=og:image], meta[property=og:image:url], meta[property=og:image:secure_url], meta[name=twitter:image], meta[name=twitter:image:src]")
+            .forEach {
+                val content = it.attr("abs:content").ifBlank { it.attr("content") }
+                if (content.startsWith("http")) {
+                    add(content, MediaType.IMAGE, containerFor(content, "jpg"), "Photo (HD)")
+                }
             }
 
         // 4. Embedded URLs in scripts/attributes (including JSON-escaped URLs)

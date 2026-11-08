@@ -58,7 +58,9 @@ class ExtractorRegistry @Inject constructor(
             host.contains("facebook.com") ||
             host.contains("fb.watch") ||
             host.contains("twitter.com") ||
-            host.contains("x.com")
+            host.contains("x.com") ||
+            host.contains("pinterest.") ||
+            host.contains("pin.it")
 
         if (willing.isNotEmpty() && isWalledSocial) {
             throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)

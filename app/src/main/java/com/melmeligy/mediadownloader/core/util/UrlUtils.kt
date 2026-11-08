@@ -17,17 +17,35 @@ object UrlUtils {
 
     private val trackingQueryParams = setOf(
         "igsh", "igshid", "utm_source", "utm_medium", "utm_campaign", "utm_term",
-        "utm_content", "fbclid"
+        "utm_content", "fbclid", "invite_code", "sender", "sfo"
     )
-    private val instagramPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:reel|reels|p|tv|share/reel|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z]{2}\\.)?pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
 
-    /** Cleans social tracking parameters and normalizes paths (e.g. Instagram Reels). */
+    /** Cleans social tracking parameters and normalizes paths (e.g. Instagram Reels, Posts, Pinterest). */
     fun cleanSocialUrl(url: String): String {
         val trimmed = url.trim()
-        val igMatch = instagramPattern.find(trimmed)
-        if (igMatch != null) {
-            val shortcode = igMatch.groupValues[1]
+        val igReelMatch = instagramReelPattern.find(trimmed)
+        if (igReelMatch != null) {
+            val shortcode = igReelMatch.groupValues[1]
             return "https://www.instagram.com/reel/$shortcode/"
+        }
+        val igPostMatch = instagramPostPattern.find(trimmed)
+        if (igPostMatch != null) {
+            val shortcode = igPostMatch.groupValues[1]
+            return "https://www.instagram.com/p/$shortcode/"
+        }
+        val igTvMatch = instagramTvPattern.find(trimmed)
+        if (igTvMatch != null) {
+            val shortcode = igTvMatch.groupValues[1]
+            return "https://www.instagram.com/tv/$shortcode/"
+        }
+        val pinMatch = pinterestPinPattern.find(trimmed)
+        if (pinMatch != null) {
+            val pinId = pinMatch.groupValues[1]
+            return "https://www.pinterest.com/pin/$pinId/"
         }
         return runCatching {
             val uri = URI(trimmed)

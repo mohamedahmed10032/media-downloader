@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
@@ -190,16 +191,19 @@ private fun SnaptubeFormatSheetContent(
     onDownload: (MediaStream) -> Unit
 ) {
     val prepared = remember(resolved) { prepareSnaptubeStreams(resolved) }
+    val imageStreams = prepared.images
     val musicStreams = prepared.music
     val videoStreams = prepared.video
+    val quickImages = prepared.quickImages
     val quickMusic = prepared.quickMusic
     val quickVideo = prepared.quickVideo
-    val allStreams = remember(musicStreams, videoStreams) { musicStreams + videoStreams }
+    val allStreams = remember(imageStreams, musicStreams, videoStreams) { imageStreams + musicStreams + videoStreams }
 
     var selectedStream by remember(allStreams) {
         val defaultPick = allStreams.firstOrNull { it.headers["X-Internal-Default"] == "true" }
-            ?: quickMusic.lastOrNull()
             ?: quickVideo.lastOrNull()
+            ?: quickImages.firstOrNull()
+            ?: quickMusic.lastOrNull()
             ?: allStreams.firstOrNull()
         mutableStateOf(defaultPick)
     }
@@ -224,6 +228,7 @@ private fun SnaptubeFormatSheetContent(
             if (!expanded) {
                 CompactDownloadVideoAsView(
                     resolved = resolved,
+                    quickImages = quickImages,
                     quickMusic = quickMusic,
                     quickVideo = quickVideo,
                     selectedId = selectedStream?.id,
@@ -232,6 +237,7 @@ private fun SnaptubeFormatSheetContent(
                 )
             } else {
                 ExpandedMoreFormatsView(
+                    imageStreams = imageStreams,
                     musicStreams = musicStreams,
                     videoStreams = videoStreams,
                     selectedId = selectedStream?.id,
@@ -275,12 +281,20 @@ private fun SnaptubeFormatSheetContent(
 @Composable
 private fun CompactDownloadVideoAsView(
     resolved: ResolvedMedia,
+    quickImages: List<MediaStream>,
     quickMusic: List<MediaStream>,
     quickVideo: List<MediaStream>,
     selectedId: String?,
     onSelect: (MediaStream) -> Unit,
     onMoreFormatsClick: () -> Unit
 ) {
+    val titleText = when {
+        quickVideo.isNotEmpty() -> "Download video as"
+        quickImages.isNotEmpty() -> "Download photo as"
+        quickMusic.isNotEmpty() -> "Download music as"
+        else -> "Download media as"
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(bottom = 4.dp)
@@ -292,12 +306,36 @@ private fun CompactDownloadVideoAsView(
                     .padding(horizontal = 20.dp, vertical = 6.dp)
             ) {
                 Text(
-                    text = "Download video as",
+                    text = titleText,
                     style = MaterialTheme.typography.titleLarge.copy(fontSize = 19.sp),
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 CompactVideoHeader(resolved = resolved)
+            }
+        }
+
+        if (quickImages.isNotEmpty()) {
+            item {
+                SnaptubeSectionHeader(title = "Photo")
+            }
+            items(quickImages, key = { it.id }) { stream ->
+                SnaptubeFormatRow(
+                    stream = stream,
+                    icon = Icons.Rounded.Image,
+                    isSelected = stream.id == selectedId,
+                    showSubtitle = true,
+                    onClick = { onSelect(stream) }
+                )
+            }
+        }
+
+        if (quickImages.isNotEmpty() && (quickMusic.isNotEmpty() || quickVideo.isNotEmpty())) {
+            item {
+                HorizontalDivider(
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
+                )
             }
         }
 
@@ -379,6 +417,7 @@ private fun CompactDownloadVideoAsView(
 
 @Composable
 private fun ExpandedMoreFormatsView(
+    imageStreams: List<MediaStream> = emptyList(),
     musicStreams: List<MediaStream>,
     videoStreams: List<MediaStream>,
     selectedId: String?,
@@ -410,6 +449,30 @@ private fun ExpandedMoreFormatsView(
             modifier = Modifier.fillMaxWidth(),
             contentPadding = PaddingValues(bottom = 8.dp)
         ) {
+            if (imageStreams.isNotEmpty()) {
+                item {
+                    SnaptubeSectionHeader(title = "Photo")
+                }
+                items(imageStreams, key = { it.id }) { stream ->
+                    SnaptubeFormatRow(
+                        stream = stream,
+                        icon = Icons.Rounded.Image,
+                        isSelected = stream.id == selectedId,
+                        showSubtitle = true,
+                        onClick = { onSelect(stream) }
+                    )
+                }
+            }
+
+            if (imageStreams.isNotEmpty() && (musicStreams.isNotEmpty() || videoStreams.isNotEmpty())) {
+                item {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
+                    )
+                }
+            }
+
             if (musicStreams.isNotEmpty()) {
                 item {
                     SnaptubeSectionHeader(title = "Music")
@@ -477,8 +540,11 @@ private fun CompactVideoHeader(resolved: ResolvedMedia) {
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
+                val hasImages = resolved.streams.any { it.type == MediaType.IMAGE }
+                val hasVideos = resolved.streams.any { it.type == MediaType.VIDEO }
+                val icon = if (hasImages && !hasVideos) Icons.Rounded.Image else Icons.Rounded.Movie
                 Icon(
-                    imageVector = Icons.Rounded.Movie,
+                    imageVector = icon,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(22.dp)
@@ -601,10 +667,20 @@ private fun formatShortSize(stream: MediaStream): String = when {
     stream.sizeBytes != null && stream.sizeBytes > 0 -> FormatUtils.formatBytes(stream.sizeBytes)
     stream.isHls && stream.bitrateKbps != null -> "~${stream.bitrateKbps}K"
     stream.isHls -> "HLS"
+    stream.type == MediaType.IMAGE -> stream.container.uppercase()
     else -> "MP4"
 }
 
 private fun defaultSubtitleFor(stream: MediaStream): String? {
+    if (stream.type == MediaType.IMAGE) {
+        val w = stream.width
+        val h = stream.height
+        return if (w != null && h != null) {
+            "${w}x${h} • High resolution picture"
+        } else {
+            "High resolution picture"
+        }
+    }
     if (stream.type == MediaType.AUDIO) {
         return if (stream.container.equals("m4a", ignoreCase = true)) {
             "M4A (128K), best for mobile play"
@@ -624,13 +700,24 @@ private fun defaultSubtitleFor(stream: MediaStream): String? {
 }
 
 private data class PreparedSnaptubeStreams(
+    val images: List<MediaStream>,
     val music: List<MediaStream>,
     val video: List<MediaStream>,
+    val quickImages: List<MediaStream>,
     val quickMusic: List<MediaStream>,
     val quickVideo: List<MediaStream>
 )
 
 private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStreams {
+    val rawImages = resolved.streams
+        .filter { it.type == MediaType.IMAGE }
+        .distinctBy { it.url }
+        .map { img ->
+            val label = if (img.label.startsWith("Photo") || img.label.startsWith("Image")) img.label else "Photo (${img.container.uppercase()})"
+            img.copy(label = label)
+        }
+    val quickImages = rawImages.take(2)
+
     // Normalize & sort video streams in Snaptube order (144p -> 240p -> 360p -> 480p -> 720p -> 1080p -> 2K -> 4K)
     val rawVideos = resolved.streams
         .filter { it.type == MediaType.VIDEO }
@@ -718,8 +805,10 @@ private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStr
         }
 
     return PreparedSnaptubeStreams(
+        images = rawImages,
         music = rawMusic,
         video = rawVideos,
+        quickImages = quickImages,
         quickMusic = quickMusic,
         quickVideo = quickVideo
     )

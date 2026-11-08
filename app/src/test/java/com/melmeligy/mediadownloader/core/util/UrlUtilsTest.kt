@@ -63,9 +63,17 @@ class UrlUtilsTest {
 
     @Test
     fun extractFirstUrl_normalizesInstagramSharedTextAndStripsTracking() {
-        val shared = "Watch this reel on Instagram https://www.instagram.com/share/reel/DEvv7ssup4o/?igsh=MTZvdjgzZnRsbzRuMg=="
-        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.extractFirstUrl(shared))
-        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.normalize(shared))
+        val sharedReel = "Watch this reel on Instagram https://www.instagram.com/share/reel/DEvv7ssup4o/?igsh=MTZvdjgzZnRsbzRuMg=="
+        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.extractFirstUrl(sharedReel))
+        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.normalize(sharedReel))
+
+        val sharedPost = "Check out this photo https://www.instagram.com/p/C9U3YwJMPKj/?igsh=YWJ4"
+        assertEquals("https://www.instagram.com/p/C9U3YwJMPKj/", UrlUtils.extractFirstUrl(sharedPost))
+        assertEquals("https://www.instagram.com/p/C9U3YwJMPKj/", UrlUtils.normalize(sharedPost))
+
+        val sharedPin = "Pinterest pin https://www.pinterest.com/pin/687499743144766861/?invite_code=abc&sender=123"
+        assertEquals("https://www.pinterest.com/pin/687499743144766861/", UrlUtils.extractFirstUrl(sharedPin))
+        assertEquals("https://www.pinterest.com/pin/687499743144766861/", UrlUtils.normalize(sharedPin))
     }
 
     @Test
