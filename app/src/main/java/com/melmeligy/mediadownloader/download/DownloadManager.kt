@@ -55,6 +55,7 @@ class DownloadManager @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val segmentedDownloader: SegmentedDownloader,
     private val hlsDownloader: HlsSegmentDownloader,
+    private val videoAudioMuxer: VideoAudioMuxer,
     private val mediaStoreWriter: MediaStoreWriter,
     private val notifier: DownloadNotifier,
     private val dispatchers: DispatcherProvider
@@ -162,18 +163,89 @@ class DownloadManager @Inject constructor(
         val staging = stagingFile(item)
         try {
             val headers = JsonUtils.jsonToMap(item.headersJson)
-            val onProgress: ProgressCallback = { p ->
-                repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
-            }
+            val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
 
             if (item.isHls) {
+                val onProgress: ProgressCallback = { p ->
+                    repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
+                }
                 hlsDownloader.download(item.remoteUrl, headers, staging, onProgress)
+            } else if (companionAudioUrl != null) {
+                val videoKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: 0L
+                val audioKnownBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull() ?: 0L
+                val combinedTotal = if (videoKnownBytes > 0 && audioKnownBytes > 0) {
+                    videoKnownBytes + audioKnownBytes
+                } else {
+                    item.totalBytes
+                }
+
+                val stagingVideo = File(stagingDir(), "dl_${item.id}_video.mp4.part")
+                val stagingAudio = File(stagingDir(), "dl_${item.id}_audio.m4a.part")
+
+                // 1. Download adaptive video track
+                segmentedDownloader.download(
+                    url = item.remoteUrl,
+                    headers = headers,
+                    dest = stagingVideo,
+                    knownTotal = videoKnownBytes,
+                    acceptsRanges = false,
+                    segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
+                    onProgress = { p ->
+                        val total = if (combinedTotal > 0) combinedTotal else p.total
+                        repository.updateProgress(item.id, p.downloaded, total, p.speed, p.eta)
+                    }
+                )
+                val videoActualBytes = stagingVideo.length()
+
+                // 2. Download companion audio track
+                segmentedDownloader.download(
+                    url = companionAudioUrl,
+                    headers = headers,
+                    dest = stagingAudio,
+                    knownTotal = audioKnownBytes,
+                    acceptsRanges = false,
+                    segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
+                    onProgress = { p ->
+                        val done = videoActualBytes + p.downloaded
+                        val total = if (combinedTotal > 0) combinedTotal else (videoActualBytes + p.total)
+                        repository.updateProgress(item.id, done, total, p.speed, p.eta)
+                    }
+                )
+
+                // 3. Hardware-native lossless muxing (MP4 video + M4A audio -> final MP4)
+                withContext(dispatchers.io) {
+                    videoAudioMuxer.mux(stagingVideo, stagingAudio, staging)
+                    runCatching { stagingVideo.delete() }
+                    runCatching { stagingAudio.delete() }
+                }
+            } else if (headers["X-Internal-Extract-Audio"] == "true") {
+                val realSourceBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: item.totalBytes
+                val stagingSource = File(stagingDir(), "dl_${item.id}_src.mp4.part")
+                segmentedDownloader.download(
+                    url = item.remoteUrl,
+                    headers = headers,
+                    dest = stagingSource,
+                    knownTotal = realSourceBytes,
+                    acceptsRanges = false,
+                    segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
+                    onProgress = { p ->
+                        repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
+                    }
+                )
+                withContext(dispatchers.io) {
+                    videoAudioMuxer.extractAudioOnly(stagingSource, staging)
+                    runCatching { stagingSource.delete() }
+                }
             } else {
+                val realKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: item.totalBytes
+                val onProgress: ProgressCallback = { p ->
+                    repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
+                }
                 segmentedDownloader.download(
                     url = item.remoteUrl,
                     headers = headers,
                     dest = staging,
-                    knownTotal = item.totalBytes,
+                    knownTotal = realKnownBytes,
                     acceptsRanges = false,
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                     onProgress = onProgress
@@ -199,8 +271,8 @@ class DownloadManager @Inject constructor(
     private suspend fun handleCancellation(item: DownloadItem, staging: File) {
         when (intents.remove(item.id)) {
             ControlIntent.CANCEL -> {
+                cleanupStaging(item.id)
                 runCatching { staging.delete() }
-                runCatching { File(staging.parentFile, staging.name + ".idx").delete() }
                 repository.delete(item.id)
             }
             ControlIntent.PAUSE -> repository.updateStatus(item.id, DownloadStatus.PAUSED)
@@ -272,7 +344,9 @@ class DownloadManager @Inject constructor(
 
     private fun cleanupStaging(id: Long) {
         val dir = stagingDir()
-        dir.listFiles()?.filter { it.name.startsWith("dl_$id.") }?.forEach { runCatching { it.delete() } }
+        dir.listFiles()
+            ?.filter { it.name.startsWith("dl_$id.") || it.name.startsWith("dl_${id}_") }
+            ?.forEach { runCatching { it.delete() } }
     }
 
     private fun fileName(item: DownloadItem): String {

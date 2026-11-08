@@ -65,6 +65,14 @@ object MediaSniffer {
         return cleaned
     }
 
+    /** Canonical deduplication key that preserves `itag` for `googlevideo.com` streams. */
+    fun dedupeKey(rawUrl: String): String {
+        val cleaned = cleanMediaUrl(rawUrl)
+        val base = cleaned.substringBefore('?')
+        val itag = Regex("[?&]itag=(\\d+)").find(cleaned)?.groupValues?.getOrNull(1)
+        return if (itag != null) "$base?itag=$itag" else base
+    }
+
     /** Heuristic to detect whether a CDN MP4 URL is actually an audio-only DASH track. */
     fun isAudioTrackUrl(rawUrl: String, mimeType: String? = null): Boolean {
         val mime = mimeType?.lowercase().orEmpty()

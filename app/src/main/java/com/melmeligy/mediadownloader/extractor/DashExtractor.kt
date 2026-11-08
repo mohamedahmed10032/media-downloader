@@ -123,7 +123,21 @@ class DashExtractor @Inject constructor(
             return null
         }
 
-        val sorted = streams.sortedByDescending { it.height ?: it.bitrateKbps ?: 0 }
+        val audioStreams = streams.filter { it.type == MediaType.AUDIO }
+            .sortedByDescending { it.bitrateKbps ?: 0 }
+        val bestAudio = audioStreams.firstOrNull()
+
+        val enrichedStreams = streams.map { s ->
+            if (s.type == MediaType.VIDEO && bestAudio != null && s.container == "mp4") {
+                s.copy(
+                    headers = s.headers + ("X-Internal-Companion-Audio" to bestAudio.url)
+                )
+            } else {
+                s
+            }
+        }
+
+        val sorted = enrichedStreams.sortedByDescending { it.height ?: it.bitrateKbps ?: 0 }
         val title = UrlUtils.host(url)?.let { "DASH video ($it)" } ?: "DASH video"
         return ResolvedMedia(sourceUrl = url, title = title, streams = sorted, extractor = name)
     }

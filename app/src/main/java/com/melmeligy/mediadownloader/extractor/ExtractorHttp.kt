@@ -4,8 +4,10 @@ import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.Constants
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.data.remote.RawContentService
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.UnknownHostException
 import javax.inject.Inject
@@ -23,6 +25,7 @@ data class HeadInfo(
 /**
  * Shared HTTP helpers for the extractors and downloaders.
  * - [fetchString] uses Retrofit (dynamic @Url) for page/playlist text.
+ * - [postJson] uses OkHttp for JSON API endpoints (e.g. YouTube InnerTube player API).
  * - [probe] uses OkHttp directly for a single-byte ranged request (size + range support).
  * - [buildRequest] builds OkHttp requests for streaming byte transfers.
  */
@@ -45,6 +48,26 @@ class ExtractorHttp @Inject constructor(
         response.body().use { body ->
             if (!response.isSuccessful) throw mapHttpError(response.code())
             return body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+        }
+    }
+
+    /** Executes an HTTP POST request with a JSON payload and returns the response body string. */
+    fun postJson(url: String, jsonBody: String, headers: Map<String, String> = emptyMap()): String {
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val request = buildRequest(url, headers)
+            .post(jsonBody.toRequestBody(mediaType))
+            .build()
+        try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw mapHttpError(response.code)
+                return response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+            }
+        } catch (e: MediaException) {
+            throw e
+        } catch (e: UnknownHostException) {
+            throw MediaException(AppError.NO_INTERNET, e.message, e)
+        } catch (e: IOException) {
+            throw MediaException(AppError.GENERIC, e.message, e)
         }
     }
 
@@ -96,9 +119,11 @@ class ExtractorHttp @Inject constructor(
         return builder
     }
 
-    private fun withUserAgent(headers: Map<String, String>): Map<String, String> =
-        if (headers.keys.any { it.equals("User-Agent", ignoreCase = true) }) headers
-        else headers + ("User-Agent" to Constants.DEFAULT_USER_AGENT)
+    private fun withUserAgent(headers: Map<String, String>): Map<String, String> {
+        val clean = headers.filterKeys { !it.startsWith("X-Internal-", ignoreCase = true) }
+        return if (clean.keys.any { it.equals("User-Agent", ignoreCase = true) }) clean
+        else clean + ("User-Agent" to Constants.DEFAULT_USER_AGENT)
+    }
 
     fun mapHttpError(code: Int): MediaException = when (code) {
         401, 403 -> MediaException(AppError.GEO_BLOCKED, "HTTP $code")

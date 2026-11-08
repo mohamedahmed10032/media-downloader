@@ -8,6 +8,7 @@ import com.melmeligy.mediadownloader.extractor.InterceptedMediaExtractor
 import com.melmeligy.mediadownloader.extractor.HtmlMediaExtractor
 import com.melmeligy.mediadownloader.extractor.ImageExtractor
 import com.melmeligy.mediadownloader.extractor.SocialMediaExtractor
+import com.melmeligy.mediadownloader.extractor.YouTubeExtractor
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -29,6 +30,10 @@ abstract class ExtractorModule {
     @Binds
     @IntoSet
     abstract fun bindIntercepted(extractor: InterceptedMediaExtractor): MediaExtractor
+
+    @Binds
+    @IntoSet
+    abstract fun bindYouTube(extractor: YouTubeExtractor): MediaExtractor
 
     @Binds
     @IntoSet

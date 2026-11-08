@@ -37,13 +37,18 @@ class InterceptedMediaExtractor @Inject constructor(
 
     private val resRegex = Regex("(?:^|[^0-9])(2160|1440|1080|720|540|480|360|240)p?(?:[^0-9]|$)", RegexOption.IGNORE_CASE)
 
-    override fun canHandle(url: String): Boolean =
-        engine.payloadsFor(url).any { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
+    override fun canHandle(url: String): Boolean {
+        val host = UrlUtils.host(url)?.lowercase().orEmpty()
+        if (host.contains("youtube.com") || host.contains("youtu.be")) {
+            return false // Always let YouTubeExtractor resolve full InnerTube formats
+        }
+        return engine.payloadsFor(url).any { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
+    }
 
     override suspend fun extract(url: String): ResolvedMedia? = coroutineScope {
         val candidates = engine.payloadsFor(url)
             .filter { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
-            .distinctBy { MediaSniffer.cleanMediaUrl(it.url).substringBefore('?') }
+            .distinctBy { MediaSniffer.dedupeKey(it.url) }
 
         if (candidates.isEmpty()) return@coroutineScope null
 
@@ -65,39 +70,68 @@ class InterceptedMediaExtractor @Inject constructor(
             }
         }.awaitAll().flatten()
 
-        // Deduplicate by bare URL and filter out tiny tracking fragments (< 15 KB if size is known)
+        // Deduplicate by canonical key and filter out tiny tracking fragments (< 15 KB if size is known)
         val filtered = resolvedStreams
             .filter { it.type == MediaType.VIDEO || it.type == MediaType.AUDIO }
             .filter { (it.sizeBytes ?: Long.MAX_VALUE) > 15_000L }
-            .distinctBy { it.url.substringBefore('?') }
+            .distinctBy { MediaSniffer.dedupeKey(it.url) }
 
         if (filtered.isEmpty()) return@coroutineScope null
 
-        // Assign clean, distinct labels when multiple video or audio resolutions exist
-        val videos = filtered.filter { it.type == MediaType.VIDEO }
-            .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
-            .mapIndexed { idx, s ->
-                val label = when {
-                    s.height != null && s.height >= 1080 -> "${s.height}p FHD"
-                    s.height != null && s.height >= 720 -> "${s.height}p HD"
-                    s.height != null -> "${s.height}p"
-                    videosCountLabel(idx, filtered.count { it.type == MediaType.VIDEO }) != null ->
-                        videosCountLabel(idx, filtered.count { it.type == MediaType.VIDEO })!!
-                    else -> s.label
-                }
-                s.copy(id = "int-v-$idx", label = label)
-            }
-
-        val audios = filtered.filter { it.type == MediaType.AUDIO }
+        val rawAudios = filtered.filter { it.type == MediaType.AUDIO }
             .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
-            .mapIndexed { idx, s ->
-                val label = when {
-                    s.bitrateKbps != null -> "Audio (${s.bitrateKbps} kbps)"
-                    idx == 0 -> "Original Audio (${s.container.uppercase()})"
-                    else -> "Audio Track ${idx + 1} (${s.container.uppercase()})"
-                }
-                s.copy(id = "int-a-$idx", label = label)
+        val bestAudio = rawAudios.firstOrNull()
+
+        val rawVideos = filtered.filter { it.type == MediaType.VIDEO }
+            .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+
+        val videos = rawVideos.mapIndexed { idx, s ->
+            val label = when {
+                s.height != null && s.height >= 720 -> "High quality (${s.height}p)"
+                s.height != null -> "Fast (${s.height}p)"
+                videosCountLabel(idx, rawVideos.size) != null -> videosCountLabel(idx, rawVideos.size)!!
+                else -> s.label
             }
+            val needsAudio = bestAudio != null && !s.isHls && s.headers["X-Internal-Companion-Audio"] == null
+            val vBytes = s.sizeBytes ?: 0L
+            val aBytes = bestAudio?.sizeBytes ?: 0L
+            val combinedSize = if (needsAudio && vBytes > 0 && aBytes > 0) vBytes + aBytes else s.sizeBytes
+            val extraHeaders = LinkedHashMap<String, String>(s.headers).apply {
+                if (idx < 2) put("X-Internal-Quick", "true")
+                if (needsAudio && bestAudio != null) {
+                    put("X-Internal-Companion-Audio", bestAudio.url)
+                    if (vBytes > 0) put("X-Internal-Video-Bytes", vBytes.toString())
+                    if (aBytes > 0) put("X-Internal-Audio-Bytes", aBytes.toString())
+                }
+            }
+            s.copy(id = "int-v-$idx", label = label, sizeBytes = combinedSize, headers = extraHeaders)
+        }
+
+        val audios = if (bestAudio != null) {
+            listOf(
+                bestAudio.copy(
+                    id = "int-a-fast",
+                    container = "m4a",
+                    label = "Fast",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                bestAudio.copy(
+                    id = "int-a-mp3",
+                    container = "mp3",
+                    label = "Classic MP3",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true",
+                        "X-Internal-Default" to "true"
+                    )
+                )
+            )
+        } else {
+            emptyList()
+        }
 
         val finalStreams = videos + audios
         val title = pageTitle?.takeIf { it.isNotBlank() }
@@ -113,11 +147,11 @@ class InterceptedMediaExtractor @Inject constructor(
     }
 
     private fun videosCountLabel(index: Int, totalVideos: Int): String? {
-        if (totalVideos <= 1) return "HD Video"
+        if (totalVideos <= 1) return "High quality (720p)"
         return when (index) {
-            0 -> "HD Video (High Quality)"
-            1 -> "SD Video (Medium Quality)"
-            else -> "Video Quality ${index + 1}"
+            0 -> "High quality (720p)"
+            1 -> "Fast (360p)"
+            else -> "Fast (${index + 1})"
         }
     }
 

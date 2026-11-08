@@ -154,13 +154,15 @@ class HtmlMediaExtractor @Inject constructor(
             }
         }
 
-        // 3. Open Graph / Twitter card media (video & audio only)
+        // 3. Open Graph / Twitter card media (video & audio only; ignore iframe /embed/ HTML pages)
         val ogWidth = doc.select("meta[property=og:video:width]").attr("content").toIntOrNull()
         val ogHeight = doc.select("meta[property=og:video:height]").attr("content").toIntOrNull()
         doc.select("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url], meta[name=twitter:player:stream]")
             .forEach {
                 val content = it.attr("abs:content").ifBlank { it.attr("content") }
-                add(content, MediaType.VIDEO, containerFor(content, "mp4"), "Video", ogWidth, ogHeight)
+                if (!content.contains("/embed/", ignoreCase = true) && !content.contains("youtube.com/v/", ignoreCase = true)) {
+                    add(content, MediaType.VIDEO, containerFor(content, "mp4"), "Video", ogWidth, ogHeight)
+                }
             }
         doc.select("meta[property=og:audio], meta[property=og:audio:url], meta[property=og:audio:secure_url]")
             .forEach {
@@ -175,7 +177,7 @@ class HtmlMediaExtractor @Inject constructor(
             val expanded = runCatching { hlsExtractor.extract(hlsUrl, pageHeaders) }.getOrNull()
             if (expanded != null && expanded.streams.isNotEmpty()) {
                 expanded.streams.forEach { variant ->
-                    val k = variant.url.substringBefore('?')
+                    val k = com.melmeligy.mediadownloader.intercept.MediaSniffer.dedupeKey(variant.url)
                     if (!found.containsKey(k)) {
                         found[k] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
                     }
@@ -189,7 +191,7 @@ class HtmlMediaExtractor @Inject constructor(
         for (mpdUrl in mpdUrls) {
             val expanded = runCatching { dashExtractor.extract(mpdUrl, pageHeaders) }.getOrNull()
             expanded?.streams?.forEach { variant ->
-                val k = variant.url.substringBefore('?')
+                val k = com.melmeligy.mediadownloader.intercept.MediaSniffer.dedupeKey(variant.url)
                 if (!found.containsKey(k)) {
                     found[k] = variant.copy(id = "html-${counter++}", headers = pageHeaders)
                 }
@@ -199,8 +201,8 @@ class HtmlMediaExtractor @Inject constructor(
         directRegex.findAll(unescapedHtml).forEach { match ->
             classifyByExtension(match.value)?.let { (t, c) ->
                 val label = when {
-                    match.value.contains("hd", ignoreCase = true) -> "HD Video"
-                    match.value.contains("sd", ignoreCase = true) -> "SD Video"
+                    match.value.contains("hd", ignoreCase = true) -> "High quality (720p)"
+                    match.value.contains("sd", ignoreCase = true) -> "Fast (360p)"
                     else -> defaultLabel(t)
                 }
                 add(match.value, t, c, label)
@@ -221,18 +223,29 @@ class HtmlMediaExtractor @Inject constructor(
             .ifBlank { doc.title() }
             .ifBlank { UrlUtils.host(url) ?: "Media" }
 
-        // 5. Enrich direct streams with size estimates concurrently
+        // 5. Enrich direct streams with size estimates concurrently and discard HTML embed pages
         val rawStreams = found.values.toList()
         val streams = rawStreams.mapIndexed { i, stream ->
             async {
                 if (!stream.isHls && i < MAX_SIZE_PROBES) {
                     runCatching {
                         val info = http.probe(stream.url, stream.headers)
-                        if (info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
+                        val ct = info.contentType?.lowercase().orEmpty()
+                        if (ct.startsWith("text/html") || ct.startsWith("application/xhtml") || ct.startsWith("application/json")) {
+                            null
+                        } else if (info.contentLength > 0) {
+                            stream.copy(sizeBytes = info.contentLength)
+                        } else {
+                            stream
+                        }
                     }.getOrDefault(stream)
                 } else stream
             }
-        }.awaitAll()
+        }.awaitAll().filterNotNull()
+
+        if (streams.isEmpty()) {
+            return@coroutineScope runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+        }
 
         val sortedStreams = streams.sortedWith(
             compareBy<MediaStream> { it.type.ordinal }

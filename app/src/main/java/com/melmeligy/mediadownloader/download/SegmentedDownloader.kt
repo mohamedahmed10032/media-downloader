@@ -48,8 +48,12 @@ class SegmentedDownloader @Inject constructor(
     ) = coroutineScope {
         dest.parentFile?.mkdirs()
 
+        val isGoogleVideo = url.contains("googlevideo.com", ignoreCase = true)
         var total = knownTotal
-        var ranged = acceptsRanges
+        if (total <= 0 && isGoogleVideo) {
+            total = Regex("[?&]clen=(\\d+)").find(url)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
+        }
+        var ranged = acceptsRanges || isGoogleVideo
         if (total <= 0 || !ranged) {
             runCatching { http.probe(url, headers) }.getOrNull()?.let { info ->
                 if (total <= 0) total = info.contentLength
@@ -81,7 +85,7 @@ class SegmentedDownloader @Inject constructor(
 
         try {
             val tasks = (0 until n).map { i ->
-                async(Dispatchers.IO) { downloadSegment(url, headers, dest, bounds[i], positions, i, downloaded) }
+                async(Dispatchers.IO) { downloadSegment(url, headers, dest, bounds[i], positions, i, downloaded, isGoogleVideo) }
             }
             tasks.awaitAll()
         } finally {
@@ -101,17 +105,25 @@ class SegmentedDownloader @Inject constructor(
         bound: Pair<Long, Long>,
         positions: LongArray,
         index: Int,
-        downloaded: AtomicLong
+        downloaded: AtomicLong,
+        isGoogleVideo: Boolean
     ) {
         val (_, endInclusive) = bound
         var attempt = 0
         while (positions[index] <= endInclusive) {
             currentCoroutineContext().ensureActive()
             try {
+                val startByte = positions[index]
+                val chunkEnd = if (isGoogleVideo) {
+                    minOf(endInclusive, startByte + GOOGLE_VIDEO_CHUNK_BYTES - 1L)
+                } else {
+                    endInclusive
+                }
                 val request = http.buildRequest(url, headers)
-                    .header("Range", "bytes=${positions[index]}-$endInclusive")
+                    .header("Range", "bytes=$startByte-$chunkEnd")
                     .build()
 
+                var bytesInPass = 0L
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
@@ -119,18 +131,23 @@ class SegmentedDownloader @Inject constructor(
                         raf.seek(positions[index])
                         val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
                         body.byteStream().use { input ->
-                            while (true) {
+                            while (positions[index] <= chunkEnd) {
                                 currentCoroutineContext().ensureActive()
-                                val read = input.read(buffer)
+                                val maxToRead = minOf(buffer.size.toLong(), chunkEnd - positions[index] + 1L).toInt()
+                                val read = input.read(buffer, 0, maxToRead)
                                 if (read == -1) break
                                 raf.write(buffer, 0, read)
                                 positions[index] += read
+                                bytesInPass += read
                                 downloaded.addAndGet(read.toLong())
                             }
                         }
                     }
                 }
-                break
+                if (bytesInPass <= 0L && positions[index] <= endInclusive) {
+                    throw MediaException(AppError.GENERIC, "Segment stalled at ${positions[index]}")
+                }
+                attempt = 0
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -223,5 +240,9 @@ class SegmentedDownloader @Inject constructor(
 
     private fun persistPositions(idxFile: File, positions: LongArray) {
         runCatching { idxFile.writeText(positions.joinToString("\n")) }
+    }
+
+    private companion object {
+        const val GOOGLE_VIDEO_CHUNK_BYTES = 9_437_184L // 9 MB per ranged request to prevent YouTube CDN throttling
     }
 }

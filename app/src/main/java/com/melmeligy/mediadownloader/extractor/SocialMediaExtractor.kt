@@ -101,12 +101,18 @@ class SocialMediaExtractor @Inject constructor(
             label: String,
             width: Int? = null,
             height: Int? = null,
-            bitrateKbps: Int? = null
+            bitrateKbps: Int? = null,
+            isDashVideoOnly: Boolean = false
         ) {
             val cleaned = MediaSniffer.cleanMediaUrl(unescape(candidateUrl))
             if (!cleaned.startsWith("http")) return
             val key = cleaned.substringBefore('?')
             if (rawStreams.containsKey(key)) return
+            val extraHeaders = if (isDashVideoOnly) {
+                headers + ("X-Internal-Dash-VideoOnly" to "true")
+            } else {
+                headers
+            }
             rawStreams[key] = MediaStream(
                 id = "ig-${counter++}",
                 url = cleaned,
@@ -117,7 +123,7 @@ class SocialMediaExtractor @Inject constructor(
                 height = height,
                 bitrateKbps = bitrateKbps,
                 isHls = false,
-                headers = headers
+                headers = extraHeaders
             )
         }
 
@@ -126,7 +132,16 @@ class SocialMediaExtractor @Inject constructor(
         val dashRegex = Regex("<MPD[\\s\\S]*?</MPD>", RegexOption.IGNORE_CASE)
         dashRegex.findAll(unescapedHtml).forEach { match ->
             parseDashXml(match.value).forEach { s ->
-                addCandidate(s.url, s.type, s.container, s.label, s.width, s.height, s.bitrateKbps)
+                addCandidate(
+                    s.url,
+                    s.type,
+                    s.container,
+                    s.label,
+                    s.width,
+                    s.height,
+                    s.bitrateKbps,
+                    isDashVideoOnly = (s.type == MediaType.VIDEO)
+                )
             }
         }
 
@@ -141,11 +156,10 @@ class SocialMediaExtractor @Inject constructor(
                     val w = obj.optInt("width", 0).takeIf { it > 0 }
                     val h = obj.optInt("height", 0).takeIf { it > 0 }
                     val label = when {
-                        h != null && h >= 1080 -> "${h}p FHD"
-                        h != null && h >= 720 -> "${h}p HD"
-                        h != null -> "${h}p"
-                        i == 0 -> "HD Video"
-                        else -> "SD Video"
+                        h != null && h >= 720 -> "High quality (${h}p)"
+                        h != null -> "Fast (${h}p)"
+                        i == 0 -> "High quality (720p)"
+                        else -> "Fast (480p)"
                     }
                     addCandidate(vUrl, MediaType.VIDEO, "mp4", label, w, h)
                 }
@@ -155,19 +169,19 @@ class SocialMediaExtractor @Inject constructor(
         // 3. Parse direct video_url fields
         val videoUrlRegex = Regex("\"video_url\"\\s*:\\s*\"([^\"]+)\"")
         videoUrlRegex.findAll(unescapedHtml).forEach { match ->
-            addCandidate(match.groupValues[1], MediaType.VIDEO, "mp4", "HD Video")
+            addCandidate(match.groupValues[1], MediaType.VIDEO, "mp4", "High quality (720p)")
         }
 
         // 4. Parse explicit <video class="EmbeddedMediaVideo" src="...">
         doc.select("video[src], video source[src]").forEach { el ->
             val src = el.absUrl("src").ifBlank { el.attr("src") }
-            addCandidate(src, MediaType.VIDEO, "mp4", "HD Video")
+            addCandidate(src, MediaType.VIDEO, "mp4", "High quality (720p)")
         }
 
         if (rawStreams.isEmpty()) return@coroutineScope null
 
         // Probe exact file sizes in parallel
-        val probed = rawStreams.values.take(8).map { stream ->
+        val probed = rawStreams.values.take(10).map { stream ->
             async {
                 runCatching {
                     val info = http.probe(stream.url, headers)
@@ -178,10 +192,54 @@ class SocialMediaExtractor @Inject constructor(
 
         if (probed.isEmpty()) return@coroutineScope null
 
+        val rawAudios = probed.filter { it.type == MediaType.AUDIO }
+            .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+        val bestAudio = rawAudios.firstOrNull()
+
         val videos = probed.filter { it.type == MediaType.VIDEO }
             .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
-        val audios = probed.filter { it.type == MediaType.AUDIO }
-            .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+            .map { v ->
+                if (v.headers["X-Internal-Dash-VideoOnly"] == "true" && bestAudio != null) {
+                    val vSize = v.sizeBytes ?: 0L
+                    val aSize = bestAudio.sizeBytes ?: 0L
+                    val combined = if (vSize > 0 && aSize > 0) vSize + aSize else v.sizeBytes
+                    v.copy(
+                        sizeBytes = combined,
+                        headers = v.headers + mapOf(
+                            "X-Internal-Companion-Audio" to bestAudio.url,
+                            "X-Internal-Video-Bytes" to vSize.toString(),
+                            "X-Internal-Audio-Bytes" to aSize.toString()
+                        )
+                    )
+                } else {
+                    v
+                }
+            }
+
+        val audios = if (bestAudio != null) {
+            listOf(
+                bestAudio.copy(
+                    id = "ig-audio-fast",
+                    container = "m4a",
+                    label = "Fast",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                bestAudio.copy(
+                    id = "ig-audio-mp3",
+                    container = "mp3",
+                    label = "Classic MP3",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            )
+        } else {
+            emptyList()
+        }
 
         val title = doc.select(".CaptionUsername").text().takeIf { it.isNotBlank() }?.let { "Instagram Reel (@$it)" }
             ?: doc.select("meta[property=og:title]").attr("content").takeIf { it.isNotBlank() }
