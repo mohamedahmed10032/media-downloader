@@ -72,7 +72,8 @@ import com.melmeligy.mediadownloader.ui.common.ErrorState
 import com.melmeligy.mediadownloader.ui.common.LoadingState
 import com.melmeligy.mediadownloader.ui.common.asMessage
 
-private val SnaptubeYellow = Color(0xFFFFD600)
+private val SnaptubePurple = Color(0xFF7C3AED)
+private val SnaptubePurpleHover = Color(0xFF6D28D9)
 private val SnaptubeDarkText = Color(0xFF141414)
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -161,14 +162,15 @@ fun ChooseFormatStateContent(
                     onClick = { onOpenInBrowser(url) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = SnaptubeYellow,
-                        contentColor = SnaptubeDarkText
+                        containerColor = SnaptubePurple,
+                        contentColor = Color.White
                     ),
                     shape = RoundedCornerShape(24.dp)
                 ) {
                     Text(
                         text = "Open in Browser to Auto-Catch Stream",
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
                 }
             }
@@ -254,14 +256,15 @@ private fun SnaptubeFormatSheetContent(
                         .height(50.dp),
                     shape = RoundedCornerShape(25.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = SnaptubeYellow,
-                        contentColor = SnaptubeDarkText
+                        containerColor = SnaptubePurple,
+                        contentColor = Color.White
                     )
                 ) {
                     Text(
                         text = stringResource(R.string.quality_download),
                         fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
                 }
             }
@@ -570,7 +573,7 @@ private fun SnaptubeFormatRow(
         Icon(
             imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
             contentDescription = null,
-            tint = if (isSelected) SnaptubeYellow else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+            tint = if (isSelected) SnaptubePurple else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
             modifier = Modifier.size(22.dp)
         )
     }

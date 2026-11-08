@@ -23,7 +23,7 @@ object Constants {
     // Downloads
     const val DEFAULT_SEGMENT_COUNT = 6
     const val MIN_SEGMENT_SIZE_BYTES = 512 * 1024L // 512 KB - below this, download single-threaded
-    const val DOWNLOAD_BUFFER_SIZE = 128 * 1024
+    const val DOWNLOAD_BUFFER_SIZE = 256 * 1024
     const val PROGRESS_THROTTLE_MS = 300L
     const val SEGMENT_MAX_RETRIES = 3
 

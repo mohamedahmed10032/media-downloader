@@ -208,6 +208,11 @@ class HeadlessWebExtractor @Inject constructor(
 
         if (resolved.isEmpty()) return@coroutineScope null
 
+        val rawAudios = resolved.filter { it.type == MediaType.AUDIO }
+            .distinctBy { it.url.substringBefore('?') }
+            .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+        val bestAudio = rawAudios.firstOrNull()
+
         val videos = resolved.filter { it.type == MediaType.VIDEO }
             .distinctBy { it.url.substringBefore('?') }
             .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
@@ -219,16 +224,49 @@ class HeadlessWebExtractor @Inject constructor(
                     i == 0 -> "HD Video"
                     else -> "SD Video"
                 }
-                s.copy(id = "hl-v-$i", label = label)
+                if (s.headers["X-Internal-Dash-VideoOnly"] == "true" && bestAudio != null) {
+                    val vSize = s.sizeBytes ?: 0L
+                    val aSize = bestAudio.sizeBytes ?: 0L
+                    val combined = if (vSize > 0 && aSize > 0) vSize + aSize else s.sizeBytes
+                    s.copy(
+                        id = "hl-v-$i",
+                        label = label,
+                        sizeBytes = combined,
+                        headers = s.headers + mapOf(
+                            "X-Internal-Companion-Audio" to bestAudio.url,
+                            "X-Internal-Video-Bytes" to vSize.toString(),
+                            "X-Internal-Audio-Bytes" to aSize.toString()
+                        )
+                    )
+                } else {
+                    s.copy(id = "hl-v-$i", label = label)
+                }
             }
 
-        val audios = resolved.filter { it.type == MediaType.AUDIO }
-            .distinctBy { it.url.substringBefore('?') }
-            .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
-            .mapIndexed { i, s ->
-                val label = if (i == 0) "Original Audio (${s.container.uppercase()})" else "Audio Track ${i + 1} (${s.container.uppercase()})"
-                s.copy(id = "hl-a-$i", label = label)
-            }
+        val audios = if (bestAudio != null) {
+            listOf(
+                bestAudio.copy(
+                    id = "hl-audio-fast",
+                    container = "m4a",
+                    label = "Fast",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                bestAudio.copy(
+                    id = "hl-audio-mp3",
+                    container = "mp3",
+                    label = "Classic MP3",
+                    headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            )
+        } else {
+            emptyList()
+        }
 
         val finalStreams = videos + audios
         if (finalStreams.isEmpty()) return@coroutineScope null

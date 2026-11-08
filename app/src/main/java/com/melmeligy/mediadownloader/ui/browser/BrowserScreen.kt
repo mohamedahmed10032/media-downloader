@@ -32,14 +32,13 @@ import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Home
-import androidx.compose.material.icons.rounded.MovieCreation
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Tab
-import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -49,7 +48,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -63,6 +61,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -73,14 +72,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.melmeligy.mediadownloader.core.Constants
-import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.intercept.BlobBridge
 import com.melmeligy.mediadownloader.intercept.BlobBridgeInterface
 import com.melmeligy.mediadownloader.intercept.HeaderExtractor
-import com.melmeligy.mediadownloader.intercept.MediaStreamPayload
 import com.melmeligy.mediadownloader.intercept.SniffingWebViewClient
-import com.melmeligy.mediadownloader.intercept.StreamType
 
 private const val DETECT_JS =
     "(function(){try{var n=document.querySelectorAll('video,audio,source').length;" +
@@ -346,11 +342,15 @@ fun BrowserScreen(
                         Button(
                             onClick = { openChooseFormatSheet() },
                             shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF7C3AED),
+                                contentColor = Color.White
+                            ),
                             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
                         ) {
-                            Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Download", fontWeight = FontWeight.SemiBold)
+                            Text("Download", fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     }
                 }
@@ -455,90 +455,7 @@ private fun TabsSheet(
     }
 }
 
-/** Lists everything the interception layer captured on the current page. */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun DetectionsSheet(
-    detections: List<MediaStreamPayload>,
-    pageUrl: String,
-    onPick: (MediaStreamPayload) -> Unit,
-    onScanPage: () -> Unit,
-    onClear: () -> Unit
-) {
-    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                "Download Options (${detections.size})",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-            TextButton(onClick = onClear) {
-                Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(16.dp))
-                Text(" Clear", style = MaterialTheme.typography.labelLarge)
-            }
-        }
 
-        if (pageUrl.startsWith("http")) {
-            OutlinedButton(
-                onClick = onScanPage,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                shape = RoundedCornerShape(10.dp)
-            ) {
-                Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Scan Full Page for All Video & Audio Qualities")
-            }
-        }
-
-        detections.forEach { payload ->
-            val size = payload.sizeBytes?.let { " • " + FormatUtils.formatBytes(it) }.orEmpty()
-            ListItem(
-                headlineContent = {
-                    Text(
-                        payload.suggestedTitle,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        fontWeight = FontWeight.Medium
-                    )
-                },
-                supportingContent = {
-                    Text(
-                        "${payload.streamType.name}$size",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                },
-                leadingContent = {
-                    Icon(
-                        Icons.Rounded.MovieCreation,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                },
-                trailingContent = {
-                    Button(
-                        onClick = { onPick(payload) },
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Rounded.Download, contentDescription = "Download", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Get")
-                    }
-                },
-                modifier = Modifier.clickableRow { onPick(payload) }
-            )
-        }
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

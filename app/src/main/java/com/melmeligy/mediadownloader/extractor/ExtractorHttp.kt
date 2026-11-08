@@ -71,6 +71,26 @@ class ExtractorHttp @Inject constructor(
         }
     }
 
+    /** Executes an HTTP POST request with form-encoded payload and returns the response body string. */
+    fun postForm(url: String, formBody: String, headers: Map<String, String> = emptyMap()): String {
+        val mediaType = "application/x-www-form-urlencoded; charset=utf-8".toMediaType()
+        val request = buildRequest(url, headers)
+            .post(formBody.toRequestBody(mediaType))
+            .build()
+        try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw mapHttpError(response.code)
+                return response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+            }
+        } catch (e: MediaException) {
+            throw e
+        } catch (e: UnknownHostException) {
+            throw MediaException(AppError.NO_INTERNET, e.message, e)
+        } catch (e: IOException) {
+            throw MediaException(AppError.GENERIC, e.message, e)
+        }
+    }
+
     /**
      * Probes [url] with a single-byte ranged GET. Returns content type, total size (when the
      * server reports it) and whether ranged requests are supported (enables segmented download).

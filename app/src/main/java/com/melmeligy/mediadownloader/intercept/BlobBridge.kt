@@ -140,7 +140,7 @@ object BlobBridge {
     safe(function () {
       var host = (location.hostname || '').toLowerCase();
       if (host.indexOf('instagram.com') > -1 || host.indexOf('tiktok.com') > -1 || host.indexOf('facebook.com') > -1) {
-        var dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+        var dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"], div[data-bloks-name], .modal, ._a9-v');
         for (var i = 0; i < dialogs.length; i++) {
           var d = dialogs[i];
           var txt = (d.innerText || '').toLowerCase();
@@ -148,6 +148,9 @@ object BlobBridge {
               txt.indexOf('open instagram') > -1 ||
               txt.indexOf('use the app') > -1 ||
               txt.indexOf('open app') > -1 ||
+              txt.indexOf('not now') > -1 ||
+              txt.indexOf('log in') > -1 ||
+              txt.indexOf('sign up') > -1 ||
               txt.indexOf('continue in app') > -1) {
             var closeBtn = d.querySelector('button[aria-label*="Close"], svg[aria-label*="Close"], [role="button"]');
             if (closeBtn && (closeBtn.innerText || '').toLowerCase().indexOf('open') === -1) {
@@ -159,7 +162,21 @@ object BlobBridge {
             }
           }
         }
+        var fixedOverlays = document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]');
+        for (var f = 0; f < fixedOverlays.length; f++) {
+          var fo = fixedOverlays[f];
+          var fotxt = (fo.innerText || '').toLowerCase();
+          if (fotxt.indexOf('watch this reel') > -1 || fotxt.indexOf('open instagram') > -1) {
+            fo.style.display = 'none';
+          }
+        }
         document.body.style.overflow = 'auto';
+        var videos = document.querySelectorAll('video');
+        for (var v = 0; v < videos.length; v++) {
+          var vid = videos[v];
+          vid.muted = true;
+          vid.play().catch(function(){});
+        }
       }
     });
   }
