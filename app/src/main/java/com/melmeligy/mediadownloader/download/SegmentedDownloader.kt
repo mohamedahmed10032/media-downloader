@@ -61,7 +61,7 @@ class SegmentedDownloader @Inject constructor(
             }
         }
 
-        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1
+        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1 && !isGoogleVideo
         if (!canSegment) {
             singleStream(url, headers, dest, total, ranged, onProgress)
             return@coroutineScope
@@ -166,15 +166,7 @@ class SegmentedDownloader @Inject constructor(
         acceptsRanges: Boolean,
         onProgress: ProgressCallback
     ) = coroutineScope {
-        val existing = if (dest.exists()) dest.length() else 0L
-        val resume = acceptsRanges && existing > 0 && (total <= 0 || existing < total)
-        if (!resume && dest.exists()) dest.delete()
-
-        val builder = http.buildRequest(url, headers)
-        if (resume) builder.header("Range", "bytes=$existing-")
-        val request = builder.build()
-
-        val downloaded = AtomicLong(if (resume) existing else 0L)
+        val downloaded = AtomicLong(if (dest.exists()) dest.length() else 0L)
         val tracker = SpeedTracker(downloaded.get())
         val progressJob = launch {
             while (isActive) {
@@ -183,22 +175,53 @@ class SegmentedDownloader @Inject constructor(
             }
         }
 
+        var attempt = 0
         try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
-                val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty body")
-                java.io.FileOutputStream(dest, resume).use { output ->
-                    val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
-                    body.byteStream().use { input ->
-                        while (true) {
-                            currentCoroutineContext().ensureActive()
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            output.write(buffer, 0, read)
-                            downloaded.addAndGet(read.toLong())
+            while (total <= 0 || downloaded.get() < total) {
+                currentCoroutineContext().ensureActive()
+                val existing = if (dest.exists()) dest.length() else 0L
+                val canResume = acceptsRanges && existing > 0 && (total <= 0 || existing < total)
+                if (!canResume && dest.exists() && attempt == 0 && downloaded.get() == 0L) {
+                    dest.delete()
+                }
+
+                val builder = http.buildRequest(url, headers)
+                if (canResume) builder.header("Range", "bytes=$existing-")
+                val request = builder.build()
+
+                try {
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
+                        val isPartial = response.code == 206
+                        val append = canResume && isPartial
+                        if (!append && existing > 0) {
+                            downloaded.set(0L)
+                        } else if (append) {
+                            downloaded.set(existing)
+                        }
+                        val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty body")
+                        java.io.FileOutputStream(dest, append).use { output ->
+                            val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
+                            body.byteStream().use { input ->
+                                while (true) {
+                                    currentCoroutineContext().ensureActive()
+                                    val read = input.read(buffer)
+                                    if (read == -1) break
+                                    output.write(buffer, 0, read)
+                                    downloaded.addAndGet(read.toLong())
+                                }
+                            }
+                            output.flush()
                         }
                     }
-                    output.flush()
+                    // Successfully drained response stream
+                    break
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (e: Exception) {
+                    attempt++
+                    if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                    delay(500L * attempt)
                 }
             }
         } finally {

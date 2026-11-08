@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -42,6 +43,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -252,6 +255,35 @@ fun BrowserScreen(
                 }
             )
         },
+        floatingActionButton = {
+            BadgedBox(
+                badge = {
+                    if (detections.isNotEmpty()) {
+                        Badge(
+                            containerColor = Color(0xFFEF4444),
+                            contentColor = Color.White
+                        ) {
+                            Text("${detections.size}")
+                        }
+                    }
+                }
+            ) {
+                FloatingActionButton(
+                    onClick = { openChooseFormatSheet() },
+                    containerColor = Color(0xFFFACC15), // Snaptube iconic Yellow
+                    contentColor = Color.Black,
+                    shape = CircleShape,
+                    elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 8.dp)
+                ) {
+                    Icon(
+                        Icons.Rounded.Download,
+                        contentDescription = "Download media",
+                        modifier = Modifier.size(28.dp),
+                        tint = Color.Black
+                    )
+                }
+            }
+        },
         bottomBar = {
             BottomAppBar {
                 IconButton(onClick = { if (canGoBack) webView.goBack() }, enabled = canGoBack) {
@@ -269,18 +301,17 @@ fun BrowserScreen(
                 IconButton(onClick = { showTabs = true }) {
                     Icon(Icons.Rounded.Tab, contentDescription = "Tabs (${tabs.size})")
                 }
-                if (detections.isNotEmpty() || hasMedia) {
-                    IconButton(onClick = { openChooseFormatSheet() }) {
-                        BadgedBox(badge = {
-                            if (detections.isNotEmpty()) {
-                                Badge { Text("${detections.size}") }
-                            }
-                        }) {
-                            Icon(
-                                Icons.Rounded.Download,
-                                contentDescription = "Choose Format & Download"
-                            )
+                IconButton(onClick = { openChooseFormatSheet() }) {
+                    BadgedBox(badge = {
+                        if (detections.isNotEmpty()) {
+                            Badge { Text("${detections.size}") }
                         }
+                    }) {
+                        Icon(
+                            Icons.Rounded.Download,
+                            contentDescription = "Choose Format & Download",
+                            tint = if (detections.isNotEmpty() || hasMedia) Color(0xFF7C3AED) else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }

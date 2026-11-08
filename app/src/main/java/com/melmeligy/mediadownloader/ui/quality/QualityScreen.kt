@@ -712,6 +712,7 @@ private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStr
     val rawImages = resolved.streams
         .filter { it.type == MediaType.IMAGE }
         .distinctBy { it.url }
+        .sortedByDescending { it.sizeBytes ?: 0L }
         .map { img ->
             val label = if (img.label.startsWith("Photo") || img.label.startsWith("Image")) img.label else "Photo (${img.container.uppercase()})"
             img.copy(label = label)

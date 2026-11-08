@@ -938,39 +938,44 @@ class SocialMediaExtractor @Inject constructor(
             )
         }
 
-        // 2. Original HD image extraction (i.pinimg.com/originals/)
+        // 2. Original HD image extraction (i.pinimg.com/originals/) or high-res 736x fallback
         val origRegex = Regex("https://i\\.pinimg\\.com/originals/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
         val origUrls = origRegex.findAll(html).map { it.value }.distinct().toList()
-        for ((idx, imgUrl) in origUrls.withIndex()) {
-            if (thumb == null) thumb = imgUrl
-            val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
-            val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
-            streams += MediaStream(
-                id = "pin-img-$idx",
-                url = imgUrl,
-                type = MediaType.IMAGE,
-                container = ext,
-                label = "Photo (Original HD)",
-                sizeBytes = info?.contentLength?.takeIf { it > 0 },
-                isHls = false
-            )
+        val candidateImgUrls = if (origUrls.isNotEmpty()) {
+            origUrls
+        } else {
+            Regex("https://i\\.pinimg\\.com/736x/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
+                .findAll(html).map { it.value }.distinct().toList()
         }
 
-        // 3. Fallback high-res image (736x) if no originals found
-        if (origUrls.isEmpty()) {
-            val hiResRegex = Regex("https://i\\.pinimg\\.com/736x/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
-            val hiResUrls = hiResRegex.findAll(html).map { it.value }.distinct().toList()
-            for ((idx, imgUrl) in hiResUrls.withIndex()) {
+        if (candidateImgUrls.isNotEmpty()) {
+            val probedImages = candidateImgUrls.take(6).map { imgUrl ->
+                async {
+                    val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
+                    val size = info?.contentLength?.takeIf { it > 0 } ?: 0L
+                    val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
+                    Triple(imgUrl, size, ext)
+                }
+            }.awaitAll()
+
+            val maxSize = probedImages.maxOfOrNull { it.second } ?: 0L
+            val validImages = if (maxSize >= 50_000L) {
+                probedImages.filter { it.second >= 25_000L }
+            } else {
+                probedImages
+            }.sortedByDescending { it.second }
+
+            for ((idx, entry) in validImages.withIndex()) {
+                val (imgUrl, size, ext) = entry
                 if (thumb == null) thumb = imgUrl
-                val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
-                val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
+                val label = if (idx == 0) "Photo (Original HD)" else "Photo (Standard)"
                 streams += MediaStream(
-                    id = "pin-img-736-$idx",
+                    id = "pin-img-$idx",
                     url = imgUrl,
                     type = MediaType.IMAGE,
                     container = ext,
-                    label = "Photo (736p HD)",
-                    sizeBytes = info?.contentLength?.takeIf { it > 0 },
+                    label = label,
+                    sizeBytes = size.takeIf { it > 0 },
                     isHls = false
                 )
             }

@@ -38,22 +38,26 @@ class DirectMediaExtractor @Inject constructor(
             contentType.startsWith("audio/") -> MediaType.AUDIO
             else -> return null
         }
-        // Images are the ImageExtractor's job.
-        if (type == MediaType.IMAGE) return null
-
         val container = ext ?: contentType.substringAfter('/', "bin").ifBlank { "bin" }
         val fileName = UrlUtils.fileNameFromUrl(url)
+        val finalUrl = info?.finalUrl ?: url
+        val label = when (type) {
+            MediaType.VIDEO -> "Original quality"
+            MediaType.AUDIO -> "Original audio"
+            MediaType.IMAGE -> "Original image"
+        }
         val stream = MediaStream(
             id = "direct-0",
-            url = info?.finalUrl ?: url,
+            url = finalUrl,
             type = type,
             container = container,
-            label = if (type == MediaType.VIDEO) "Original quality" else "Original audio",
+            label = label,
             sizeBytes = info?.contentLength?.takeIf { it > 0 }
         )
         return ResolvedMedia(
             sourceUrl = url,
             title = fileName,
+            thumbnailUrl = if (type == MediaType.IMAGE) finalUrl else null,
             streams = listOf(stream),
             extractor = name
         )

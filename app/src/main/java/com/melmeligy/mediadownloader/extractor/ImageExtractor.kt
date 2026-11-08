@@ -31,9 +31,10 @@ class ImageExtractor @Inject constructor(
         if (!isImage) return null
 
         val container = ext ?: contentType.substringAfter('/', "jpg").ifBlank { "jpg" }
+        val directUrl = info?.finalUrl ?: url
         val stream = MediaStream(
             id = "image-0",
-            url = info?.finalUrl ?: url,
+            url = directUrl,
             type = MediaType.IMAGE,
             container = container,
             label = "Original image",
@@ -42,6 +43,7 @@ class ImageExtractor @Inject constructor(
         return ResolvedMedia(
             sourceUrl = url,
             title = UrlUtils.fileNameFromUrl(url),
+            thumbnailUrl = directUrl,
             streams = listOf(stream),
             extractor = name
         )
