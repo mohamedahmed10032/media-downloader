@@ -32,17 +32,46 @@ class ExtractorRegistry @Inject constructor(
             throw MediaException(AppError.NO_INTERNET)
         }
 
-        val ordered = orderedCandidates(url)
+        val willing = extractors.filter { it.canHandle(url) }.sortedByDescending { it.priority }
         var lastError: MediaException? = null
 
-        for (extractor in ordered) {
+        for (extractor in willing) {
             try {
                 val result = extractor.extract(url)
                 if (result != null && result.streams.isNotEmpty()) {
                     return@withContext result
                 }
             } catch (e: MediaException) {
-                // Keep the most informative error, but keep trying other extractors.
+                lastError = preferMoreSpecific(lastError, e)
+            } catch (e: Exception) {
+                lastError = lastError ?: MediaException(AppError.GENERIC, e.message, e)
+            }
+        }
+
+        // If a specialized extractor handles this walled domain (Instagram, TikTok, YouTube, etc.)
+        // and found no streams, do not waste 60+ seconds probing generic HTML/HLS/DASH/Direct extractors.
+        val host = UrlUtils.host(url)?.lowercase().orEmpty()
+        val isWalledSocial = host.contains("instagram.com") ||
+            host.contains("tiktok.com") ||
+            host.contains("youtube.com") ||
+            host.contains("youtu.be") ||
+            host.contains("facebook.com") ||
+            host.contains("fb.watch") ||
+            host.contains("twitter.com") ||
+            host.contains("x.com")
+
+        if (willing.isNotEmpty() && isWalledSocial) {
+            throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
+        }
+
+        val fallback = extractors.filterNot { it.canHandle(url) }.sortedByDescending { it.priority }
+        for (extractor in fallback) {
+            try {
+                val result = extractor.extract(url)
+                if (result != null && result.streams.isNotEmpty()) {
+                    return@withContext result
+                }
+            } catch (e: MediaException) {
                 lastError = preferMoreSpecific(lastError, e)
             } catch (e: Exception) {
                 lastError = lastError ?: MediaException(AppError.GENERIC, e.message, e)
@@ -50,12 +79,6 @@ class ExtractorRegistry @Inject constructor(
         }
 
         throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
-    }
-
-    private fun orderedCandidates(url: String): List<MediaExtractor> {
-        val willing = extractors.filter { it.canHandle(url) }.sortedByDescending { it.priority }
-        val fallback = extractors.filterNot { it.canHandle(url) }.sortedByDescending { it.priority }
-        return willing + fallback
     }
 
     private fun preferMoreSpecific(current: MediaException?, candidate: MediaException): MediaException {

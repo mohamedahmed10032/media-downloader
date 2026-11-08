@@ -22,9 +22,12 @@ object FormatUtils {
         }
     }
 
-    /** Formats a transfer rate, e.g. 1_048_576 -> "1.0 MB/s". */
-    fun formatSpeed(bytesPerSecond: Long): String =
-        if (bytesPerSecond <= 0) "--" else "${formatBytes(bytesPerSecond)}/s"
+    /** Formats a transfer rate in MB/s (e.g. 1.85 MB/s, 0.45 MB/s). */
+    fun formatSpeed(bytesPerSecond: Long): String {
+        if (bytesPerSecond <= 0) return "--"
+        val mbPerSec = bytesPerSecond.toDouble() / (1024.0 * 1024.0)
+        return String.format(Locale.US, "%.2f MB/s", mbPerSec)
+    }
 
     /** Formats an ETA in seconds into "mm:ss" / "hh:mm:ss". */
     fun formatEta(seconds: Long): String {

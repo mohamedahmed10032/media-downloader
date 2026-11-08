@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.melmeligy.mediadownloader.R
+import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.ui.common.DownloadRow
 import com.melmeligy.mediadownloader.ui.common.RequestRuntimePermissions
 
@@ -81,16 +82,29 @@ fun HomeScreen(
 
     // Automatically inspect clipboard for a ready-to-download media link.
     LaunchedEffect(Unit) {
-        val candidate = clipboard.getText()?.text?.trim()
-        if (!candidate.isNullOrBlank() && viewModel.isUrl(candidate)) {
-            clipboardUrl = candidate
+        val raw = clipboard.getText()?.text?.trim()
+        if (!raw.isNullOrBlank()) {
+            val clean = UrlUtils.extractFirstUrl(raw) ?: if (viewModel.isUrl(raw)) UrlUtils.normalize(raw) else null
+            if (clean != null) {
+                clipboardUrl = clean
+                if (input.isBlank()) {
+                    input = clean
+                }
+            }
         }
     }
 
     fun submit() {
         val text = input.trim()
         if (text.isEmpty()) return
-        if (viewModel.isUrl(text)) onDetect(text) else onOpenBrowser(text)
+        val clean = UrlUtils.extractFirstUrl(text) ?: UrlUtils.normalize(text)
+        if (clean != null) {
+            onDetect(clean)
+        } else if (viewModel.isUrl(text)) {
+            onDetect(text)
+        } else {
+            onOpenBrowser(text)
+        }
     }
 
     LazyColumn(
@@ -152,8 +166,9 @@ fun HomeScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Button(
                             onClick = {
-                                input = detectedClip
-                                onDetect(detectedClip)
+                                val clean = UrlUtils.extractFirstUrl(detectedClip) ?: UrlUtils.normalize(detectedClip) ?: detectedClip
+                                input = clean
+                                onDetect(clean)
                             },
                             shape = RoundedCornerShape(10.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
@@ -179,7 +194,10 @@ fun HomeScreen(
                 singleLine = true,
                 trailingIcon = {
                     IconButton(onClick = {
-                        clipboard.getText()?.text?.let { input = it.trim() }
+                        clipboard.getText()?.text?.let { raw ->
+                            val clean = UrlUtils.extractFirstUrl(raw.trim()) ?: UrlUtils.normalize(raw.trim()) ?: raw.trim()
+                            input = clean
+                        }
                     }) {
                         Icon(Icons.Rounded.ContentPaste, contentDescription = stringResource(R.string.home_paste_from_clipboard))
                     }

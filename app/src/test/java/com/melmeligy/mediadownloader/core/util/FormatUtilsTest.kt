@@ -24,6 +24,14 @@ class FormatUtilsTest {
     }
 
     @Test
+    fun formatSpeed_formatsInMegabytesPerSecond() {
+        assertEquals("--", FormatUtils.formatSpeed(0))
+        assertEquals("0.50 MB/s", FormatUtils.formatSpeed(512 * 1024))
+        assertEquals("1.00 MB/s", FormatUtils.formatSpeed(1024L * 1024))
+        assertEquals("2.50 MB/s", FormatUtils.formatSpeed((2.5 * 1024 * 1024).toLong()))
+    }
+
+    @Test
     fun formatPercent_clampsRange() {
         assertEquals("50%", FormatUtils.formatPercent(0.5f))
         assertEquals("0%", FormatUtils.formatPercent(-1f))

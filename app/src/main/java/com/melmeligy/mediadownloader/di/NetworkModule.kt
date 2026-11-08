@@ -27,11 +27,16 @@ object NetworkModule {
             level = if (BuildConfig.DEBUG) HttpLoggingInterceptor.Level.BASIC
             else HttpLoggingInterceptor.Level.NONE
         }
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 32
+        }
         return OkHttpClient.Builder()
+            .dispatcher(dispatcher)
             .connectTimeout(Constants.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(Constants.READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .writeTimeout(Constants.WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .connectionPool(okhttp3.ConnectionPool(16, 5, TimeUnit.MINUTES))
+            .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
             .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)

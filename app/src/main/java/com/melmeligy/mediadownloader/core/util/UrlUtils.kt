@@ -15,9 +15,39 @@ object UrlUtils {
     private val urlLikeRegex = Regex("^[\\w.-]+\\.[a-zA-Z]{2,}(/.*)?$")
     private val embeddedHttpUrlRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
 
+    private val trackingQueryParams = setOf(
+        "igsh", "igshid", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+        "utm_content", "fbclid"
+    )
+    private val instagramPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:reel|reels|p|tv|share/reel|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+
+    /** Cleans social tracking parameters and normalizes paths (e.g. Instagram Reels). */
+    fun cleanSocialUrl(url: String): String {
+        val trimmed = url.trim()
+        val igMatch = instagramPattern.find(trimmed)
+        if (igMatch != null) {
+            val shortcode = igMatch.groupValues[1]
+            return "https://www.instagram.com/reel/$shortcode/"
+        }
+        return runCatching {
+            val uri = URI(trimmed)
+            val query = uri.rawQuery ?: return@runCatching trimmed
+            val cleanedQuery = query.split('&').filterNot { param ->
+                val key = param.substringBefore('=').lowercase()
+                key in trackingQueryParams
+            }.joinToString("&")
+            val newQuery = if (cleanedQuery.isBlank()) "" else "?$cleanedQuery"
+            val portPart = if (uri.port != -1) ":${uri.port}" else ""
+            "${uri.scheme}://${uri.host}$portPart${uri.rawPath}$newQuery"
+        }.getOrDefault(trimmed)
+    }
+
     /** Extracts the first http(s) URL embedded inside arbitrary share text, if any. */
-    fun extractFirstUrl(input: String): String? =
-        embeddedHttpUrlRegex.find(input)?.value?.trimEnd('.', ',', ';', ')', ']')
+    fun extractFirstUrl(input: String): String? {
+        val raw = embeddedHttpUrlRegex.find(input)?.value?.trimEnd('.', ',', ';', ')', ']', '>', '"', '\'')
+            ?: return null
+        return cleanSocialUrl(raw)
+    }
 
     /** True if the input looks like a URL or bare domain rather than a search phrase. */
     fun isProbablyUrl(input: String): Boolean {
@@ -38,10 +68,12 @@ object UrlUtils {
             !candidate.contains(' ') && isProbablyUrl(candidate) -> "https://$candidate"
             else -> return null
         }
-        return runCatching {
+        val validated = runCatching {
             val uri = URI(withScheme)
             if (uri.host.isNullOrBlank()) null else withScheme
-        }.getOrNull()
+        }.getOrNull() ?: return null
+
+        return cleanSocialUrl(validated)
     }
 
     /** Treats [input] as either a URL (normalised) or a Google search query. */

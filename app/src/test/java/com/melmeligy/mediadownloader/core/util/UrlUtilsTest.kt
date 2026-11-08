@@ -62,6 +62,13 @@ class UrlUtilsTest {
     }
 
     @Test
+    fun extractFirstUrl_normalizesInstagramSharedTextAndStripsTracking() {
+        val shared = "Watch this reel on Instagram https://www.instagram.com/share/reel/DEvv7ssup4o/?igsh=MTZvdjgzZnRsbzRuMg=="
+        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.extractFirstUrl(shared))
+        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.normalize(shared))
+    }
+
+    @Test
     fun cleanMediaUrl_stripsByteStartAndByteEndParams() {
         val instagramChunk = "https://scontent.cdninstagram.com/v/t50.2886-16/1234.mp4?efg=eyJ2&bytestart=0&byteend=250499&oe=6789"
         val cleaned = com.melmeligy.mediadownloader.intercept.MediaSniffer.cleanMediaUrl(instagramChunk)

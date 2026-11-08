@@ -1,5 +1,6 @@
 package com.melmeligy.mediadownloader.extractor
 
+import android.util.Base64
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.MediaStream
@@ -9,6 +10,7 @@ import com.melmeligy.mediadownloader.intercept.MediaSniffer
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -60,17 +62,24 @@ class SocialMediaExtractor @Inject constructor(
     override suspend fun extract(url: String): ResolvedMedia? {
         val host = UrlUtils.host(url)?.lowercase().orEmpty()
         val fastResult = runCatching {
-            when {
-                host.contains("instagram.com") -> extractInstagram(url)
-                host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") -> extractFacebook(url)
-                host.contains("twitter.com") || host.contains("x.com") -> extractTwitter(url)
-                host.contains("tiktok.com") -> extractTikTok(url)
-                else -> null
+            withTimeoutOrNull(8_000L) {
+                when {
+                    host.contains("instagram.com") -> extractInstagram(url)
+                    host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") -> extractFacebook(url)
+                    host.contains("twitter.com") || host.contains("x.com") -> extractTwitter(url)
+                    host.contains("tiktok.com") -> extractTikTok(url)
+                    else -> null
+                }
             }
         }.getOrNull()
 
         if (fastResult != null && fastResult.streams.isNotEmpty()) {
             return fastResult
+        }
+
+        // For Instagram, do NOT fall back to detached Headless WebView (it cannot play media and causes a freeze)
+        if (host.contains("instagram.com")) {
+            return null
         }
 
         // Fallback to Headless WebView to execute JS/GraphQL and intercept live CDN streams
@@ -191,8 +200,66 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
+        // Method 0: High-speed FastDL resolver (direct progressive CDN MP4)
+        runCatching {
+            val fastDlHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin" to "https://fastdl.to",
+                "Referer" to "https://fastdl.to/en",
+                "X-Requested-With" to "XMLHttpRequest",
+                "Accept" to "*/*"
+            )
+            val canonicalReel = "https://www.instagram.com/reel/$shortcode/"
+            val postBody = "q=" + URLEncoder.encode(canonicalReel, "UTF-8") + "&t=media&lang=en&v=v2"
+            val respJson = http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
+            val jsonRoot = JSONObject(respJson)
+            if (jsonRoot.optString("status") == "ok") {
+                val dataHtml = jsonRoot.optString("data")
+                if (dataHtml.isNotBlank()) {
+                    val doc = Jsoup.parse(dataHtml)
+                    val img = doc.select("div.download-items__thumb img").firstOrNull()
+                    val thumbUrl = img?.let { el ->
+                        el.attr("data-src").takeIf { it.isNotBlank() } ?: el.attr("src")
+                    }
+                    if (!thumbUrl.isNullOrBlank() && thumbUrl.startsWith("http")) {
+                        capturedThumb = thumbUrl
+                    }
+
+                    doc.select("a[href]").forEach { a ->
+                        val href = a.attr("href")
+                        val title = a.attr("title").ifBlank { a.text() }
+                        if (href.startsWith("http") && !title.contains("SoundCloud", ignoreCase = true) && !title.contains("other video", ignoreCase = true)) {
+                            var directMediaUrl = href
+                            if (href.contains("token=")) {
+                                runCatching {
+                                    val token = href.substringAfter("token=").substringBefore('&')
+                                    val parts = token.split('.')
+                                    if (parts.size >= 2) {
+                                        val payloadBase64 = parts[1]
+                                        val decodedBytes = Base64.decode(payloadBase64, Base64.URL_SAFE or Base64.NO_PADDING)
+                                        val payloadJson = JSONObject(String(decodedBytes, Charsets.UTF_8))
+                                        val innerUrl = payloadJson.optString("url")
+                                        if (innerUrl.isNotBlank() && innerUrl.startsWith("http")) {
+                                            directMediaUrl = innerUrl
+                                        }
+                                    }
+                                }
+                            }
+                            val isImage = title.contains("Image", ignoreCase = true) || title.contains("Photo", ignoreCase = true)
+                            if (isImage) {
+                                addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Photo (HD)")
+                            } else {
+                                addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Method 1: Snaptube Polaris LoggedOut Desktop GraphQL API
-        if (mediaId != null) {
+        if (rawStreams.isEmpty() && mediaId != null) {
             runCatching {
                 val polarisHeaders = mapOf(
                     "X-IG-App-ID" to "1217981644879628",
@@ -297,6 +364,30 @@ class SocialMediaExtractor @Inject constructor(
                     container = "mp3",
                     label = "Classic MP3",
                     headers = bestAudio.headers + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            )
+        } else if (videos.isNotEmpty()) {
+            val v = videos.first()
+            listOf(
+                v.copy(
+                    id = "ig-audio-fast",
+                    type = MediaType.AUDIO,
+                    container = "m4a",
+                    label = "Fast",
+                    headers = v.headers + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                v.copy(
+                    id = "ig-audio-mp3",
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    headers = v.headers + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )
