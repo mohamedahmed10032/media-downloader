@@ -115,9 +115,8 @@ class VideoAudioMuxer @Inject constructor() {
         } catch (e: Exception) {
             // Fallback: if muxing fails (e.g. non-MP4 codec on legacy device), preserve the video file
             runCatching {
-                if (!outputFile.exists() || outputFile.length() <= 0L) {
-                    videoFile.copyTo(outputFile, overwrite = true)
-                }
+                outputFile.delete()
+                videoFile.copyTo(outputFile, overwrite = true)
             }
             outputFile.exists() && outputFile.length() > 0L
         } finally {
@@ -151,14 +150,20 @@ class VideoAudioMuxer @Inject constructor() {
 
             val buffer = ByteBuffer.allocateDirect(512 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
+            var firstPtsUs = -1L
+            var lastPtsUs = -1L
             while (true) {
                 val sampleSize = extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
-                val pts = extractor.sampleTime
+                var pts = extractor.sampleTime
                 if (pts < 0) {
                     extractor.advance()
                     continue
                 }
+                if (firstPtsUs < 0L) firstPtsUs = pts
+                pts = (pts - firstPtsUs).coerceAtLeast(0L)
+                if (pts <= lastPtsUs) pts = lastPtsUs + 1000L
+                lastPtsUs = pts
                 bufferInfo.offset = 0
                 bufferInfo.size = sampleSize
                 bufferInfo.presentationTimeUs = pts
@@ -174,9 +179,94 @@ class VideoAudioMuxer @Inject constructor() {
             outputFile.exists() && outputFile.length() > 0L
         } catch (e: Exception) {
             runCatching {
-                if (!outputFile.exists() || outputFile.length() <= 0L) {
-                    sourceFile.copyTo(outputFile, overwrite = true)
+                outputFile.delete()
+                sourceFile.copyTo(outputFile, overwrite = true)
+            }
+            outputFile.exists() && outputFile.length() > 0L
+        } finally {
+            runCatching { extractor?.release() }
+            runCatching { muxer?.release() }
+        }
+    }
+
+    @SuppressLint("WrongConstant")
+    fun remuxTsToMp4(tsFile: File, outputFile: File): Boolean {
+        if (!tsFile.exists() || tsFile.length() <= 0L) return false
+        var extractor: MediaExtractor? = null
+        var muxer: MediaMuxer? = null
+        return try {
+            outputFile.parentFile?.mkdirs()
+            if (outputFile.exists()) outputFile.delete()
+
+            extractor = MediaExtractor().apply { setDataSource(tsFile.absolutePath) }
+            val videoTrack = selectTrack(extractor, "video/")
+            val audioTrack = selectTrack(extractor, "audio/")
+
+            if (videoTrack < 0 && audioTrack < 0) {
+                tsFile.copyTo(outputFile, overwrite = true)
+                return true
+            }
+
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val dstVideoTrack = if (videoTrack >= 0) {
+                extractor.selectTrack(videoTrack)
+                val format = extractor.getTrackFormat(videoTrack)
+                if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                    runCatching { muxer.setOrientationHint(format.getInteger(MediaFormat.KEY_ROTATION)) }
                 }
+                muxer.addTrack(format)
+            } else -1
+
+            val dstAudioTrack = if (audioTrack >= 0) {
+                extractor.selectTrack(audioTrack)
+                val format = extractor.getTrackFormat(audioTrack)
+                muxer.addTrack(format)
+            } else -1
+
+            muxer.start()
+
+            val buffer = ByteBuffer.allocateDirect(1024 * 1024)
+            val bufferInfo = MediaCodec.BufferInfo()
+            var firstPtsUs = -1L
+            var lastVideoPtsUs = -1L
+            var lastAudioPtsUs = -1L
+
+            while (true) {
+                val sampleSize = extractor.readSampleData(buffer, 0)
+                if (sampleSize < 0) break
+                val trackIndex = extractor.sampleTrackIndex
+                val dstTrack = if (trackIndex == videoTrack) dstVideoTrack
+                else if (trackIndex == audioTrack) dstAudioTrack
+                else -1
+
+                if (dstTrack >= 0) {
+                    var pts = extractor.sampleTime
+                    if (pts >= 0) {
+                        if (firstPtsUs < 0L) firstPtsUs = pts
+                        pts = (pts - firstPtsUs).coerceAtLeast(0L)
+                        if (trackIndex == videoTrack) {
+                            if (pts <= lastVideoPtsUs) pts = lastVideoPtsUs + 1000L
+                            lastVideoPtsUs = pts
+                        } else {
+                            if (pts <= lastAudioPtsUs) pts = lastAudioPtsUs + 1000L
+                            lastAudioPtsUs = pts
+                        }
+                        bufferInfo.offset = 0
+                        bufferInfo.size = sampleSize
+                        bufferInfo.presentationTimeUs = pts
+                        bufferInfo.flags = extractor.sampleFlags
+                        muxer.writeSampleData(dstTrack, buffer, bufferInfo)
+                    }
+                }
+                extractor.advance()
+            }
+
+            runCatching { muxer.stop() }
+            outputFile.exists() && outputFile.length() > 0L
+        } catch (e: Exception) {
+            runCatching {
+                outputFile.delete()
+                tsFile.copyTo(outputFile, overwrite = true)
             }
             outputFile.exists() && outputFile.length() > 0L
         } finally {

@@ -18,6 +18,9 @@ class MediaSniffingInterceptor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
+        if (request.header("X-Internal-Download") != null) {
+            return chain.proceed(request)
+        }
         val response = chain.proceed(request)
 
         runCatching {

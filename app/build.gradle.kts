@@ -30,8 +30,8 @@ android {
         applicationId = "com.melmeligy.mediadownloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.8.0"
+        versionCode = 9
+        versionName = "1.9.0"
 
         testInstrumentationRunner = "com.melmeligy.mediadownloader.HiltTestRunner"
         vectorDrawables { useSupportLibrary = true }

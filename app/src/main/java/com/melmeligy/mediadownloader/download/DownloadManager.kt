@@ -20,6 +20,7 @@ import com.melmeligy.mediadownloader.core.util.JsonUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.model.MediaStream
+import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
@@ -67,12 +68,17 @@ class DownloadManager @Inject constructor(
     // ---- Public API used by the UI ----
 
     suspend fun enqueue(resolved: ResolvedMedia, stream: MediaStream): Long {
+        val finalContainer = when {
+            stream.type == MediaType.AUDIO -> stream.container
+            stream.isHls -> "mp4"
+            else -> stream.container
+        }
         val item = DownloadItem(
             title = resolved.title,
             sourceUrl = resolved.sourceUrl,
             remoteUrl = stream.url,
             type = stream.type,
-            container = if (stream.isHls) "ts" else stream.container,
+            container = finalContainer,
             qualityLabel = stream.label,
             status = DownloadStatus.QUEUED,
             totalBytes = stream.sizeBytes ?: 0,
@@ -166,10 +172,22 @@ class DownloadManager @Inject constructor(
             val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
 
             if (item.isHls) {
+                val stagingTs = File(stagingDir(), "dl_${item.id}_raw.ts.part")
                 val onProgress: ProgressCallback = { p ->
                     repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
                 }
-                hlsDownloader.download(item.remoteUrl, headers, staging, onProgress)
+                try {
+                    hlsDownloader.download(item.remoteUrl, headers, stagingTs, onProgress)
+                    withContext(dispatchers.io) {
+                        if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
+                            videoAudioMuxer.extractAudioOnly(stagingTs, staging)
+                        } else {
+                            videoAudioMuxer.remuxTsToMp4(stagingTs, staging)
+                        }
+                    }
+                } finally {
+                    runCatching { stagingTs.delete() }
+                }
             } else if (companionAudioUrl != null) {
                 val videoKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: 0L
                 val audioKnownBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull() ?: 0L
@@ -345,8 +363,16 @@ class DownloadManager @Inject constructor(
     private fun cleanupStaging(id: Long) {
         val dir = stagingDir()
         dir.listFiles()
-            ?.filter { it.name.startsWith("dl_$id.") || it.name.startsWith("dl_${id}_") }
-            ?.forEach { runCatching { it.delete() } }
+            ?.filter {
+                it.name.startsWith("dl_$id.") ||
+                    it.name.startsWith("dl_${id}_") ||
+                    it.name.startsWith("hls_parts_dl_${id}_")
+            }
+            ?.forEach {
+                runCatching {
+                    if (it.isDirectory) it.deleteRecursively() else it.delete()
+                }
+            }
     }
 
     private fun fileName(item: DownloadItem): String {

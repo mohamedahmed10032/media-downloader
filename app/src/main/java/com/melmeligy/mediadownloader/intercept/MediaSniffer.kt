@@ -34,7 +34,7 @@ object MediaSniffer {
 
     /** Segment / init markers. Matching URLs are never surfaced as downloadable items. */
     private val SEGMENT_HINTS = listOf(
-        ".m4s", "/seg-", "seg_", "init.mp4", "-frag", "chunk-", "chunk_", "/dash/segment"
+        ".ts", ".m4s", "/seg-", "seg_", "init.mp4", "-frag", "chunk-", "chunk_", "/dash/segment"
     )
 
     /** Analytics / tracking hosts that occasionally serve media-looking URLs. */
@@ -102,6 +102,7 @@ object MediaSniffer {
             mime in HLS_MIME || ext == "m3u8" || url.contains(".m3u8") -> StreamType.HLS
             mime in DASH_MIME || ext == "mpd" || url.contains(".mpd") -> StreamType.DASH
             url.startsWith("blob:") -> StreamType.BLOB
+            mime == "video/mp2t" || ext == "ts" -> StreamType.UNKNOWN
             isSegment(url) -> StreamType.UNKNOWN
             ext in PROGRESSIVE_EXT -> StreamType.PROGRESSIVE
             mime != null && (mime.startsWith("video/") || mime.startsWith("audio/")) ->
@@ -110,7 +111,14 @@ object MediaSniffer {
         }
     }
 
-    fun isSegment(url: String): Boolean = SEGMENT_HINTS.any { url.lowercase().contains(it) }
+    fun isSegment(url: String): Boolean {
+        if (url.isBlank()) return false
+        val lower = url.lowercase()
+        val path = lower.substringBefore('?').substringBefore('#')
+        val ext = path.substringAfterLast('.', "")
+        if (ext == "ts" || ext == "m4s") return true
+        return SEGMENT_HINTS.any { lower.contains(it) }
+    }
 
     fun isMedia(type: StreamType): Boolean = type != StreamType.UNKNOWN
 

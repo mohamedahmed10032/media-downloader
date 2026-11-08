@@ -85,12 +85,31 @@ class InterceptedMediaExtractor @Inject constructor(
         val rawVideos = filtered.filter { it.type == MediaType.VIDEO }
             .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
 
-        val videos = rawVideos.mapIndexed { idx, s ->
+        // Deduplicate video streams: collapse duplicates by resolution/height, prioritizing streams with calculated sizeBytes
+        val distinctVideos = rawVideos
+            .groupBy { it.height }
+            .flatMap { (height, group) ->
+                if (height != null) {
+                    listOf(group.maxByOrNull { it.sizeBytes ?: 0L } ?: group.first())
+                } else {
+                    // Only keep null-height videos (e.g. Auto HLS) if no known-height variants exist
+                    if (rawVideos.any { it.height != null }) emptyList() else group
+                }
+            }
+            .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+
+        val videos = distinctVideos.mapIndexed { idx, s ->
+            val h = s.height ?: resRegex.find(s.url)?.groupValues?.getOrNull(1)?.toIntOrNull()
             val label = when {
-                s.height != null && s.height >= 720 -> "High quality (${s.height}p)"
-                s.height != null -> "Fast (${s.height}p)"
-                videosCountLabel(idx, rawVideos.size) != null -> videosCountLabel(idx, rawVideos.size)!!
-                else -> s.label
+                h != null && h >= 2160 -> "High quality (4K)"
+                h != null && h >= 1440 -> "High quality (2K)"
+                h != null && h >= 1080 -> "1080p FHD"
+                h != null && h >= 720 -> "High quality (${h}p)"
+                h != null && h == 480 -> "480p"
+                h != null && h <= 360 -> "Fast (${h}p)"
+                h != null -> "${h}p"
+                s.label.isNotBlank() && !s.label.startsWith("Variant") && !s.label.startsWith("Fast (") && s.label != "Auto (HLS)" -> s.label
+                else -> "HD Video"
             }
             val needsAudio = bestAudio != null && !s.isHls && s.headers["X-Internal-Companion-Audio"] == null
             val vBytes = s.sizeBytes ?: 0L
@@ -104,7 +123,7 @@ class InterceptedMediaExtractor @Inject constructor(
                     if (aBytes > 0) put("X-Internal-Audio-Bytes", aBytes.toString())
                 }
             }
-            s.copy(id = "int-v-$idx", label = label, sizeBytes = combinedSize, headers = extraHeaders)
+            s.copy(id = "int-v-$idx", label = label, height = h ?: s.height, sizeBytes = combinedSize, headers = extraHeaders)
         }
 
         val audios = if (bestAudio != null) {
@@ -144,15 +163,6 @@ class InterceptedMediaExtractor @Inject constructor(
             streams = finalStreams,
             extractor = name
         )
-    }
-
-    private fun videosCountLabel(index: Int, totalVideos: Int): String? {
-        if (totalVideos <= 1) return "High quality (720p)"
-        return when (index) {
-            0 -> "High quality (720p)"
-            1 -> "Fast (360p)"
-            else -> "Fast (${index + 1})"
-        }
     }
 
     private fun progressiveStream(

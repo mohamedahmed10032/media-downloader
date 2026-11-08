@@ -22,11 +22,21 @@ object FormatUtils {
         }
     }
 
-    /** Formats a transfer rate in MB/s (e.g. 1.85 MB/s, 0.45 MB/s). */
+    /**
+     * Formats a transfer rate adaptively:
+     * - Returns "--" if bytesPerSecond <= 0
+     * - Formats in "%.2f MB/s" when rate is >= 1.0 MB/s
+     * - Formats in "%.1f KB/s" when rate is < 1.0 MB/s (never outputs "0.00 MB/s")
+     */
     fun formatSpeed(bytesPerSecond: Long): String {
         if (bytesPerSecond <= 0) return "--"
         val mbPerSec = bytesPerSecond.toDouble() / (1024.0 * 1024.0)
-        return String.format(Locale.US, "%.2f MB/s", mbPerSec)
+        return if (mbPerSec >= 1.0) {
+            String.format(Locale.US, "%.2f MB/s", mbPerSec)
+        } else {
+            val kbPerSec = bytesPerSecond.toDouble() / 1024.0
+            String.format(Locale.US, "%.1f KB/s", kbPerSec)
+        }
     }
 
     /** Formats an ETA in seconds into "mm:ss" / "hh:mm:ss". */

@@ -662,14 +662,16 @@ private fun SnaptubeTagBadge(text: String) {
     }
 }
 
-@Composable
-private fun formatShortSize(stream: MediaStream): String = when {
+internal fun formatStreamSize(stream: MediaStream): String = when {
     stream.sizeBytes != null && stream.sizeBytes > 0 -> FormatUtils.formatBytes(stream.sizeBytes)
-    stream.isHls && stream.bitrateKbps != null -> "~${stream.bitrateKbps}K"
-    stream.isHls -> "HLS"
+    stream.bitrateKbps != null && stream.bitrateKbps > 0 -> "~${stream.bitrateKbps} kbps"
+    stream.isHls -> "Stream"
     stream.type == MediaType.IMAGE -> stream.container.uppercase()
     else -> "MP4"
 }
+
+@Composable
+private fun formatShortSize(stream: MediaStream): String = formatStreamSize(stream)
 
 private fun defaultSubtitleFor(stream: MediaStream): String? {
     if (stream.type == MediaType.IMAGE) {
@@ -699,7 +701,7 @@ private fun defaultSubtitleFor(stream: MediaStream): String? {
     }
 }
 
-private data class PreparedSnaptubeStreams(
+internal data class PreparedSnaptubeStreams(
     val images: List<MediaStream>,
     val music: List<MediaStream>,
     val video: List<MediaStream>,
@@ -708,7 +710,7 @@ private data class PreparedSnaptubeStreams(
     val quickVideo: List<MediaStream>
 )
 
-private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStreams {
+internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStreams {
     val rawImages = resolved.streams
         .filter { it.type == MediaType.IMAGE }
         .distinctBy { it.url }
@@ -730,12 +732,17 @@ private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStr
         .map { v ->
             val h = v.height
             val normalizedLabel = when {
-                v.label.startsWith("Fast") || v.label.startsWith("High quality") -> v.label
                 h != null && h >= 2160 -> "High quality (4K)"
                 h != null && h >= 1440 -> "High quality (2K)"
+                h != null && h >= 1080 -> "1080p FHD"
                 h != null && h >= 720 -> "High quality (${h}p)"
-                h != null -> "Fast (${h}p)"
-                else -> v.label
+                h != null && h == 480 -> "480p"
+                h != null && h <= 360 -> "Fast (${h}p)"
+                h != null -> "${h}p"
+                v.label.startsWith("High quality (") || (v.label.startsWith("Fast (") && v.label.endsWith("p)")) -> v.label
+                v.label == "Auto (HLS)" -> "Auto"
+                v.label.isNotBlank() && !v.label.startsWith("Variant") -> v.label
+                else -> "Video"
             }
             v.copy(label = normalizedLabel)
         }
@@ -747,14 +754,32 @@ private fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStr
     // If a non-YouTube extractor only returned video streams, synthesize Fast (M4A) and Classic MP3 options
     // using on-device hardware audio track extraction so Music section is always available like Snaptube!
     if (rawMusic.isEmpty() && rawVideos.isNotEmpty()) {
-        val sourceVideo = rawVideos.firstOrNull { !it.isHls } ?: rawVideos.first()
+        val sourceVideo = rawVideos.maxByOrNull { it.sizeBytes ?: 0L }
+            ?: rawVideos.firstOrNull { !it.isHls }
+            ?: rawVideos.first()
         val vSize = sourceVideo.sizeBytes ?: 0L
-        val estM4aSize = if (vSize > 0L) (vSize * 16L / 100L).coerceAtLeast(150_000L) else null
-        val estMp3Size = if (vSize > 0L) (vSize * 20L / 100L).coerceAtLeast(180_000L) else null
-        val baseHeaders = sourceVideo.headers + mapOf(
-            "X-Internal-Extract-Audio" to "true",
-            "X-Internal-Video-Bytes" to vSize.toString()
-        )
+        val durationSeconds = sourceVideo.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+            ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
+
+        val estM4aSize = if (durationSeconds != null && durationSeconds > 0L) {
+            (128_000L * durationSeconds) / 8L
+        } else if (vSize > 500_000L) {
+            (vSize * 14L) / 100L
+        } else null
+
+        val estMp3Size = if (durationSeconds != null && durationSeconds > 0L) {
+            (160_000L * durationSeconds) / 8L
+        } else if (vSize > 500_000L) {
+            (vSize * 18L) / 100L
+        } else null
+
+        val baseHeaders = sourceVideo.headers + buildMap {
+            put("X-Internal-Extract-Audio", "true")
+            if (vSize > 0L) put("X-Internal-Video-Bytes", vSize.toString())
+            if (durationSeconds != null && durationSeconds > 0L) {
+                put("X-Internal-Duration-Seconds", durationSeconds.toString())
+            }
+        }
         rawMusic = listOf(
             MediaStream(
                 id = "${sourceVideo.id}-synth-m4a",

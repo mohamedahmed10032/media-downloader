@@ -36,7 +36,7 @@ object NetworkModule {
             .connectTimeout(Constants.CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(Constants.READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .writeTimeout(Constants.WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
+            .connectionPool(okhttp3.ConnectionPool(64, 5, TimeUnit.MINUTES))
             .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)

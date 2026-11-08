@@ -5,12 +5,16 @@ import com.melmeligy.mediadownloader.core.Constants
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.extractor.ExtractorHttp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
@@ -62,6 +66,7 @@ class HlsSegmentDownloader @Inject constructor(
         dest.parentFile?.mkdirs()
         if (dest.exists()) dest.delete()
 
+        val partsDir = File(dest.parentFile, "hls_parts_${dest.nameWithoutExtension}_${System.currentTimeMillis()}").apply { mkdirs() }
         val written = AtomicLong(0)
         val completed = AtomicInteger(0)
         val totalSegments = segments.size
@@ -79,48 +84,95 @@ class HlsSegmentDownloader @Inject constructor(
             }
         }
 
+        val semaphore = Semaphore(CONCURRENT_SEGMENTS)
+        val tasks = segments.mapIndexed { index, segmentUrl ->
+            async(Dispatchers.IO) {
+                semaphore.withPermit {
+                    currentCoroutineContext().ensureActive()
+                    val partFile = File(partsDir, "seg_$index.part")
+                    downloadSegmentToPart(segmentUrl, headers, partFile, written)
+                    partFile
+                }
+            }
+        }
         try {
             FileOutputStream(dest, true).use { output ->
-                val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
-                for (segmentUrl in segments) {
+                val copyBuffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
+                for (task in tasks) {
                     currentCoroutineContext().ensureActive()
-                    var attempt = 0
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        try {
-                            val request = http.buildRequest(segmentUrl, headers).build()
-                            client.newCall(request).execute().use { response ->
-                                if (!response.isSuccessful) throw http.mapHttpError(response.code)
-                                val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
-                                body.byteStream().use { input ->
-                                    while (true) {
-                                        currentCoroutineContext().ensureActive()
-                                        val read = input.read(buffer)
-                                        if (read == -1) break
-                                        output.write(buffer, 0, read)
-                                        written.addAndGet(read.toLong())
-                                    }
-                                }
-                            }
-                            break
-                        } catch (e: kotlinx.coroutines.CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            attempt++
-                            if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
-                            delay(400L * attempt)
+                    val partFile = task.await()
+                    partFile.inputStream().use { input ->
+                        while (true) {
+                            val read = input.read(copyBuffer)
+                            if (read == -1) break
+                            output.write(copyBuffer, 0, read)
                         }
                     }
+                    partFile.delete()
                     completed.incrementAndGet()
                 }
                 output.flush()
             }
         } finally {
             progressJob.cancel()
+            tasks.forEach { it.cancel() }
+            runCatching { partsDir.deleteRecursively() }
         }
 
-        val finalBytes = written.get()
+        val finalBytes = dest.length()
         onProgress(DownloadProgress(finalBytes, finalBytes, 0, 0))
+    }
+
+    private suspend fun downloadSegmentToPart(
+        segmentUrl: String,
+        headers: Map<String, String>,
+        partFile: File,
+        written: AtomicLong
+    ) {
+        var attempt = 0
+        val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            var attemptBytes = 0L
+            try {
+                val request = http.buildRequest(segmentUrl, headers)
+                    .header("X-Internal-Download", "true")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw http.mapHttpError(response.code)
+                    val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
+                    partFile.parentFile?.mkdirs()
+                    FileOutputStream(partFile).use { output ->
+                        body.byteStream().use { input ->
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                output.write(buffer, 0, read)
+                                attemptBytes += read
+                                written.addAndGet(read.toLong())
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+                break
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                if (attemptBytes > 0) {
+                    written.addAndGet(-attemptBytes)
+                }
+                runCatching { partFile.delete() }
+                throw e
+            } catch (e: Exception) {
+                if (attemptBytes > 0) {
+                    written.addAndGet(-attemptBytes)
+                }
+                runCatching { partFile.delete() }
+                attempt++
+                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                delay(400L * attempt)
+            }
+        }
     }
 
     private fun firstVariantUrl(masterText: String, baseUrl: String): String? {
@@ -172,5 +224,9 @@ class HlsSegmentDownloader @Inject constructor(
             }
         }
         return result
+    }
+
+    private companion object {
+        const val CONCURRENT_SEGMENTS = 5
     }
 }

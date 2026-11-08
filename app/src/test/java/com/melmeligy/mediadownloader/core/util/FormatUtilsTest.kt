@@ -24,11 +24,15 @@ class FormatUtilsTest {
     }
 
     @Test
-    fun formatSpeed_formatsInMegabytesPerSecond() {
+    fun formatSpeed_formatsAdaptivelyInMbOrKb() {
         assertEquals("--", FormatUtils.formatSpeed(0))
-        assertEquals("0.50 MB/s", FormatUtils.formatSpeed(512 * 1024))
+        assertEquals("--", FormatUtils.formatSpeed(-500))
+        assertEquals("4.9 KB/s", FormatUtils.formatSpeed(5_000))
+        assertEquals("15.2 KB/s", FormatUtils.formatSpeed(15_564))
+        assertEquals("512.0 KB/s", FormatUtils.formatSpeed(512 * 1024))
         assertEquals("1.00 MB/s", FormatUtils.formatSpeed(1024L * 1024))
         assertEquals("2.50 MB/s", FormatUtils.formatSpeed((2.5 * 1024 * 1024).toLong()))
+        assertFalse(FormatUtils.formatSpeed(5_000).contains("0.00 MB/s"))
     }
 
     @Test
