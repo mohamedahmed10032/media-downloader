@@ -166,7 +166,7 @@ fun HomeScreen(
 
         // Instant Clipboard Link Detected Card (Snaptube-style 1-tap bar)
         val detectedClip = clipboardUrl
-        if (detectedClip != null && detectedClip != input.trim()) {
+        if (!detectedClip.isNullOrBlank()) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -265,7 +265,10 @@ fun HomeScreen(
                 )
             }
             OutlinedButton(
-                onClick = { onOpenBrowser(null) },
+                onClick = {
+                    val browserUrl = input.trim().ifBlank { clipboardUrl.orEmpty().trim() }.takeIf { it.isNotBlank() }
+                    onOpenBrowser(browserUrl)
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp)
@@ -318,7 +321,13 @@ fun HomeScreen(
                 )
             }
             items(recent, key = { it.id }) { item ->
-                DownloadRow(item = item)
+                DownloadRow(
+                    item = item,
+                    onPause = { viewModel.pause(item.id) },
+                    onResume = { viewModel.resume(item.id) },
+                    onCancel = { viewModel.cancel(item.id) },
+                    onRetry = { viewModel.retry(item.id) }
+                )
             }
         }
     }

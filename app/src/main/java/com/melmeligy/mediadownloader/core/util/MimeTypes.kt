@@ -1,41 +1,60 @@
 package com.melmeligy.mediadownloader.core.util
 
+import android.webkit.MimeTypeMap
 import com.melmeligy.mediadownloader.domain.model.MediaType
 
-/** Maps container extensions to MIME types for MediaStore inserts and "open with" intents. */
+/** Maps container extensions and media types to valid MIME types for MediaStore inserts and intents. */
 object MimeTypes {
 
-    private val map = mapOf(
-        "mp4" to "video/mp4",
-        "m4v" to "video/mp4",
-        "webm" to "video/webm",
-        "mkv" to "video/x-matroska",
-        "mov" to "video/quicktime",
-        "3gp" to "video/3gpp",
-        "ts" to "video/mp2t",
-        "flv" to "video/x-flv",
-        "mp3" to "audio/mpeg",
-        "m4a" to "audio/mp4",
-        "aac" to "audio/aac",
-        "ogg" to "audio/ogg",
-        "opus" to "audio/opus",
-        "wav" to "audio/wav",
-        "flac" to "audio/flac",
-        "jpg" to "image/jpeg",
-        "jpeg" to "image/jpeg",
-        "png" to "image/png",
-        "gif" to "image/gif",
-        "webp" to "image/webp",
-        "bmp" to "image/bmp",
-        "heic" to "image/heic"
-    )
-
     fun forContainer(container: String, type: MediaType): String {
-        map[container.lowercase()]?.let { return it }
+        val ext = container.lowercase().trimStart('.')
         return when (type) {
-            MediaType.VIDEO -> "video/mp4"
-            MediaType.AUDIO -> "audio/mpeg"
-            MediaType.IMAGE -> "image/jpeg"
+            MediaType.AUDIO -> when (ext) {
+                "mp3" -> "audio/mpeg"
+                "m4a" -> "audio/mp4"
+                "aac" -> "audio/aac"
+                "wav" -> "audio/wav"
+                "flac" -> "audio/flac"
+                "ogg" -> "audio/ogg"
+                "opus" -> "audio/opus"
+                "webm" -> "audio/webm"
+                "mp4" -> "audio/mp4"
+                "3gp", "3gpp" -> "audio/3gpp"
+                "mka" -> "audio/x-matroska"
+                "mid", "midi" -> "audio/midi"
+                "wma" -> "audio/x-ms-wma"
+                else -> runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }
+                    .getOrNull()
+                    ?.takeIf { it.startsWith("audio/") } ?: "audio/mpeg"
+            }
+            MediaType.VIDEO -> when (ext) {
+                "mp4", "m4v" -> "video/mp4"
+                "webm" -> "video/webm"
+                "mkv" -> "video/x-matroska"
+                "mov" -> "video/quicktime"
+                "3gp", "3gpp" -> "video/3gpp"
+                "ts" -> "video/mp2t"
+                "flv" -> "video/x-flv"
+                "avi" -> "video/x-msvideo"
+                "wmv" -> "video/x-ms-wmv"
+                "asf" -> "video/x-ms-asf"
+                else -> runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }
+                    .getOrNull()
+                    ?.takeIf { it.startsWith("video/") } ?: "video/mp4"
+            }
+            MediaType.IMAGE -> when (ext) {
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "gif" -> "image/gif"
+                "webp" -> "image/webp"
+                "bmp" -> "image/bmp"
+                "heic", "heif" -> "image/heic"
+                "svg" -> "image/svg+xml"
+                "ico" -> "image/x-icon"
+                else -> runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }
+                    .getOrNull()
+                    ?.takeIf { it.startsWith("image/") } ?: "image/jpeg"
+            }
         }
     }
 }

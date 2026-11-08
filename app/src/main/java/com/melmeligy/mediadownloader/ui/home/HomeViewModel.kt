@@ -5,14 +5,17 @@ import androidx.lifecycle.viewModelScope
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
+import com.melmeligy.mediadownloader.download.DownloadManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
 class HomeViewModel @Inject constructor(
+    private val downloadManager: DownloadManager,
     downloadRepository: DownloadRepository
 ) : ViewModel() {
 
@@ -21,4 +24,10 @@ class HomeViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
     fun isUrl(input: String): Boolean = UrlUtils.isProbablyUrl(input)
+
+    fun pause(id: Long) = viewModelScope.launch { downloadManager.pause(id) }
+    fun resume(id: Long) = viewModelScope.launch { downloadManager.resume(id) }
+    fun cancel(id: Long) = viewModelScope.launch { downloadManager.cancel(id) }
+    fun retry(id: Long) = viewModelScope.launch { downloadManager.retry(id) }
 }
+

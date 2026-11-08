@@ -61,9 +61,9 @@ class SegmentedDownloader @Inject constructor(
             }
         }
 
-        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1 && !isGoogleVideo
+        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1
         if (!canSegment) {
-            singleStream(url, headers, dest, total, ranged, onProgress)
+            singleStream(url, headers, dest, total, ranged, isGoogleVideo, onProgress)
             return@coroutineScope
         }
 
@@ -164,6 +164,7 @@ class SegmentedDownloader @Inject constructor(
         dest: File,
         total: Long,
         acceptsRanges: Boolean,
+        isGoogleVideo: Boolean,
         onProgress: ProgressCallback
     ) = coroutineScope {
         val downloaded = AtomicLong(if (dest.exists()) dest.length() else 0L)
@@ -186,14 +187,19 @@ class SegmentedDownloader @Inject constructor(
                 }
 
                 val builder = http.buildRequest(url, headers)
-                if (canResume) builder.header("Range", "bytes=$existing-")
+                if (isGoogleVideo && total > 0L) {
+                    val chunkEnd = minOf(total - 1L, existing + GOOGLE_VIDEO_CHUNK_BYTES - 1L)
+                    builder.header("Range", "bytes=$existing-$chunkEnd")
+                } else if (canResume) {
+                    builder.header("Range", "bytes=$existing-")
+                }
                 val request = builder.build()
 
                 try {
                     client.newCall(request).execute().use { response ->
                         if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
                         val isPartial = response.code == 206
-                        val append = canResume && isPartial
+                        val append = (canResume || existing > 0L) && isPartial
                         if (!append && existing > 0) {
                             downloaded.set(0L)
                         } else if (append) {
@@ -214,8 +220,9 @@ class SegmentedDownloader @Inject constructor(
                             output.flush()
                         }
                     }
-                    // Successfully drained response stream
-                    break
+                    // If we drained the entire file (or unknown-length stream), break; otherwise loop next chunk
+                    if (total <= 0L || downloaded.get() >= total) break
+                    attempt = 0
                 } catch (ce: kotlinx.coroutines.CancellationException) {
                     throw ce
                 } catch (e: Exception) {

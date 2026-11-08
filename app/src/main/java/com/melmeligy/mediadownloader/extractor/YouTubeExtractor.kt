@@ -51,24 +51,46 @@ class YouTubeExtractor @Inject constructor(
     override suspend fun extract(url: String): ResolvedMedia? = withContext(dispatchers.io) {
         val videoId = extractVideoId(url) ?: return@withContext null
 
-        // Try Snaptube's InnerTube client profiles in priority order until we get valid streamingData
+        // Primary VISIONOS clients (exempt from YouTube's 1 MB GVS PoToken cold-start cap)
+        // followed by mobile/VR fallbacks.
         val clients = listOf(
-            InnerTubeClient.ANDROID_VR_UPGRADED,
-            InnerTubeClient.IOS,
+            InnerTubeClient.VISIONOS,
+            InnerTubeClient.VISIONOS_1_04,
+            InnerTubeClient.VISIONOS_SAFARI,
             InnerTubeClient.ANDROID_VR_LEGACY,
+            InnerTubeClient.IOS,
+            InnerTubeClient.ANDROID_VR_UPGRADED,
             InnerTubeClient.ANDROID_TESTSUITE
         )
 
-        var visitorData: String? = null
+        var visitorData: String? = cachedVisitorData
         for (client in clients) {
-            val resolved = runCatching {
+            var resolved = runCatching {
                 fetchFromInnerTube(url, videoId, client, visitorData) { newVisitor ->
-                    if (visitorData == null && !newVisitor.isNullOrBlank()) {
+                    if (!newVisitor.isNullOrBlank()) {
                         visitorData = newVisitor
+                        cachedVisitorData = newVisitor
                     }
                 }
             }.getOrNull()
-            if (resolved != null && resolved.streams.isNotEmpty()) {
+
+            // VISIONOS requires visitorData on the request; if the first call had no visitorData
+            // and received one in responseContext.visitorData, immediately retry the same client.
+            if (resolved == null && !visitorData.isNullOrBlank() && client.name.startsWith("VISIONOS")) {
+                resolved = runCatching {
+                    fetchFromInnerTube(url, videoId, client, visitorData) { newVisitor ->
+                        if (!newVisitor.isNullOrBlank()) {
+                            visitorData = newVisitor
+                            cachedVisitorData = newVisitor
+                        }
+                    }
+                }.getOrNull()
+            }
+
+            if (resolved != null &&
+                resolved.streams.isNotEmpty() &&
+                resolved.streams.any { it.type == MediaType.AUDIO }
+            ) {
                 return@withContext resolved
             }
         }
@@ -237,10 +259,15 @@ class YouTubeExtractor @Inject constructor(
                     .thenByDescending { it.bitrate }
             )
 
+        val mp4AudioFormats = audioFormats.filter { it.isMp4a || it.isMp4 }
         // Best M4A AAC audio for muxing with adaptive MP4 video streams and for Music downloads
-        val primaryM4a = audioFormats.firstOrNull { it.isMp4a || it.isMp4 } ?: audioFormats.firstOrNull()
-        val lowAudio = audioFormats.minByOrNull { it.bitrate.takeIf { b -> b > 0 } ?: Long.MAX_VALUE } ?: primaryM4a
-        val highAudio = audioFormats.maxByOrNull { it.bitrate } ?: primaryM4a
+        val primaryM4a = mp4AudioFormats.firstOrNull() ?: audioFormats.firstOrNull()
+        val lowAudio = (mp4AudioFormats.ifEmpty { audioFormats })
+            .minByOrNull { it.bitrate.takeIf { b -> b > 0 } ?: Long.MAX_VALUE }
+            ?: primaryM4a
+        val highAudio = (mp4AudioFormats.ifEmpty { audioFormats })
+            .maxByOrNull { it.bitrate }
+            ?: primaryM4a
 
         val musicStreams = mutableListOf<MediaStream>()
         if (primaryM4a != null) {
@@ -261,7 +288,8 @@ class YouTubeExtractor @Inject constructor(
                 isHls = false,
                 headers = baseHeaders + mapOf(
                     "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
-                    "X-Internal-Quick" to "true"
+                    "X-Internal-Quick" to "true",
+                    "X-Internal-Video-Bytes" to primaryM4a.contentLength.toString()
                 )
             )
 
@@ -278,7 +306,8 @@ class YouTubeExtractor @Inject constructor(
                     isHls = false,
                     headers = baseHeaders + mapOf(
                         "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
-                        "X-Internal-Badge" to "Low"
+                        "X-Internal-Badge" to "Low",
+                        "X-Internal-Video-Bytes" to lowAudio.contentLength.toString()
                     )
                 )
             }
@@ -294,7 +323,8 @@ class YouTubeExtractor @Inject constructor(
                 sizeBytes = baseAudioSize,
                 isHls = false,
                 headers = baseHeaders + mapOf(
-                    "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc"
+                    "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
+                    "X-Internal-Video-Bytes" to primaryM4a.contentLength.toString()
                 )
             )
 
@@ -539,6 +569,9 @@ class YouTubeExtractor @Inject constructor(
         return null
     }
 
+    @Volatile
+    private var cachedVisitorData: String? = null
+
     private data class YtFormat(
         val itag: Int,
         val url: String,
@@ -566,6 +599,36 @@ class YouTubeExtractor @Inject constructor(
         val androidSdkVersion: Int? = null,
         val params: String? = null
     ) {
+        VISIONOS(
+            clientName = "VISIONOS",
+            clientVersion = "1.02",
+            clientId = 101,
+            userAgent = "com.google.ios.youtube/1.02 (RealityDevice17,1; U; visionOS 2_3)",
+            deviceMake = "Apple",
+            deviceModel = "RealityDevice17,1",
+            osName = "visionOS",
+            osVersion = "2.3.21O5565d"
+        ),
+        VISIONOS_1_04(
+            clientName = "VISIONOS",
+            clientVersion = "1.04",
+            clientId = 101,
+            userAgent = "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)",
+            deviceMake = "Apple",
+            deviceModel = "RealityDevice17,1",
+            osName = "visionOS",
+            osVersion = "26.6.0.23O770"
+        ),
+        VISIONOS_SAFARI(
+            clientName = "VISIONOS",
+            clientVersion = "1.02",
+            clientId = 101,
+            userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+            deviceMake = "Apple",
+            deviceModel = "RealityDevice17,1",
+            osName = "visionOS",
+            osVersion = "26.5.23O471"
+        ),
         ANDROID_VR_UPGRADED(
             clientName = "ANDROID_VR",
             clientVersion = "1.71.26",
