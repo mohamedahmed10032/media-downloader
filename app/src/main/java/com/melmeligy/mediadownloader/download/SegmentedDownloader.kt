@@ -78,25 +78,43 @@ class SegmentedDownloader @Inject constructor(
         val progressJob = launch {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
-                emit(downloaded.get(), total, tracker, onProgress)
+                emit(downloaded.get().coerceAtMost(total), total, tracker, onProgress)
                 persistPositions(idxFile, positions)
             }
         }
 
+        var fallbackToSingleStream = false
         try {
-            val tasks = (0 until n).map { i ->
-                async(Dispatchers.IO) { downloadSegment(url, headers, dest, bounds[i], positions, i, downloaded, isGoogleVideo) }
+            coroutineScope {
+                val tasks = (0 until n).map { i ->
+                    async(Dispatchers.IO) {
+                        downloadSegment(url, headers, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo)
+                    }
+                }
+                tasks.awaitAll()
             }
-            tasks.awaitAll()
+        } catch (_: RangeNotSupportedException) {
+            fallbackToSingleStream = true
         } finally {
             progressJob.cancel()
-            persistPositions(idxFile, positions)
+            if (!fallbackToSingleStream) {
+                persistPositions(idxFile, positions)
+            }
+        }
+
+        if (fallbackToSingleStream) {
+            runCatching { idxFile.delete() }
+            runCatching { dest.delete() }
+            singleStream(url, headers, dest, total, acceptsRanges = false, isGoogleVideo = false, onProgress = onProgress)
+            return@coroutineScope
         }
 
         // All segments complete: clean up sidecar and emit final progress.
         idxFile.delete()
         onProgress(DownloadProgress(total, total, 0, 0))
     }
+
+    private class RangeNotSupportedException : Exception("Server returned HTTP 200 instead of 206 for Range request")
 
     private suspend fun downloadSegment(
         url: String,
@@ -106,6 +124,7 @@ class SegmentedDownloader @Inject constructor(
         positions: LongArray,
         index: Int,
         downloaded: AtomicLong,
+        total: Long,
         isGoogleVideo: Boolean
     ) {
         val (_, endInclusive) = bound
@@ -121,11 +140,17 @@ class SegmentedDownloader @Inject constructor(
                 }
                 val request = http.buildRequest(url, headers)
                     .header("Range", "bytes=$startByte-$chunkEnd")
+                    .header("X-Internal-Download", "true")
                     .build()
 
                 var bytesInPass = 0L
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
+                    if (response.code == 200 && (startByte > 0L || chunkEnd < total - 1L)) {
+                        throw RangeNotSupportedException()
+                    }
+                    if (response.code != 206 && !response.isSuccessful) {
+                        throw http.mapHttpError(response.code)
+                    }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
                     RandomAccessFile(dest, "rw").use { raf ->
                         raf.seek(positions[index])
@@ -149,6 +174,8 @@ class SegmentedDownloader @Inject constructor(
                 }
                 attempt = 0
             } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: RangeNotSupportedException) {
                 throw e
             } catch (e: Exception) {
                 attempt++

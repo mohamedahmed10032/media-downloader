@@ -1,8 +1,12 @@
 package com.melmeligy.mediadownloader.ui.navigation
 
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.res.stringResource
+import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -19,6 +23,20 @@ import com.melmeligy.mediadownloader.ui.quality.QualityScreen
 import com.melmeligy.mediadownloader.ui.settings.SettingsScreen
 import com.melmeligy.mediadownloader.ui.splash.SplashScreen
 
+private fun NavHostController.safePopBackStack() {
+    if (previousBackStackEntry != null && currentDestination?.route != Routes.HOME) {
+        runCatching { popBackStack() }
+    }
+}
+
+private fun NavHostController.navigateSingleTop(route: String) {
+    runCatching {
+        navigate(route) {
+            launchSingleTop = true
+        }
+    }
+}
+
 @Composable
 fun AppNavHost(
     sharedUrl: String?,
@@ -30,17 +48,27 @@ fun AppNavHost(
     LaunchedEffect(sharedUrl) {
         val url = sharedUrl?.trim()
         if (!url.isNullOrEmpty()) {
-            navController.navigate(Routes.browser(url))
+            navController.navigateSingleTop(Routes.browser(url))
             onSharedUrlConsumed()
         }
     }
 
-    NavHost(navController = navController, startDestination = Routes.SPLASH) {
+    NavHost(
+        navController = navController,
+        startDestination = Routes.SPLASH,
+        enterTransition = { fadeIn(animationSpec = tween(120)) },
+        exitTransition = { fadeOut(animationSpec = tween(90)) },
+        popEnterTransition = { fadeIn(animationSpec = tween(120)) },
+        popExitTransition = { fadeOut(animationSpec = tween(90)) }
+    ) {
 
         composable(Routes.SPLASH) {
             SplashScreen(onFinished = {
-                navController.navigate(Routes.HOME) {
-                    popUpTo(Routes.SPLASH) { inclusive = true }
+                runCatching {
+                    navController.navigate(Routes.HOME) {
+                        popUpTo(Routes.SPLASH) { inclusive = true }
+                        launchSingleTop = true
+                    }
                 }
             })
         }
@@ -49,8 +77,8 @@ fun AppNavHost(
             MainScaffold(navController, Tab.HOME, stringResource(R.string.home_title)) { padding ->
                 HomeScreen(
                     contentPadding = padding,
-                    onOpenBrowser = { url -> navController.navigate(Routes.browser(url)) },
-                    onDetect = { url -> navController.navigate(Routes.quality(url)) }
+                    onOpenBrowser = { url -> navController.navigateSingleTop(Routes.browser(url)) },
+                    onDetect = { url -> navController.navigateSingleTop(Routes.quality(url)) }
                 )
             }
         }
@@ -65,7 +93,7 @@ fun AppNavHost(
             MainScaffold(navController, Tab.LIBRARY, stringResource(R.string.library_title)) { padding ->
                 LibraryScreen(
                     contentPadding = padding,
-                    onPlay = { id -> navController.navigate(Routes.player(id)) }
+                    onPlay = { id -> navController.navigateSingleTop(Routes.player(id)) }
                 )
             }
         }
@@ -74,13 +102,13 @@ fun AppNavHost(
             MainScaffold(navController, Tab.SETTINGS, stringResource(R.string.settings_title)) { padding ->
                 SettingsScreen(
                     contentPadding = padding,
-                    onOpenAbout = { navController.navigate(Routes.ABOUT) }
+                    onOpenAbout = { navController.navigateSingleTop(Routes.ABOUT) }
                 )
             }
         }
 
         composable(Routes.ABOUT) {
-            AboutScreen(onBack = { navController.popBackStack() })
+            AboutScreen(onBack = { navController.safePopBackStack() })
         }
 
         composable(
@@ -93,8 +121,8 @@ fun AppNavHost(
             val url = entry.arguments?.getString(Routes.ARG_URL).orEmpty().ifBlank { null }
             BrowserScreen(
                 initialUrl = url,
-                onDownload = { detected -> navController.navigate(Routes.quality(detected)) },
-                onBack = { navController.popBackStack() }
+                onDownload = { detected -> navController.navigateSingleTop(Routes.quality(detected)) },
+                onBack = { navController.safePopBackStack() }
             )
         }
 
@@ -107,14 +135,13 @@ fun AppNavHost(
             QualityScreen(
                 url = entry.arguments?.getString(Routes.ARG_URL).orEmpty(),
                 onQueued = {
-                    navController.navigate(Routes.DOWNLOADS) {
-                        popUpTo(Routes.HOME)
-                        launchSingleTop = true
-                    }
+                    navController.safePopBackStack()
+                    navController.navigateToTopLevelTab(Tab.DOWNLOADS)
                 },
-                onBack = { navController.popBackStack() },
+                onBack = { navController.safePopBackStack() },
                 onOpenInBrowser = { targetUrl ->
-                    navController.navigate(Routes.browser(targetUrl))
+                    navController.safePopBackStack()
+                    navController.navigateSingleTop(Routes.browser(targetUrl))
                 }
             )
         }
@@ -124,7 +151,8 @@ fun AppNavHost(
             arguments = listOf(navArgument(Routes.ARG_ID) { type = NavType.LongType })
         ) { entry ->
             val id = entry.arguments?.getLong(Routes.ARG_ID) ?: 0L
-            PlayerScreen(downloadId = id, onBack = { navController.popBackStack() })
+            PlayerScreen(downloadId = id, onBack = { navController.safePopBackStack() })
         }
     }
 }
+

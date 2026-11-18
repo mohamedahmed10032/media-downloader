@@ -41,6 +41,10 @@ class MediaInterceptionEngine @Inject constructor() {
     var currentPageTitle: String? = null
         private set
 
+    @Volatile
+    var currentPageThumbnail: String? = null
+        private set
+
     // ---- Producer / consumer registration ----
 
     fun addSink(sink: MediaTaskSink) {
@@ -55,13 +59,24 @@ class MediaInterceptionEngine @Inject constructor() {
 
     /** Called on every navigation. Clears detections when the page actually changes. */
     fun onPageChanged(url: String?, title: String? = null) {
-        if (url != null && url != currentPageUrl) {
+        val normalizedNew = normalizePageKey(url)
+        val normalizedOld = normalizePageKey(currentPageUrl)
+        if (normalizedNew != null && normalizedOld != null && normalizedNew != normalizedOld) {
             seen.clear()
             registry.clear()
             _detections.value = emptyList()
+            currentPageTitle = null
+            currentPageThumbnail = null
         }
-        if (url != null) currentPageUrl = url
+        if (url != null && !url.startsWith("about:")) currentPageUrl = url
         if (!title.isNullOrBlank()) currentPageTitle = title
+    }
+
+    fun updatePageMetadata(title: String?, thumbnailUrl: String?) {
+        if (!title.isNullOrBlank()) currentPageTitle = title
+        if (!thumbnailUrl.isNullOrBlank() && thumbnailUrl.startsWith("http")) {
+            currentPageThumbnail = thumbnailUrl
+        }
     }
 
     fun clear() {
@@ -80,17 +95,61 @@ class MediaInterceptionEngine @Inject constructor() {
         } else {
             MediaSniffer.cleanMediaUrl(payload.url)
         }
-        val normalizedPayload = payload.copy(url = cleanedUrl)
-        if (!accept(normalizedPayload.fingerprint)) return false
+        if (payload.streamType != StreamType.BLOB && MediaSniffer.isPreviewOrAdUrl(cleanedUrl)) {
+            return false
+        }
 
-        val enriched = normalizedPayload.copy(
-            pageUrl = normalizedPayload.pageUrl ?: currentPageUrl,
-            pageTitle = normalizedPayload.pageTitle ?: currentPageTitle
+        // Drop late subresource detections belonging to a previous page
+        val activePageKey = normalizePageKey(currentPageUrl)
+        val payloadPageKey = normalizePageKey(payload.pageUrl)
+        if (activePageKey != null && payloadPageKey != null && activePageKey != payloadPageKey) {
+            return false
+        }
+
+        if (!payload.pageTitle.isNullOrBlank()) currentPageTitle = payload.pageTitle
+        if (!payload.thumbnailUrl.isNullOrBlank() && payload.thumbnailUrl.startsWith("http")) {
+            currentPageThumbnail = payload.thumbnailUrl
+        }
+
+        val normalizedPayload = payload.copy(
+            url = cleanedUrl,
+            pageUrl = payload.pageUrl ?: currentPageUrl,
+            pageTitle = payload.pageTitle?.takeIf { it.isNotBlank() } ?: currentPageTitle,
+            thumbnailUrl = payload.thumbnailUrl?.takeIf { it.isNotBlank() } ?: currentPageThumbnail
         )
 
-        registry[enriched.url] = enriched
-        _detections.value = (listOf(enriched) + _detections.value).take(MAX_DETECTIONS)
-        sinks.forEach { sink -> runCatching { sink.onMediaDetected(enriched) } }
+        val key = normalizedPayload.fingerprint
+        if (!accept(key)) {
+            // Merge richer metadata (headers, authoritative flag, qualityHint, size, duration) into existing entry
+            val existing = registry[cleanedUrl]
+                ?: _detections.value.firstOrNull { it.fingerprint == key }
+            if (existing != null) {
+                val mergedHeaders = LinkedHashMap<String, String>().apply {
+                    putAll(normalizedPayload.headersMap)
+                    putAll(existing.headersMap)
+                }
+                val upgraded = existing.copy(
+                    headersMap = mergedHeaders,
+                    pageTitle = normalizedPayload.pageTitle ?: existing.pageTitle,
+                    thumbnailUrl = normalizedPayload.thumbnailUrl ?: existing.thumbnailUrl,
+                    sizeBytes = existing.sizeBytes ?: normalizedPayload.sizeBytes,
+                    qualityHint = normalizedPayload.qualityHint ?: existing.qualityHint,
+                    durationSeconds = normalizedPayload.durationSeconds ?: existing.durationSeconds,
+                    isAuthoritativePlayer = existing.isAuthoritativePlayer || normalizedPayload.isAuthoritativePlayer
+                )
+                if (upgraded != existing) {
+                    registry[upgraded.url] = upgraded
+                    _detections.value = _detections.value.map {
+                        if (it.fingerprint == key) upgraded else it
+                    }
+                }
+            }
+            return false
+        }
+
+        registry[normalizedPayload.url] = normalizedPayload
+        _detections.value = (listOf(normalizedPayload) + _detections.value).take(MAX_DETECTIONS)
+        sinks.forEach { sink -> runCatching { sink.onMediaDetected(normalizedPayload) } }
         return true
     }
 
@@ -119,20 +178,24 @@ class MediaInterceptionEngine @Inject constructor() {
         val cleaned = MediaSniffer.cleanMediaUrl(url)
         registry[cleaned]?.let { return it }
         registry[url]?.let { return it }
-        val bare = cleaned.substringBefore('?')
-        return registry.values.firstOrNull { it.url.substringBefore('?') == bare }
+        val dedupe = MediaSniffer.dedupeKey(cleaned)
+        return registry.values.firstOrNull { MediaSniffer.dedupeKey(it.url) == dedupe }
     }
 
     /** Returns all captured payloads for the active page or matching [url]. */
     fun payloadsFor(url: String): List<MediaStreamPayload> {
         val current = _detections.value
         val cleaned = MediaSniffer.cleanMediaUrl(url)
-        if (url == currentPageUrl || cleaned == currentPageUrl) {
+        val reqPageKey = normalizePageKey(url)
+        val curPageKey = normalizePageKey(currentPageUrl)
+        if (url == currentPageUrl || cleaned == currentPageUrl || (reqPageKey != null && reqPageKey == curPageKey)) {
             return current
         }
         val matched = lookup(cleaned)
         if (matched != null) {
-            val samePage = current.filter { it.pageUrl == matched.pageUrl && matched.pageUrl != null }
+            val samePage = current.filter {
+                it.pageUrl != null && normalizePageKey(it.pageUrl) == normalizePageKey(matched.pageUrl)
+            }
             return if (samePage.isNotEmpty()) samePage else listOf(matched)
         }
         return emptyList()
@@ -140,6 +203,11 @@ class MediaInterceptionEngine @Inject constructor() {
 
     /** Headers captured for [url], or an empty map. */
     fun headersFor(url: String): Map<String, String> = lookup(url)?.headersMap ?: emptyMap()
+
+    private fun normalizePageKey(url: String?): String? {
+        val trimmed = url?.trim()?.takeIf { it.isNotEmpty() && !it.startsWith("about:") } ?: return null
+        return trimmed.substringBefore('#').trimEnd('/')
+    }
 
     private fun accept(key: String): Boolean {
         val now = System.currentTimeMillis()

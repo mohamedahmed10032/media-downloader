@@ -132,4 +132,43 @@ object UrlUtils {
     fun resolveUrl(base: String, ref: String): String = runCatching {
         URI(base).resolve(ref.trim()).toString()
     }.getOrDefault(ref)
+
+    private val explicitPHeightRegex = Regex(
+        "(?:^|[^0-9])(2160|1440|1080|720|576|540|480|360|270|250|240|180|160|144)p(?:[^a-z0-9]|$)",
+        RegexOption.IGNORE_CASE
+    )
+    private val dimensionRegex = Regex(
+        "(?:^|[^0-9])(\\d{3,4})x(2160|1440|1080|720|576|540|480|360|270|250|240|180|160|144)(?:[^0-9]|$)",
+        RegexOption.IGNORE_CASE
+    )
+    private val delimitedHeightRegex = Regex(
+        "(?:[_/=-]|quality=|res=|height=)(2160|1440|1080|720|576|540|480|360|270|250|240|180|160|144)(?:[._/&?-]|$)",
+        RegexOption.IGNORE_CASE
+    )
+
+    /**
+     * Infers standard video vertical resolution (e.g. 2160, 1440, 1080, 720, 480, 360, 250, 240, 144)
+     * from a label or stream URL without matching random multi-digit video IDs.
+     */
+    fun inferResolution(url: String, label: String = ""): Int? {
+        if (label.isNotBlank()) {
+            val trimmed = label.trim().lowercase()
+            trimmed.toIntOrNull()?.takeIf { it in KNOWN_HEIGHTS }?.let { return it }
+            explicitPHeightRegex.find(trimmed)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+            dimensionRegex.find(trimmed)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
+            when {
+                trimmed.contains("4k") || trimmed.contains("uhd") -> return 2160
+                trimmed.contains("2k") || trimmed.contains("qhd") -> return 1440
+                trimmed.contains("fhd") -> return 1080
+            }
+        }
+        if (url.isNotBlank()) {
+            explicitPHeightRegex.find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+            dimensionRegex.find(url)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
+            delimitedHeightRegex.find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+        }
+        return null
+    }
+
+    val KNOWN_HEIGHTS = setOf(2160, 1440, 1080, 720, 576, 540, 480, 360, 270, 250, 240, 180, 160, 144)
 }

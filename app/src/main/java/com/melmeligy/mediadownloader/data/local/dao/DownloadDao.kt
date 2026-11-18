@@ -36,7 +36,9 @@ interface DownloadDao {
     suspend fun updateStatus(id: Long, status: String, now: Long)
 
     @Query(
-        "UPDATE downloads SET downloadedBytes = :downloaded, totalBytes = :total, " +
+        "UPDATE downloads SET downloadedBytes = :downloaded, " +
+            "totalBytes = CASE WHEN :total > 0 THEN MAX(:total, :downloaded) " +
+            "ELSE CASE WHEN totalBytes > 0 THEN MAX(totalBytes, :downloaded) ELSE 0 END END, " +
             "speedBytesPerSec = :speed, etaSeconds = :eta, updatedAt = :now WHERE id = :id"
     )
     suspend fun updateProgress(id: Long, downloaded: Long, total: Long, speed: Long, eta: Long, now: Long)

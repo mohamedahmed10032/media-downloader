@@ -18,13 +18,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DriveFileRenameOutline
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Movie
-import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Share
@@ -58,6 +58,7 @@ import androidx.core.net.toUri
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
@@ -175,7 +176,7 @@ private fun LibraryItemRow(
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     val openLabel = if (item.type == MediaType.IMAGE) R.string.action_open_with else R.string.action_play
-                    val openIcon = if (item.type == MediaType.IMAGE) Icons.Rounded.OpenInNew else Icons.Rounded.PlayArrow
+                    val openIcon = if (item.type == MediaType.IMAGE) Icons.AutoMirrored.Rounded.OpenInNew else Icons.Rounded.PlayArrow
                     DropdownMenuItem(
                         text = { Text(stringResource(openLabel)) },
                         leadingIcon = { Icon(openIcon, null) },
@@ -204,6 +205,7 @@ private fun LibraryItemRow(
 
 @Composable
 private fun Thumb(item: DownloadItem, onClick: () -> Unit) {
+    val context = LocalContext.current
     val shape = RoundedCornerShape(8.dp)
     Box(
         modifier = Modifier.size(56.dp).clip(shape).clickable(onClick = onClick),
@@ -218,9 +220,17 @@ private fun Thumb(item: DownloadItem, onClick: () -> Unit) {
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary
         )
-        if (item.type != MediaType.AUDIO && item.contentUri != null) {
+        val uriString = item.contentUri
+        if (item.type != MediaType.AUDIO && !uriString.isNullOrBlank()) {
+            val request = remember(uriString) {
+                ImageRequest.Builder(context)
+                    .data(uriString.toUri())
+                    .size(168, 168)
+                    .crossfade(false)
+                    .build()
+            }
             AsyncImage(
-                model = item.contentUri.toUri(),
+                model = request,
                 contentDescription = item.title,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.size(56.dp).clip(shape)

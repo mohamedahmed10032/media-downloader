@@ -1,7 +1,5 @@
 package com.melmeligy.mediadownloader.intercept
 
-import android.net.Uri
-
 /**
  * Pure classification rules for intercepted network traffic.
  *
@@ -9,8 +7,8 @@ import android.net.Uri
  * `application/vnd.apple.mpegurl`), DASH manifests (`.mpd`, `application/dash+xml`),
  * plain progressive media files, and blob object URLs.
  *
- * Individual media segments are deliberately rejected so a single playing stream does
- * not flood the queue with hundreds of tasks.
+ * Individual media segments, ad/VAST streams, hover thumbnails, and site promo/bumper clips
+ * are deliberately rejected so only real main-content streams reach the format selector.
  */
 object MediaSniffer {
 
@@ -42,12 +40,58 @@ object MediaSniffer {
         "google-analytics.com", "googletagmanager.com", "doubleclick.net", "/beacon", "/pixel"
     )
 
-    private val RANGE_QUERY_PARAMS = setOf(
-        "bytestart", "byteend", "range", "rn", "rbuf"
+    /** Hover-preview, trailer, VAST preroll, and site intro/bumper URL tokens. */
+    private val PREVIEW_OR_BUMPER_HINTS = listOf(
+        "mediabook",
+        "videopreview",
+        "video_preview",
+        "hover_preview",
+        "_preview.",
+        "_preview_",
+        "-preview.",
+        "-preview-",
+        "/preview/",
+        "/previews/",
+        "thumb_preview",
+        "hover_video",
+        "_trailer.",
+        "_trailer_",
+        "-trailer.",
+        "-trailer-",
+        "/trailer/",
+        "/trailers/",
+        "_teaser.",
+        "_teaser_",
+        "-teaser.",
+        "-teaser-",
+        "/preroll",
+        "_preroll",
+        "-preroll",
+        "pre-roll",
+        "/midroll",
+        "/postroll",
+        "/bumper",
+        "_bumper",
+        "-bumper",
+        "site_bumper",
+        "site_intro",
+        "intro_logo",
+        "outro_logo",
+        "promo_video",
+        "/promo/",
+        "mozaique",
+        "timeline_screens",
+        "videothumbs",
+        "/thumbs/",
+        "/thumb/",
+        "storyboard"
     )
 
     private val rangeParamRegex =
         Regex("([?&])(bytestart|byteend|range|rn|rbuf)=[^&#]*", RegexOption.IGNORE_CASE)
+
+    private val qualityParamRegex =
+        Regex("[?&](itag|quality|res|resolution)=([^&#]+)", RegexOption.IGNORE_CASE)
 
     /**
      * Strips byte-range slicing query parameters (`bytestart`, `byteend`, `range`) used by
@@ -65,12 +109,25 @@ object MediaSniffer {
         return cleaned
     }
 
-    /** Canonical deduplication key that preserves `itag` for `googlevideo.com` streams. */
+    /** True if [rawUrl] belongs to an ad server, VAST preroll, hover preview, or site bumper. */
+    fun isPreviewOrAdUrl(rawUrl: String): Boolean {
+        if (rawUrl.isBlank()) return false
+        if (AdBlocker.isAd(rawUrl)) return true
+        val lower = rawUrl.lowercase()
+        if (NOISE_HINTS.any { lower.contains(it) }) return true
+        return PREVIEW_OR_BUMPER_HINTS.any { lower.contains(it) }
+    }
+
+    /** Canonical deduplication key that preserves `itag` / `quality` query discriminators. */
     fun dedupeKey(rawUrl: String): String {
         val cleaned = cleanMediaUrl(rawUrl)
         val base = cleaned.substringBefore('?')
-        val itag = Regex("[?&]itag=(\\d+)").find(cleaned)?.groupValues?.getOrNull(1)
-        return if (itag != null) "$base?itag=$itag" else base
+        val qMatch = qualityParamRegex.find(cleaned)
+        return if (qMatch != null) {
+            "${base}?${qMatch.groupValues[1].lowercase()}=${qMatch.groupValues[2]}"
+        } else {
+            base
+        }
     }
 
     /** Heuristic to detect whether a CDN MP4 URL is actually an audio-only DASH track. */
@@ -92,11 +149,23 @@ object MediaSniffer {
         if (rawUrl.isBlank()) return StreamType.UNKNOWN
         val cleaned = cleanMediaUrl(rawUrl)
         val url = cleaned.lowercase()
-        if (NOISE_HINTS.any { url.contains(it) }) return StreamType.UNKNOWN
+        if (!url.startsWith("blob:") && isPreviewOrAdUrl(cleaned)) return StreamType.UNKNOWN
 
         val mime = mimeType?.lowercase()?.substringBefore(';')?.trim()
         val path = url.substringBefore('?').substringBefore('#')
         val ext = path.substringAfterLast('.', "")
+
+        // Never treat HTML, JSON, JS, CSS, or static images as downloadable stream manifests/files
+        if (mime != null && (
+                mime.startsWith("text/html") ||
+                    mime.startsWith("application/json") ||
+                    mime.contains("javascript") ||
+                    mime.startsWith("image/") ||
+                    mime.startsWith("text/css")
+                )
+        ) {
+            if (ext != "m3u8" && ext != "mpd") return StreamType.UNKNOWN
+        }
 
         return when {
             mime in HLS_MIME || ext == "m3u8" || url.contains(".m3u8") -> StreamType.HLS

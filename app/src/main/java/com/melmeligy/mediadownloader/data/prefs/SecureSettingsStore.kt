@@ -12,9 +12,14 @@ import com.melmeligy.mediadownloader.domain.model.ThemeMode
 import com.melmeligy.mediadownloader.domain.model.VideoQuality
 import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -22,6 +27,9 @@ import javax.inject.Singleton
 /**
  * Settings persistence backed by [EncryptedSharedPreferences]. Values are exposed as a
  * hot [Flow] via an in-memory [MutableStateFlow] that is updated on every write.
+ *
+ * Keystore / Tink initialization is performed exclusively on [DispatcherProvider.io]
+ * so constructing this singleton on UI navigation never blocks the main thread.
  *
  * If the encrypted preferences file or its keyset becomes corrupt (a known cause of
  * hard crashes), it is deleted and recreated rather than propagating the exception.
@@ -32,12 +40,25 @@ class SecureSettingsStore @Inject constructor(
     private val dispatchers: DispatcherProvider
 ) : SettingsRepository {
 
-    private val prefs: SharedPreferences = createPrefs()
-    private val state = MutableStateFlow(readAll())
+    private val prefsMutex = Mutex()
+    @Volatile
+    private var cachedPrefs: SharedPreferences? = null
+    @Volatile
+    private var initialized = false
+
+    private val state = MutableStateFlow(AppSettings())
+    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
+
+    init {
+        scope.launch {
+            runCatching { ensureLoaded() }
+        }
+    }
 
     override val settings: Flow<AppSettings> = state.asStateFlow()
 
-    override suspend fun current(): AppSettings = state.value
+    override suspend fun current(): AppSettings =
+        if (initialized) state.value else ensureLoaded()
 
     override suspend fun setThemeMode(mode: ThemeMode) = write { putString(KEY_THEME, mode.name) }
 
@@ -60,14 +81,36 @@ class SecureSettingsStore @Inject constructor(
         putString(KEY_SAVE_SUBFOLDER, cleaned)
     }
 
-    private suspend fun write(block: SharedPreferences.Editor.() -> Unit) {
-        withContext(dispatchers.io) {
-            prefs.edit().apply(block).apply()
+    private suspend fun getPrefs(): SharedPreferences {
+        cachedPrefs?.let { return it }
+        return prefsMutex.withLock {
+            cachedPrefs ?: withContext(dispatchers.io) {
+                createPrefs().also { cachedPrefs = it }
+            }
         }
-        state.value = readAll()
     }
 
-    private fun readAll(): AppSettings = AppSettings(
+    private suspend fun ensureLoaded(): AppSettings = withContext(dispatchers.io) {
+        val p = getPrefs()
+        val loaded = readAll(p)
+        if (!initialized) {
+            state.value = loaded
+            initialized = true
+        }
+        state.value
+    }
+
+    private suspend fun write(block: SharedPreferences.Editor.() -> Unit) {
+        val updated = withContext(dispatchers.io) {
+            val p = getPrefs()
+            p.edit().apply(block).apply()
+            initialized = true
+            readAll(p)
+        }
+        state.value = updated
+    }
+
+    private fun readAll(prefs: SharedPreferences): AppSettings = AppSettings(
         themeMode = prefs.getString(KEY_THEME, null)?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() }
             ?: ThemeMode.DARK,
         defaultVideoQuality = prefs.getString(KEY_VIDEO_QUALITY, null)

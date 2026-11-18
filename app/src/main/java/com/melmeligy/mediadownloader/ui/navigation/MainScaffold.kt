@@ -1,5 +1,6 @@
 package com.melmeligy.mediadownloader.ui.navigation
 
+import androidx.activity.compose.BackHandler
 import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.RowScope
@@ -29,6 +30,24 @@ enum class Tab(val route: String, @StringRes val labelRes: Int, val icon: ImageV
     SETTINGS(Routes.SETTINGS, R.string.nav_settings, Icons.Rounded.Settings)
 }
 
+/**
+ * Navigates cleanly between the four primary bottom-bar tabs while keeping saved state
+ * consistent and ignoring duplicate taps against an already-selected or mid-transition tab.
+ */
+fun NavHostController.navigateToTopLevelTab(tab: Tab) {
+    val activeRoute = currentBackStackEntry?.destination?.route ?: currentDestination?.route
+    if (activeRoute == tab.route) return
+    runCatching {
+        navigate(tab.route) {
+            popUpTo(Routes.HOME) {
+                saveState = true
+            }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
+}
+
 /** Shared scaffold (top app bar + bottom navigation) for the primary tab screens. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -39,6 +58,10 @@ fun MainScaffold(
     actions: @Composable RowScope.() -> Unit = {},
     content: @Composable (PaddingValues) -> Unit
 ) {
+    BackHandler(enabled = current != Tab.HOME) {
+        navController.navigateToTopLevelTab(Tab.HOME)
+    }
+
     Scaffold(
         topBar = { TopAppBar(title = { Text(title) }, actions = actions) },
         bottomBar = {
@@ -48,11 +71,7 @@ fun MainScaffold(
                         selected = tab == current,
                         onClick = {
                             if (tab != current) {
-                                navController.navigate(tab.route) {
-                                    popUpTo(Routes.HOME) { saveState = true }
-                                    launchSingleTop = true
-                                    restoreState = true
-                                }
+                                navController.navigateToTopLevelTab(tab)
                             }
                         },
                         icon = { Icon(tab.icon, contentDescription = null) },
@@ -63,3 +82,4 @@ fun MainScaffold(
         }
     ) { padding -> content(padding) }
 }
+

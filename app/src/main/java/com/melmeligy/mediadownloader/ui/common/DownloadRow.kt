@@ -89,14 +89,22 @@ fun DownloadRow(
 
 @Composable
 private fun Thumbnail(item: DownloadItem) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val shape = RoundedCornerShape(8.dp)
     Box(
         modifier = Modifier.size(52.dp).clip(shape),
         contentAlignment = Alignment.Center
     ) {
         if (!item.thumbnailUrl.isNullOrBlank()) {
+            val request = androidx.compose.runtime.remember(item.thumbnailUrl) {
+                coil.request.ImageRequest.Builder(context)
+                    .data(item.thumbnailUrl)
+                    .size(156, 156)
+                    .crossfade(false)
+                    .build()
+            }
             AsyncImage(
-                model = item.thumbnailUrl,
+                model = request,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.size(52.dp).clip(shape)
@@ -154,18 +162,24 @@ private fun iconFor(type: MediaType): ImageVector = when (type) {
 
 private fun statusLine(item: DownloadItem): String {
     val quality = item.qualityLabel.ifBlank { item.container.uppercase() }
+    val safeDone = item.downloadedBytes.coerceAtLeast(0L)
+    val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
     return when (item.status) {
         DownloadStatus.QUEUED -> "$quality · Queued"
         DownloadStatus.RUNNING -> {
-            val size = if (item.totalBytes > 0)
-                "${FormatUtils.formatBytes(item.downloadedBytes)} / ${FormatUtils.formatBytes(item.totalBytes)}"
-            else FormatUtils.formatBytes(item.downloadedBytes)
-            val speed = FormatUtils.formatSpeed(item.speedBytesPerSec)
-            val eta = if (item.etaSeconds > 0) " · ${FormatUtils.formatEta(item.etaSeconds)} left" else ""
-            "$size · $speed$eta"
+            val size = if (safeTotal > 0L) {
+                "${FormatUtils.formatBytes(safeDone)} / ${FormatUtils.formatBytes(safeTotal)}"
+            } else {
+                FormatUtils.formatBytes(safeDone)
+            }
+            val speed = FormatUtils.formatSpeed(item.speedBytesPerSec.coerceAtLeast(0L))
+            val eta = if (item.etaSeconds > 0 && safeTotal > safeDone) {
+                " · ${FormatUtils.formatEta(item.etaSeconds)} left"
+            } else ""
+            "$quality · $size · $speed$eta"
         }
         DownloadStatus.PAUSED -> "$quality · Paused (${FormatUtils.formatPercent(item.progress)})"
-        DownloadStatus.COMPLETED -> "$quality · ${FormatUtils.formatBytes(item.totalBytes)}"
+        DownloadStatus.COMPLETED -> "$quality · ${FormatUtils.formatBytes(item.totalBytes.coerceAtLeast(safeDone))}"
         DownloadStatus.FAILED -> "Failed · tap retry"
         DownloadStatus.CANCELED -> "Canceled"
     }

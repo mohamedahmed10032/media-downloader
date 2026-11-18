@@ -28,16 +28,20 @@ data class MediaStreamPayload(
     val headersMap: Map<String, String> = emptyMap(),
     val pageUrl: String? = null,
     val pageTitle: String? = null,
+    val thumbnailUrl: String? = null,
     val mimeType: String? = null,
     val sizeBytes: Long? = null,
+    val qualityHint: Int? = null,
+    val durationSeconds: Long? = null,
+    val isAuthoritativePlayer: Boolean = false,
     /** Absolute path of the resolved cache file. Only set for [StreamType.BLOB]. */
     val localFile: String? = null,
     val detectedAt: Long = System.currentTimeMillis()
 ) {
 
-    /** Stable de-duplication key: transport + URL without its query string. */
+    /** Stable de-duplication key: transport + canonical deduplication key. */
     val fingerprint: String
-        get() = streamType.name + "|" + url.substringBefore('?')
+        get() = streamType.name + "|" + MediaSniffer.dedupeKey(url)
 
     /** Short label for the detected-media list in the browser. */
     val label: String
@@ -54,6 +58,9 @@ data class MediaStreamPayload(
         get() = pageTitle?.takeIf { it.isNotBlank() }
             ?: url.substringBefore('?').substringAfterLast('/').ifBlank { "media" }
 }
+
+/** Backward-compatible alias for unit tests referencing the earlier payload name. */
+typealias CapturedPayload = MediaStreamPayload
 
 /**
  * The download-provider contract. Anything that wants intercepted media implements this

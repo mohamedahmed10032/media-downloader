@@ -79,10 +79,13 @@ import com.melmeligy.mediadownloader.intercept.HeaderExtractor
 import com.melmeligy.mediadownloader.intercept.SniffingWebViewClient
 
 private const val DETECT_JS =
-    "(function(){try{var n=document.querySelectorAll('video,audio,source').length;" +
-        "var h=document.documentElement?document.documentElement.innerHTML:'';" +
-        "var m=/\\.(mp4|m3u8|m4a|webm|mp3|mov)([\\?\"'&]|$)/i.test(h);" +
-        "return (n>0||m)?'1':'0';}catch(e){return '0';}})();"
+    "(function(){try{" +
+        "if(window.__dlScanNow){window.__dlScanNow();}" +
+        "var n=document.querySelectorAll('video,audio,source,link[rel=\"preload\"][href*=\".m3u8\"]').length;" +
+        "var p=!!(window.html5player||window.initials||window.jwplayer||window.videojs);" +
+        "if(!p){for(var k in window){if(k.indexOf('flashvars_')===0){p=true;break;}}}" +
+        "return (n>0||p)?'1':'0';" +
+        "}catch(e){return '0';}})();"
 
 @SuppressLint("SetJavaScriptEnabled")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -116,15 +119,6 @@ fun BrowserScreen(
     var showBookmarks by remember { mutableStateOf(false) }
     var showFormatSheet by remember { mutableStateOf(false) }
 
-    fun openChooseFormatSheet() {
-        val target = currentUrl.takeIf { it.startsWith("http") }
-            ?: detectedDownloadUrl
-            ?: detections.firstOrNull()?.url
-            ?: return
-        showFormatSheet = true
-        viewModel.resolveForSheet(target)
-    }
-
     val webView = remember {
         WebView(context).apply {
             layoutParams = android.view.ViewGroup.LayoutParams(
@@ -139,6 +133,8 @@ fun BrowserScreen(
                 builtInZoomControls = true
                 displayZoomControls = false
                 mediaPlaybackRequiresUserGesture = true
+                setSupportMultipleWindows(true)
+                javaScriptCanOpenWindowsAutomatically = false
             }
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -151,9 +147,7 @@ fun BrowserScreen(
 
             webViewClient = object : SniffingWebViewClient(engine) {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest?): Boolean {
-                    val url = request?.url?.toString() ?: return false
-                    // Only handle standard web pages inside the WebView; ignore custom schemes.
-                    return !(url.startsWith("http://") || url.startsWith("https://"))
+                    return super.shouldOverrideUrlLoading(view, request)
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
@@ -164,6 +158,18 @@ fun BrowserScreen(
                         currentUrl = url
                         addressText = url
                     }
+                    canGoBack = view.canGoBack()
+                    canGoForward = view.canGoForward()
+                }
+
+                override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    if (url != null && url.startsWith("http")) {
+                        currentUrl = url
+                        addressText = url
+                    }
+                    canGoBack = view.canGoBack()
+                    canGoForward = view.canGoForward()
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -189,18 +195,56 @@ fun BrowserScreen(
                 override fun onReceivedTitle(view: WebView, title: String?) {
                     pageTitle = title.orEmpty()
                 }
+
+                override fun onCreateWindow(
+                    view: WebView?,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: android.os.Message?
+                ): Boolean {
+                    // Drop ad popunders / target="_blank" hijack windows cleanly.
+                    return false
+                }
             }
 
             setDownloadListener { url, userAgent, _, mimeType, _ ->
-                detectedDownloadUrl = url
-                hasMedia = true
-                // A download that the WebView refuses to render still carries a live session.
-                engine.submitUrl(
-                    url = url,
-                    mimeType = mimeType,
-                    headers = HeaderExtractor.forUrl(url, engine.currentPageUrl, userAgent)
-                )
+                if (!com.melmeligy.mediadownloader.intercept.AdBlocker.isAd(url)) {
+                    detectedDownloadUrl = url
+                    hasMedia = true
+                    engine.submitUrl(
+                        url = url,
+                        mimeType = mimeType,
+                        headers = HeaderExtractor.forUrl(url, engine.currentPageUrl, userAgent)
+                    )
+                }
             }
+        }
+    }
+
+    fun openChooseFormatSheet() {
+        val target = currentUrl.takeIf { it.startsWith("http") }
+            ?: detectedDownloadUrl
+            ?: detections.firstOrNull()?.url
+            ?: return
+        viewModel.prepareSheetLoading()
+        showFormatSheet = true
+        val resolvedOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+        val triggerResolve = Runnable {
+            if (resolvedOnce.compareAndSet(false, true)) {
+                viewModel.resolveForSheet(target)
+            }
+        }
+        webView.postDelayed(triggerResolve, 180L)
+        runCatching {
+            webView.evaluateJavascript(
+                "(function(){try{if(window.__dlScanNow)window.__dlScanNow();return '1';}catch(e){return '0';}})()"
+            ) {
+                webView.removeCallbacks(triggerResolve)
+                triggerResolve.run()
+            }
+        }.onFailure {
+            webView.removeCallbacks(triggerResolve)
+            triggerResolve.run()
         }
     }
 
@@ -216,7 +260,15 @@ fun BrowserScreen(
     }
 
     androidx.compose.runtime.DisposableEffect(Unit) {
-        onDispose { webView.destroy() }
+        onDispose {
+            runCatching {
+                webView.stopLoading()
+                webView.removeJavascriptInterface(BlobBridge.NAME)
+                webView.webChromeClient = null
+                webView.loadUrl("about:blank")
+                webView.destroy()
+            }
+        }
     }
 
     BackHandler(enabled = canGoBack) { webView.goBack() }

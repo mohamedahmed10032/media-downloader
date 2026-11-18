@@ -44,14 +44,24 @@ class BrowserViewModel @Inject constructor(
     private val _blobMessage = MutableStateFlow<String?>(null)
     val blobMessage: StateFlow<String?> = _blobMessage.asStateFlow()
 
+    private var resolveJob: kotlinx.coroutines.Job? = null
+
     /** Shared engine instance handed to the WebView client and the JS bridge. */
     fun engine(): MediaInterceptionEngine = interceptionEngine
 
+    fun prepareSheetLoading() {
+        resolveJob?.cancel()
+        _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
+    }
+
     fun resolveForSheet(targetUrl: String) {
-        viewModelScope.launch {
+        resolveJob?.cancel()
+        resolveJob = viewModelScope.launch {
             _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
             _formatState.value = try {
                 com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
                 com.melmeligy.mediadownloader.core.Resource.Error(e.error)
             } catch (e: Exception) {

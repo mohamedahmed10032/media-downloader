@@ -54,8 +54,53 @@ class BlobBridgeInterface(
     @JavascriptInterface
     fun onHttpMediaDetected(url: String, mime: String, pageUrl: String) {
         if (url.isBlank() || !(url.startsWith("http://") || url.startsWith("https://"))) return
-        val headers = HeaderExtractor.forUrl(url, pageUrl.ifBlank { engine.currentPageUrl }, null)
-        engine.submitUrl(url = url, mimeType = mime.ifBlank { null }, headers = headers)
+        if (MediaSniffer.isPreviewOrAdUrl(url)) return
+        val effectivePage = pageUrl.ifBlank { engine.currentPageUrl }
+        val headers = HeaderExtractor.forUrl(url, effectivePage, null)
+        engine.submit(
+            MediaStreamPayload(
+                url = url,
+                streamType = MediaSniffer.classify(url, mime.ifBlank { null }),
+                headersMap = headers,
+                pageUrl = effectivePage,
+                mimeType = mime.ifBlank { null }
+            )
+        )
+    }
+
+    @JavascriptInterface
+    fun onPlayerStreamDetected(
+        url: String,
+        mime: String,
+        quality: Int,
+        title: String,
+        thumb: String,
+        durationSec: Long,
+        pageUrl: String
+    ) {
+        if (url.isBlank() || !(url.startsWith("http://") || url.startsWith("https://"))) return
+        if (MediaSniffer.isPreviewOrAdUrl(url)) return
+        val effectivePage = pageUrl.ifBlank { engine.currentPageUrl }
+        val headers = HeaderExtractor.forUrl(url, effectivePage, null)
+        engine.submit(
+            MediaStreamPayload(
+                url = url,
+                streamType = MediaSniffer.classify(url, mime.ifBlank { null }),
+                headersMap = headers,
+                pageUrl = effectivePage,
+                pageTitle = title.ifBlank { null },
+                thumbnailUrl = thumb.ifBlank { null },
+                mimeType = mime.ifBlank { null },
+                qualityHint = quality.takeIf { it > 0 },
+                durationSeconds = durationSec.takeIf { it > 0L },
+                isAuthoritativePlayer = true
+            )
+        )
+    }
+
+    @JavascriptInterface
+    fun onPageMetadata(title: String, thumb: String) {
+        engine.updatePageMetadata(title.ifBlank { null }, thumb.ifBlank { null })
     }
 
     /**

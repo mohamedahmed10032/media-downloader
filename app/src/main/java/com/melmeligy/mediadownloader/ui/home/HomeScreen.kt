@@ -89,7 +89,7 @@ fun HomeScreen(
     RequestRuntimePermissions()
 
     fun inspectClipboard() {
-        val raw = clipboard.getText()?.text?.trim()
+        val raw = runCatching { clipboard.getText()?.text?.trim() }.getOrNull()
         if (!raw.isNullOrBlank()) {
             val clean = UrlUtils.extractFirstUrl(raw) ?: if (viewModel.isUrl(raw)) UrlUtils.normalize(raw) else null
             if (clean != null) {
@@ -101,8 +101,9 @@ fun HomeScreen(
         }
     }
 
-    // Inspect clipboard initially
+    // Inspect clipboard after the first frame renders so switching tabs stays instant
     LaunchedEffect(Unit) {
+        kotlinx.coroutines.yield()
         inspectClipboard()
     }
 
@@ -127,7 +128,7 @@ fun HomeScreen(
             input = text
         }
         if (text.isEmpty()) {
-            val clipText = clipboard.getText()?.text?.trim().orEmpty()
+            val clipText = runCatching { clipboard.getText()?.text?.trim() }.getOrNull().orEmpty()
             if (clipText.isNotBlank()) {
                 val clean = UrlUtils.extractFirstUrl(clipText) ?: UrlUtils.normalize(clipText) ?: clipText
                 input = clean

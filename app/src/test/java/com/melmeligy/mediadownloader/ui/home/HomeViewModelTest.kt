@@ -12,6 +12,7 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -60,11 +61,15 @@ class HomeViewModelTest {
         every { downloadRepository.observeAll() } returns flowOf(items)
 
         val vm = createViewModel()
+        val collectJob = backgroundScope.launch(kotlinx.coroutines.test.UnconfinedTestDispatcher(testScheduler)) {
+            vm.recent.collect {}
+        }
         advanceUntilIdle()
 
         assertEquals(6, vm.recent.value.size)
         assertEquals(1L, vm.recent.value.first().id)
         assertEquals(6L, vm.recent.value.last().id)
+        collectJob.cancel()
     }
 
     @Test

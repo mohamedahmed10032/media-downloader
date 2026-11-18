@@ -167,26 +167,99 @@ class DownloadManager @Inject constructor(
 
     private suspend fun runOne(item: DownloadItem) {
         val staging = stagingFile(item)
+        var lastProgressWriteMs = 0L
+
+        suspend fun reportProgress(downloaded: Long, total: Long, speed: Long, eta: Long) {
+            val safeDownloaded = downloaded.coerceAtLeast(0L)
+            val safeTotal = if (total > 0L) maxOf(total, safeDownloaded) else total
+            val now = System.currentTimeMillis()
+            val isComplete = safeTotal > 0L && safeDownloaded >= safeTotal
+            if (isComplete || now - lastProgressWriteMs >= DB_PROGRESS_MIN_INTERVAL_MS) {
+                lastProgressWriteMs = now
+                repository.updateProgress(item.id, safeDownloaded, safeTotal, speed.coerceAtLeast(0L), eta)
+            }
+        }
+
         try {
             val headers = JsonUtils.jsonToMap(item.headersJson)
             val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
 
             if (item.isHls) {
                 val stagingTs = File(stagingDir(), "dl_${item.id}_raw.ts.part")
-                val onProgress: ProgressCallback = { p ->
-                    repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
-                }
+                val videoKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()
+                    ?: headers["X-Internal-Expected-Bytes"]?.toLongOrNull()
+                    ?: item.totalBytes
+                val audioKnownBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull() ?: 0L
+                val hasSplitHlsAudio = companionAudioUrl != null &&
+                    item.type == MediaType.VIDEO &&
+                    headers["X-Internal-Extract-Audio"] != "true"
+
+                val stagingAudioTs = File(stagingDir(), "dl_${item.id}_hls_audio.ts.part")
+                val stagingVideoMp4 = File(stagingDir(), "dl_${item.id}_hls_video.mp4.part")
+                val stagingAudioM4a = File(stagingDir(), "dl_${item.id}_hls_audio.m4a.part")
+
                 try {
-                    hlsDownloader.download(item.remoteUrl, headers, stagingTs, onProgress)
-                    withContext(dispatchers.io) {
-                        if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
-                            videoAudioMuxer.extractAudioOnly(stagingTs, staging)
+                    hlsDownloader.download(
+                        playlistUrl = item.remoteUrl,
+                        headers = headers,
+                        dest = stagingTs,
+                        expectedTotalBytes = videoKnownBytes
+                    ) { p ->
+                        val combinedEst = if (hasSplitHlsAudio && p.total > 0L) {
+                            p.total + audioKnownBytes.coerceAtLeast(0L)
                         } else {
-                            videoAudioMuxer.remuxTsToMp4(stagingTs, staging)
+                            p.total
+                        }
+                        reportProgress(p.downloaded, combinedEst, p.speed, p.eta)
+                    }
+
+                    if (hasSplitHlsAudio && companionAudioUrl != null) {
+                        val videoActual = stagingTs.length()
+                        val audioIsHls = headers["X-Internal-Companion-Audio-Hls"] == "true" ||
+                            companionAudioUrl.contains(".m3u8", ignoreCase = true)
+                        if (audioIsHls) {
+                            hlsDownloader.download(
+                                playlistUrl = companionAudioUrl,
+                                headers = headers,
+                                dest = stagingAudioTs,
+                                expectedTotalBytes = audioKnownBytes
+                            ) { p ->
+                                val total = if (p.total > 0L) videoActual + p.total else -1L
+                                reportProgress(videoActual + p.downloaded, total, p.speed, p.eta)
+                            }
+                        } else {
+                            segmentedDownloader.download(
+                                url = companionAudioUrl,
+                                headers = headers,
+                                dest = stagingAudioTs,
+                                knownTotal = audioKnownBytes,
+                                acceptsRanges = false,
+                                segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
+                                onProgress = { p ->
+                                    val total = if (p.total > 0L) videoActual + p.total else -1L
+                                    reportProgress(videoActual + p.downloaded, total, p.speed, p.eta)
+                                }
+                            )
+                        }
+                        withContext(dispatchers.io) {
+                            videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4)
+                            videoAudioMuxer.extractAudioOnly(stagingAudioTs, stagingAudioM4a)
+                            videoAudioMuxer.mux(stagingVideoMp4, stagingAudioM4a, staging)
+                        }
+                    } else {
+                        withContext(dispatchers.io) {
+                            if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
+                                videoAudioMuxer.extractAudioOnly(stagingTs, staging)
+                            } else {
+                                videoAudioMuxer.remuxTsToMp4(stagingTs, staging)
+                            }
                         }
                     }
                 } finally {
                     runCatching { stagingTs.delete() }
+                    runCatching { stagingAudioTs.delete() }
+                    runCatching { stagingVideoMp4.delete() }
+                    runCatching { stagingAudioM4a.delete() }
                 }
             } else if (companionAudioUrl != null) {
                 val videoKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: 0L
@@ -210,7 +283,7 @@ class DownloadManager @Inject constructor(
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                     onProgress = { p ->
                         val total = if (combinedTotal > 0) combinedTotal else p.total
-                        repository.updateProgress(item.id, p.downloaded, total, p.speed, p.eta)
+                        reportProgress(p.downloaded, total, p.speed, p.eta)
                     }
                 )
                 val videoActualBytes = stagingVideo.length()
@@ -225,8 +298,8 @@ class DownloadManager @Inject constructor(
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                     onProgress = { p ->
                         val done = videoActualBytes + p.downloaded
-                        val total = if (combinedTotal > 0) combinedTotal else (videoActualBytes + p.total)
-                        repository.updateProgress(item.id, done, total, p.speed, p.eta)
+                        val total = if (p.total > 0L) videoActualBytes + p.total else combinedTotal
+                        reportProgress(done, total, p.speed, p.eta)
                     }
                 )
 
@@ -237,7 +310,7 @@ class DownloadManager @Inject constructor(
                     runCatching { stagingAudio.delete() }
                 }
             } else if (headers["X-Internal-Extract-Audio"] == "true") {
-                val realSourceBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: item.totalBytes
+                val realSourceBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: 0L
                 val stagingSource = File(stagingDir(), "dl_${item.id}_src.mp4.part")
                 segmentedDownloader.download(
                     url = item.remoteUrl,
@@ -247,7 +320,8 @@ class DownloadManager @Inject constructor(
                     acceptsRanges = false,
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                     onProgress = { p ->
-                        repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
+                        val sourceTotal = if (p.total > 0L) p.total else realSourceBytes
+                        reportProgress(p.downloaded, sourceTotal, p.speed, p.eta)
                     }
                 )
                 withContext(dispatchers.io) {
@@ -256,9 +330,6 @@ class DownloadManager @Inject constructor(
                 }
             } else {
                 val realKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull() ?: item.totalBytes
-                val onProgress: ProgressCallback = { p ->
-                    repository.updateProgress(item.id, p.downloaded, p.total, p.speed, p.eta)
-                }
                 segmentedDownloader.download(
                     url = item.remoteUrl,
                     headers = headers,
@@ -266,7 +337,9 @@ class DownloadManager @Inject constructor(
                     knownTotal = realKnownBytes,
                     acceptsRanges = false,
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
-                    onProgress = onProgress
+                    onProgress = { p ->
+                        reportProgress(p.downloaded, p.total, p.speed, p.eta)
+                    }
                 )
             }
 
@@ -338,11 +411,13 @@ class DownloadManager @Inject constructor(
                 indeterminate = true
             )
         }
-        val totalBytes = active.sumOf { it.totalBytes.coerceAtLeast(0) }
+        val totalBytes = active.sumOf { maxOf(it.totalBytes, it.downloadedBytes).coerceAtLeast(0) }
         val doneBytes = active.sumOf { it.downloadedBytes.coerceAtLeast(0) }
         val speed = active.sumOf { it.speedBytesPerSec.coerceAtLeast(0) }
-        val indeterminate = totalBytes <= 0
-        val percent = if (totalBytes > 0) ((doneBytes * 100) / totalBytes).toInt() else 0
+        val indeterminate = active.all { it.totalBytes <= 0L }
+        val percent = if (!indeterminate && totalBytes > 0) {
+            ((doneBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
+        } else 0
         val title = if (active.size == 1) active.first().title
         else context.getString(com.melmeligy.mediadownloader.R.string.notif_downloading) + " ${active.size} files"
         val text = buildString {
@@ -393,5 +468,6 @@ class DownloadManager @Inject constructor(
 
     private companion object {
         const val FOREGROUND_REFRESH_MS = 1000L
+        const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
     }
 }

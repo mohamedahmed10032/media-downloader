@@ -86,10 +86,14 @@ class HeadlessWebExtractor @Inject constructor(
                         view: WebView,
                         request: WebResourceRequest
                     ): WebResourceResponse? {
+                        val reqUrl = request.url.toString()
+                        if (!request.isForMainFrame && com.melmeligy.mediadownloader.intercept.AdBlocker.isAd(reqUrl)) {
+                            return com.melmeligy.mediadownloader.intercept.AdBlocker.createEmptyResponse()
+                        }
                         runCatching {
-                            val reqUrl = request.url.toString()
                             if (request.method.equals("GET", ignoreCase = true) &&
-                                !reqUrl.startsWith("data:") && !reqUrl.startsWith("about:")
+                                !reqUrl.startsWith("data:") && !reqUrl.startsWith("about:") &&
+                                !MediaSniffer.isPreviewOrAdUrl(reqUrl)
                             ) {
                                 val accept = request.requestHeaders["Accept"]
                                 val type = MediaSniffer.classify(reqUrl, accept)
@@ -114,10 +118,9 @@ class HeadlessWebExtractor @Inject constructor(
                         if (!view.title.isNullOrBlank()) capturedTitle = view.title
                         runCatching {
                             view.evaluateJavascript(BlobBridge.SCRIPT, null)
-                            // Trigger video metadata load & extract og:image / og:title
                             view.evaluateJavascript(
                                 "(function(){try{" +
-                                    "var v=document.querySelector('video'); if(v){v.muted=true;v.play().catch(function(){});}" +
+                                    "if(window.__dlScanNow) window.__dlScanNow();" +
                                     "var ogImg=document.querySelector('meta[property=\"og:image\"]');" +
                                     "var ogTitle=document.querySelector('meta[property=\"og:title\"]');" +
                                     "return JSON.stringify({t:ogTitle?ogTitle.content:'',i:ogImg?ogImg.content:''});" +
@@ -141,10 +144,14 @@ class HeadlessWebExtractor @Inject constructor(
 
             val start = System.currentTimeMillis()
             while (System.currentTimeMillis() - start < timeoutMs) {
-                delay(350)
+                delay(300)
+                val hasAuthoritative = localCaptured.any { it.isAuthoritativePlayer }
                 val hasVideo = localCaptured.any { !MediaSniffer.isAudioTrackUrl(it.url, it.mimeType) }
                 val hasAudio = localCaptured.any { MediaSniffer.isAudioTrackUrl(it.url, it.mimeType) }
-                if (hasVideo && (hasAudio || System.currentTimeMillis() - start > 3_200L)) {
+                if (hasAuthoritative && System.currentTimeMillis() - start > 900L) {
+                    break
+                }
+                if (hasVideo && (hasAudio || System.currentTimeMillis() - start > 2_800L)) {
                     break
                 }
             }
@@ -152,6 +159,7 @@ class HeadlessWebExtractor @Inject constructor(
             withContext(dispatchers.main) {
                 runCatching {
                     webViewRef?.stopLoading()
+                    webViewRef?.removeJavascriptInterface(BlobBridge.NAME)
                     webViewRef?.destroy()
                 }
             }
@@ -159,20 +167,34 @@ class HeadlessWebExtractor @Inject constructor(
 
         if (localCaptured.isEmpty()) return@coroutineScope null
 
+        if (capturedTitle.isNullOrBlank()) {
+            capturedTitle = localCaptured.firstNotNullOfOrNull { it.pageTitle?.takeIf { t -> t.isNotBlank() } }
+        }
+        if (capturedThumb.isNullOrBlank()) {
+            capturedThumb = localCaptured.firstNotNullOfOrNull { it.thumbnailUrl?.takeIf { t -> t.startsWith("http") } }
+        }
+
         val distinctPayloads = localCaptured
             .filter { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
-            .distinctBy { MediaSniffer.cleanMediaUrl(it.url).substringBefore('?') }
+            .filterNot { MediaSniffer.isPreviewOrAdUrl(it.url) }
+            .distinctBy { "${it.streamType}|${MediaSniffer.dedupeKey(it.url)}|${it.qualityHint ?: 0}" }
 
-        val resolved = distinctPayloads.take(8).mapIndexed { idx, payload ->
+        val resolved = distinctPayloads.take(12).mapIndexed { idx, payload ->
             async(dispatchers.io) {
                 val cleanUrl = MediaSniffer.cleanMediaUrl(payload.url)
                 val headers = payload.headersMap
                 when (payload.streamType) {
-                    StreamType.HLS -> runCatching { hlsExtractor.extract(cleanUrl, headers)?.streams }.getOrNull().orEmpty()
+                    StreamType.HLS -> runCatching {
+                        if (payload.qualityHint != null) {
+                            hlsExtractor.extract(cleanUrl, headers, payload.qualityHint)?.streams
+                        } else {
+                            hlsExtractor.extract(cleanUrl, headers)?.streams
+                        }
+                    }.getOrNull().orEmpty()
                     StreamType.DASH -> runCatching { dashExtractor.extract(cleanUrl, headers)?.streams }.getOrNull().orEmpty()
                     StreamType.PROGRESSIVE -> {
                         val info = runCatching { http.probe(cleanUrl, headers) }.getOrNull()
-                        val contentType = info?.contentType ?: payload.mimeType.orEmpty()
+                        val contentType = (info?.contentType ?: payload.mimeType.orEmpty()).lowercase()
                         if (contentType.startsWith("text/html") || contentType.startsWith("application/json")) {
                             emptyList()
                         } else {
@@ -180,8 +202,8 @@ class HeadlessWebExtractor @Inject constructor(
                             val type = if (isAudio) MediaType.AUDIO else MediaType.VIDEO
                             val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, cleanUrl, contentType)
                             val size = info?.contentLength?.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
-                            val height = resRegex.find(cleanUrl)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                            if (size != null && size in 1..15_000L) {
+                            val height = payload.qualityHint ?: UrlUtils.inferResolution(cleanUrl)
+                            if (size != null && size in 1..40_000L) {
                                 emptyList()
                             } else {
                                 listOf(

@@ -20,18 +20,29 @@ open class SniffingWebViewClient(
     private val engine: MediaInterceptionEngine
 ) : WebViewClient() {
 
+    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest?): Boolean {
+        val url = request?.url?.toString() ?: return false
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) return true
+        if (AdBlocker.isAd(url)) return true
+        return false
+    }
+
     override fun shouldInterceptRequest(
         view: WebView,
         request: WebResourceRequest
     ): WebResourceResponse? {
-        runCatching { sniff(request) }
+        val url = request.url.toString()
+        if (!request.isForMainFrame && AdBlocker.isAd(url)) {
+            return AdBlocker.createEmptyResponse()
+        }
+        runCatching { sniff(request, url) }
         return super.shouldInterceptRequest(view, request)
     }
 
-    private fun sniff(request: WebResourceRequest) {
-        val url = request.url.toString()
+    private fun sniff(request: WebResourceRequest, url: String) {
         if (!request.method.equals("GET", ignoreCase = true)) return
         if (url.startsWith("data:") || url.startsWith("about:")) return
+        if (MediaSniffer.isPreviewOrAdUrl(url)) return
 
         val accept = request.requestHeaders["Accept"]
         val type = MediaSniffer.classify(url, accept)
@@ -42,6 +53,7 @@ open class SniffingWebViewClient(
                 url = url,
                 streamType = type,
                 headersMap = HeaderExtractor.fromRequest(request, engine.currentPageUrl),
+                pageUrl = engine.currentPageUrl,
                 mimeType = accept
             )
         )

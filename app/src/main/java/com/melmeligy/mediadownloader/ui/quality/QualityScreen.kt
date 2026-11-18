@@ -754,9 +754,17 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
     // If a non-YouTube extractor only returned video streams, synthesize Fast (M4A) and Classic MP3 options
     // using on-device hardware audio track extraction so Music section is always available like Snaptube!
     if (rawMusic.isEmpty() && rawVideos.isNotEmpty()) {
-        val sourceVideo = rawVideos.maxByOrNull { it.sizeBytes ?: 0L }
-            ?: rawVideos.firstOrNull { !it.isHls }
-            ?: rawVideos.first()
+        // Choose the lightest muxed video stream (preferring progressive MP4 240p/360p) so audio extraction
+        // never wastes bandwidth downloading 1080p/4K video just to demux AAC audio.
+        val muxedCandidates = rawVideos.filter { it.headers["X-Internal-Companion-Audio"] == null }
+            .ifEmpty { rawVideos }
+        val sourceVideo = muxedCandidates
+            .sortedWith(
+                compareBy<MediaStream> { it.isHls }
+                    .thenBy { it.height ?: Int.MAX_VALUE }
+                    .thenBy { it.sizeBytes?.takeIf { s -> s > 0L } ?: Long.MAX_VALUE }
+            )
+            .first()
         val vSize = sourceVideo.sizeBytes ?: 0L
         val durationSeconds = sourceVideo.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
             ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }

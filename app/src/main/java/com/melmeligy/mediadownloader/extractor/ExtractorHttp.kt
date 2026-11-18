@@ -30,14 +30,45 @@ data class HeadInfo(
  * - [buildRequest] builds OkHttp requests for streaming byte transfers.
  */
 @Singleton
-class ExtractorHttp @Inject constructor(
-    private val client: OkHttpClient,
-    private val service: RawContentService
-) {
+class ExtractorHttp {
 
-    /** Fetches [url] as text (HTML pages, HLS playlists) via Retrofit. */
+    private val client: OkHttpClient
+    private val service: RawContentService?
+
+    @Inject
+    constructor(client: OkHttpClient, service: RawContentService) {
+        this.client = client
+        this.service = service
+    }
+
+    constructor(client: OkHttpClient) {
+        this.client = client
+        this.service = null
+    }
+
+    /** Fetches [url] as text (HTML pages, HLS playlists) via Retrofit or OkHttp fallback. */
     suspend fun fetchString(url: String, headers: Map<String, String> = emptyMap()): String {
         val merged = withUserAgent(headers)
+        if (service == null) {
+            return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val request = buildRequest(url, merged)
+                    .header("X-Internal-Download", "true")
+                    .get()
+                    .build()
+                try {
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) throw mapHttpError(response.code)
+                        response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+                    }
+                } catch (e: MediaException) {
+                    throw e
+                } catch (e: UnknownHostException) {
+                    throw MediaException(AppError.NO_INTERNET, e.message, e)
+                } catch (e: IOException) {
+                    throw MediaException(AppError.GENERIC, e.message, e)
+                }
+            }
+        }
         val response = try {
             service.fetch(url, merged)
         } catch (e: UnknownHostException) {
@@ -98,6 +129,7 @@ class ExtractorHttp @Inject constructor(
     fun probe(url: String, headers: Map<String, String> = emptyMap()): HeadInfo {
         val request = buildRequest(url, headers)
             .header("Range", "bytes=0-0")
+            .header("X-Internal-Download", "true")
             .build()
         try {
             client.newCall(request).execute().use { response ->

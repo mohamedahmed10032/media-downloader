@@ -24,7 +24,9 @@ class MediaSniffingInterceptor(
         val response = chain.proceed(request)
 
         runCatching {
+            if (!response.isSuccessful && response.code != 206) return@runCatching
             val url = request.url.toString()
+            if (MediaSniffer.isPreviewOrAdUrl(url)) return@runCatching
             val contentType = response.header("Content-Type")
             val type = MediaSniffer.classify(url, contentType)
             if (MediaSniffer.isMedia(type)) {

@@ -18,19 +18,21 @@ import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Downloads an HLS stream by fetching its MPEG-TS media segments in order and concatenating
- * them into a single .ts file (valid MPEG-TS concatenation). Progress is estimated from the
- * completed-segment ratio.
+ * Downloads clear HLS streams (both MPEG-TS `.ts` and fragmented MP4 `#EXT-X-MAP` /
+ * `#EXT-X-BYTERANGE` playlists) concurrently and concatenates segments in strict playlist order.
  *
- * Scope & honesty: this handles clear (non-encrypted) MPEG-TS HLS. Encrypted/DRM streams and
- * fMP4 (`#EXT-X-MAP`) segment formats are explicitly declined with a clear message rather
- * than attempting to bypass protection or produce a broken file.
+ * Progress & total-byte estimation:
+ * - Uses exact byte sum when `#EXT-X-BYTERANGE` lengths are advertised on every segment.
+ * - Otherwise tracks completed-segment byte & duration totals atomically upon each segment's
+ *   completion (isolated from partial in-flight worker bytes and `#EXT-X-MAP` init headers) so
+ *   concurrent workers never inflate the estimated total size by 5x.
  */
 @Singleton
 class HlsSegmentDownloader @Inject constructor(
@@ -38,10 +40,26 @@ class HlsSegmentDownloader @Inject constructor(
     private val http: ExtractorHttp
 ) {
 
+    internal data class HlsSegment(
+        val url: String,
+        val durationSec: Double,
+        val byteRangeOffset: Long? = null,
+        val byteRangeLength: Long? = null,
+        val isInitMap: Boolean = false
+    )
+
     suspend fun download(
         playlistUrl: String,
         headers: Map<String, String>,
         dest: File,
+        onProgress: ProgressCallback
+    ) = download(playlistUrl, headers, dest, 0L, onProgress)
+
+    suspend fun download(
+        playlistUrl: String,
+        headers: Map<String, String>,
+        dest: File,
+        expectedTotalBytes: Long,
         onProgress: ProgressCallback
     ) = coroutineScope {
         var mediaUrl = playlistUrl
@@ -66,18 +84,66 @@ class HlsSegmentDownloader @Inject constructor(
         dest.parentFile?.mkdirs()
         if (dest.exists()) dest.delete()
 
-        val partsDir = File(dest.parentFile, "hls_parts_${dest.nameWithoutExtension}_${System.currentTimeMillis()}").apply { mkdirs() }
-        val written = AtomicLong(0)
-        val completed = AtomicInteger(0)
-        val totalSegments = segments.size
-        val tracker = SpeedTracker(0)
+        val exactByteRangeTotal = if (segments.all { it.byteRangeLength != null && it.byteRangeLength > 0L }) {
+            segments.sumOf { it.byteRangeLength ?: 0L }
+        } else 0L
+
+        val hintedTotal = expectedTotalBytes.takeIf { it > 0L }
+            ?: headers["X-Internal-Expected-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
+            ?: 0L
+
+        val totalMediaSegments = segments.count { !it.isInitMap }
+        val totalDurationMs = segments
+            .filter { !it.isInitMap && it.durationSec > 0.0 }
+            .sumOf { (it.durationSec * 1000.0).toLong() }
+
+        val partsDir = File(
+            dest.parentFile,
+            "hls_parts_${dest.nameWithoutExtension}_${System.currentTimeMillis()}"
+        ).apply { mkdirs() }
+
+        val written = AtomicLong(0L)
+        val initMapBytes = AtomicLong(0L)
+        val completedMediaSegments = AtomicInteger(0)
+        val completedMediaBytes = AtomicLong(0L)
+        val completedMediaDurationMs = AtomicLong(0L)
+        val tracker = SpeedTracker(0L)
+
+        fun computeEstimatedTotal(currentWritten: Long): Long {
+            if (exactByteRangeTotal > 0L) {
+                return maxOf(exactByteRangeTotal, currentWritten)
+            }
+            val doneSegs = completedMediaSegments.get()
+            val doneBytes = completedMediaBytes.get()
+            val doneDurMs = completedMediaDurationMs.get()
+            val mapBytes = initMapBytes.get()
+
+            val rawEstimate = when {
+                doneSegs > 0 && doneDurMs > 0L && totalDurationMs > 0L ->
+                    mapBytes + (doneBytes * totalDurationMs) / doneDurMs
+                doneSegs > 0 && totalMediaSegments > 0 ->
+                    mapBytes + (doneBytes * totalMediaSegments) / doneSegs
+                hintedTotal > 0L ->
+                    hintedTotal
+                else ->
+                    -1L
+            }
+
+            if (rawEstimate <= 0L) return -1L
+
+            val blended = if (hintedTotal > 0L && doneSegs in 1..3 && totalMediaSegments > 4) {
+                (rawEstimate * doneSegs + hintedTotal * (4 - doneSegs)) / 4L
+            } else {
+                rawEstimate
+            }
+            return maxOf(blended, currentWritten)
+        }
 
         val progressJob = launch {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
                 val bytes = written.get()
-                val done = completed.get()
-                val estTotal = if (done > 0) bytes * totalSegments / done else -1L
+                val estTotal = computeEstimatedTotal(bytes)
                 val speed = tracker.sample(bytes)
                 val eta = if (speed > 0 && estTotal > 0) ((estTotal - bytes) / speed).coerceAtLeast(0) else -1L
                 onProgress(DownloadProgress(bytes, estTotal, speed, eta))
@@ -85,12 +151,21 @@ class HlsSegmentDownloader @Inject constructor(
         }
 
         val semaphore = Semaphore(CONCURRENT_SEGMENTS)
-        val tasks = segments.mapIndexed { index, segmentUrl ->
+        val tasks = segments.mapIndexed { index, segment ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     currentCoroutineContext().ensureActive()
                     val partFile = File(partsDir, "seg_$index.part")
-                    downloadSegmentToPart(segmentUrl, headers, partFile, written)
+                    val segBytes = downloadSegmentToPart(segment, headers, partFile, written)
+                    if (segment.isInitMap) {
+                        initMapBytes.addAndGet(segBytes)
+                    } else {
+                        completedMediaBytes.addAndGet(segBytes)
+                        if (segment.durationSec > 0.0) {
+                            completedMediaDurationMs.addAndGet((segment.durationSec * 1000.0).toLong())
+                        }
+                        completedMediaSegments.incrementAndGet()
+                    }
                     partFile
                 }
             }
@@ -109,7 +184,6 @@ class HlsSegmentDownloader @Inject constructor(
                         }
                     }
                     partFile.delete()
-                    completed.incrementAndGet()
                 }
                 output.flush()
             }
@@ -124,39 +198,56 @@ class HlsSegmentDownloader @Inject constructor(
     }
 
     private suspend fun downloadSegmentToPart(
-        segmentUrl: String,
+        segment: HlsSegment,
         headers: Map<String, String>,
         partFile: File,
         written: AtomicLong
-    ) {
+    ): Long {
         var attempt = 0
         val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
         while (true) {
             currentCoroutineContext().ensureActive()
             var attemptBytes = 0L
             try {
-                val request = http.buildRequest(segmentUrl, headers)
+                val reqBuilder = http.buildRequest(segment.url, headers)
                     .header("X-Internal-Download", "true")
-                    .build()
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) throw http.mapHttpError(response.code)
+
+                val rangeLen = segment.byteRangeLength
+                val rangeStart = segment.byteRangeOffset ?: 0L
+                if (rangeLen != null && rangeLen > 0L) {
+                    val rangeEnd = rangeStart + rangeLen - 1L
+                    reqBuilder.header("Range", "bytes=$rangeStart-$rangeEnd")
+                }
+
+                client.newCall(reqBuilder.build()).execute().use { response ->
+                    if (!response.isSuccessful && response.code != 206) {
+                        throw http.mapHttpError(response.code)
+                    }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
+                    val serverIgnoredRange = rangeLen != null && rangeLen > 0L && response.code == 200
+
                     partFile.parentFile?.mkdirs()
                     FileOutputStream(partFile).use { output ->
                         body.byteStream().use { input ->
-                            while (true) {
+                            if (serverIgnoredRange && rangeStart > 0L) {
+                                skipFully(input, rangeStart)
+                            }
+                            var remaining = if (rangeLen != null && rangeLen > 0L) rangeLen else Long.MAX_VALUE
+                            while (remaining > 0L) {
                                 currentCoroutineContext().ensureActive()
-                                val read = input.read(buffer)
+                                val maxToRead = minOf(buffer.size.toLong(), remaining).toInt()
+                                val read = input.read(buffer, 0, maxToRead)
                                 if (read == -1) break
                                 output.write(buffer, 0, read)
                                 attemptBytes += read
+                                remaining -= read
                                 written.addAndGet(read.toLong())
                             }
                         }
                         output.flush()
                     }
                 }
-                break
+                return attemptBytes
             } catch (e: kotlinx.coroutines.CancellationException) {
                 if (attemptBytes > 0) {
                     written.addAndGet(-attemptBytes)
@@ -171,6 +262,21 @@ class HlsSegmentDownloader @Inject constructor(
                 attempt++
                 if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
                 delay(400L * attempt)
+            }
+        }
+    }
+
+    private fun skipFully(input: InputStream, bytesToSkip: Long) {
+        var remaining = bytesToSkip
+        val discard = ByteArray(8192)
+        while (remaining > 0L) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+            } else {
+                val read = input.read(discard, 0, minOf(discard.size.toLong(), remaining).toInt())
+                if (read == -1) break
+                remaining -= read
             }
         }
     }
@@ -205,22 +311,76 @@ class HlsSegmentDownloader @Inject constructor(
             line.startsWith("#EXT-X-KEY") && !line.contains("METHOD=NONE")
         }
 
-    private fun parseSegments(mediaText: String, baseUrl: String): List<String> {
-        val result = mutableListOf<String>()
-        val mapRegex = Regex("URI=\"([^\"]+)\"")
+    internal fun parseSegments(mediaText: String, baseUrl: String): List<HlsSegment> {
+        val result = mutableListOf<HlsSegment>()
+        val mapUriRegex = Regex("""URI="([^"]+)"""")
+        val mapRangeRegex = Regex("""BYTERANGE="(\d+)(?:@(\d+))?"""")
+        val byteRangeRegex = Regex("""#EXT-X-BYTERANGE:\s*(\d+)(?:@(\d+))?""", RegexOption.IGNORE_CASE)
+        val extInfRegex = Regex("""#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)""", RegexOption.IGNORE_CASE)
+
+        var pendingDuration = 0.0
+        var pendingRangeLen: Long? = null
+        var pendingRangeOffset: Long? = null
+        val nextImplicitOffsetByUri = HashMap<String, Long>()
+        var lastInitKey: String? = null
+
         for (rawLine in mediaText.lineSequence()) {
             val line = rawLine.trim()
             if (line.isEmpty()) continue
-            if (line.startsWith("#EXT-X-MAP:")) {
-                val mapUri = mapRegex.find(line)?.groupValues?.getOrNull(1)
-                if (!mapUri.isNullOrBlank()) {
-                    val resolvedMap = UrlUtils.resolveUrl(baseUrl, mapUri)
-                    if (result.firstOrNull() != resolvedMap) {
-                        result.add(resolvedMap)
+            when {
+                line.startsWith("#EXT-X-MAP:") -> {
+                    val mapUri = mapUriRegex.find(line)?.groupValues?.getOrNull(1)
+                    if (!mapUri.isNullOrBlank()) {
+                        val resolvedMap = UrlUtils.resolveUrl(baseUrl, mapUri)
+                        val rangeMatch = mapRangeRegex.find(line)
+                        val rLen = rangeMatch?.groupValues?.getOrNull(1)?.toLongOrNull()
+                        val rOff = rangeMatch?.groupValues?.getOrNull(2)?.takeIf { it.isNotEmpty() }?.toLongOrNull()
+                            ?: if (rLen != null) 0L else null
+                        val initKey = "$resolvedMap|${rOff ?: -1}|${rLen ?: -1}"
+                        if (initKey != lastInitKey) {
+                            lastInitKey = initKey
+                            result.add(
+                                HlsSegment(
+                                    url = resolvedMap,
+                                    durationSec = 0.0,
+                                    byteRangeOffset = rOff,
+                                    byteRangeLength = rLen,
+                                    isInitMap = true
+                                )
+                            )
+                        }
                     }
                 }
-            } else if (!line.startsWith("#")) {
-                result.add(UrlUtils.resolveUrl(baseUrl, line))
+                line.startsWith("#EXTINF:") -> {
+                    pendingDuration = extInfRegex.find(line)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                }
+                line.startsWith("#EXT-X-BYTERANGE:") -> {
+                    val m = byteRangeRegex.find(line)
+                    pendingRangeLen = m?.groupValues?.getOrNull(1)?.toLongOrNull()
+                    pendingRangeOffset = m?.groupValues?.getOrNull(2)?.takeIf { it.isNotEmpty() }?.toLongOrNull()
+                }
+                !line.startsWith("#") -> {
+                    val resolvedUri = UrlUtils.resolveUrl(baseUrl, line)
+                    val len = pendingRangeLen
+                    val offset = if (len != null) {
+                        val explicit = pendingRangeOffset ?: nextImplicitOffsetByUri[resolvedUri] ?: 0L
+                        nextImplicitOffsetByUri[resolvedUri] = explicit + len
+                        explicit
+                    } else null
+
+                    result.add(
+                        HlsSegment(
+                            url = resolvedUri,
+                            durationSec = pendingDuration,
+                            byteRangeOffset = offset,
+                            byteRangeLength = len,
+                            isInitMap = false
+                        )
+                    )
+                    pendingDuration = 0.0
+                    pendingRangeLen = null
+                    pendingRangeOffset = null
+                }
             }
         }
         return result

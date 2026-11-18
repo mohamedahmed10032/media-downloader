@@ -30,8 +30,8 @@ android {
         applicationId = "com.melmeligy.mediadownloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.9.0"
+        versionCode = 11
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "com.melmeligy.mediadownloader.HiltTestRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -179,6 +179,7 @@ dependencies {
     testImplementation(libs.turbine)
     testImplementation(libs.androidx.arch.core.testing)
     testImplementation(libs.androidx.work.testing)
+    testImplementation("org.json:json:20240303")
 
     // Instrumentation tests
     androidTestImplementation(libs.androidx.junit)

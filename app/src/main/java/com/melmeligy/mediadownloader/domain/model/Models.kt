@@ -29,8 +29,8 @@ data class ResolvedMedia(
     val sourceUrl: String,
     val title: String,
     val thumbnailUrl: String? = null,
-    val streams: List<MediaStream>,
-    val extractor: String
+    val streams: List<MediaStream> = emptyList(),
+    val extractor: String = ""
 ) {
     val hasVideo: Boolean get() = streams.any { it.type == MediaType.VIDEO }
     val hasAudio: Boolean get() = streams.any { it.type == MediaType.AUDIO }
