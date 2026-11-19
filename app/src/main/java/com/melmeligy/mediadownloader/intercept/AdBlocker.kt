@@ -68,6 +68,11 @@ object AdBlocker {
         "propellerads.com",
         "highperformanceformat.com",
         "profitablecpmrate.com",
+        "wpadmngr.com",
+        "cdn4ads.com",
+        "gogukypynijoxy.com",
+        "mulewosizeseha.com",
+        "xvideo.com",
         // Live-cam promo widgets embedded on tube pages
         "stripchat.com",
         "xlirdr.com",

@@ -76,13 +76,13 @@ class HlsExtractorTest {
         assertEquals(2, result.streams.size)
 
         val stream720 = result.streams.first { it.height == 720 }
-        // 2,000,000 bps * 60 s / 8 = 15,000,000 bytes (~15 MB)
-        assertEquals(15_000_000L, stream720.sizeBytes)
+        // Peak-only BANDWIDTH applies 0.72 factor: 2,000,000 * 0.72 * 60 / 8 = 10,800,000 bytes
+        assertEquals(10_800_000L, stream720.sizeBytes)
         assertEquals("60", stream720.headers["X-Internal-Duration-Seconds"])
 
         val stream360 = result.streams.first { it.height == 360 }
-        // 800,000 bps * 60 s / 8 = 6,000,000 bytes (~6 MB)
-        assertEquals(6_000_000L, stream360.sizeBytes)
+        // Peak-only BANDWIDTH applies 0.72 factor: 800,000 * 0.72 * 60 / 8 = 4,320,000 bytes
+        assertEquals(4_320_000L, stream360.sizeBytes)
         assertEquals("60", stream360.headers["X-Internal-Duration-Seconds"])
     }
 

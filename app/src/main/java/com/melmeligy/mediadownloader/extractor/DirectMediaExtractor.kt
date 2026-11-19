@@ -1,6 +1,7 @@
 package com.melmeligy.mediadownloader.extractor
 
 import com.melmeligy.mediadownloader.core.util.UrlUtils
+import com.melmeligy.mediadownloader.domain.extractor.ExtractorRegistry
 import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
@@ -21,13 +22,16 @@ class DirectMediaExtractor @Inject constructor(
     override val priority = 100
 
     override fun canHandle(url: String): Boolean {
+        if (ExtractorRegistry.isConfirmedHtml(url)) return false
         val ext = UrlUtils.fileExtension(url) ?: return false
         return ext in UrlUtils.VIDEO_EXTENSIONS || ext in UrlUtils.AUDIO_EXTENSIONS
     }
 
     override suspend fun extract(url: String): ResolvedMedia? {
+        if (ExtractorRegistry.isConfirmedHtml(url)) return null
         val ext = UrlUtils.fileExtension(url)
         val info = runCatching { http.probe(url) }.getOrNull()
+        if (info != null && info.code !in 200..299) return null
         val contentType = info?.contentType.orEmpty()
 
         // A page, not a file: let the HTML extractor take over.

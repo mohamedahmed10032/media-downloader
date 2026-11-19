@@ -225,8 +225,12 @@ class YouTubeExtractor @Inject constructor(
             if (!isAudio && !isVideo) continue
 
             val isMp4 = mimeType.contains("mp4")
+            val isWebm = mimeType.contains("webm")
             val isAvc1 = mimeType.contains("avc1")
+            val isVp9 = mimeType.contains("vp9") || mimeType.contains("vp09")
+            val isAv01 = mimeType.contains("av01") || mimeType.contains("av1")
             val isMp4a = mimeType.contains("mp4a")
+            val isOpus = mimeType.contains("opus")
 
             out += YtFormat(
                 itag = itag,
@@ -235,8 +239,12 @@ class YouTubeExtractor @Inject constructor(
                 isAudio = isAudio,
                 isAdaptive = isAdaptive,
                 isMp4 = isMp4,
+                isWebm = isWebm,
                 isAvc1 = isAvc1,
+                isVp9 = isVp9,
+                isAv01 = isAv01,
                 isMp4a = isMp4a,
+                isOpus = isOpus,
                 width = width,
                 height = height,
                 bitrate = bitrate,
@@ -260,8 +268,12 @@ class YouTubeExtractor @Inject constructor(
             )
 
         val mp4AudioFormats = audioFormats.filter { it.isMp4a || it.isMp4 }
-        // Best M4A AAC audio for muxing with adaptive MP4 video streams and for Music downloads
+        val webmAudioFormats = audioFormats.filter { it.isOpus || it.isWebm }
+            .sortedWith(compareByDescending<YtFormat> { it.isOpus }.thenByDescending { it.bitrate })
+
+        // Best M4A AAC audio for MP4 muxing and best Opus WebM audio for VP9 WebM muxing
         val primaryM4a = mp4AudioFormats.firstOrNull() ?: audioFormats.firstOrNull()
+        val primaryOpus = webmAudioFormats.firstOrNull() ?: audioFormats.firstOrNull()
         val lowAudio = (mp4AudioFormats.ifEmpty { audioFormats })
             .minByOrNull { it.bitrate.takeIf { b -> b > 0 } ?: Long.MAX_VALUE }
             ?: primaryM4a
@@ -272,9 +284,8 @@ class YouTubeExtractor @Inject constructor(
         val musicStreams = mutableListOf<MediaStream>()
         if (primaryM4a != null) {
             val baseAudioSize = primaryM4a.contentLength
-            val lowAudioSize = lowAudio?.contentLength?.takeIf { it > 0 } ?: (baseAudioSize * 60 / 100)
-            val mp3160Size = highAudio?.contentLength?.takeIf { it > baseAudioSize } ?: (baseAudioSize * 114 / 100)
-            val mp3320Size = (baseAudioSize * 185 / 100)
+            val lowAudioSize = lowAudio?.contentLength?.takeIf { it > 0 } ?: baseAudioSize
+            val highAudioSize = highAudio?.contentLength?.takeIf { it > 0 } ?: baseAudioSize
 
             // 1. Fast M4A (128K) - Shown in compact sheet AND More formats
             musicStreams += MediaStream(
@@ -328,7 +339,7 @@ class YouTubeExtractor @Inject constructor(
                 )
             )
 
-            // 4. Classic MP3 (160K) - Default selected in compact sheet AND shown in More formats
+            // 4. Classic MP3 (160K) - Shown in compact sheet AND More formats (never marked X-Internal-Default)
             val mp3160Source = highAudio ?: primaryM4a
             musicStreams += MediaStream(
                 id = "yt-audio-mp3-160k",
@@ -337,12 +348,11 @@ class YouTubeExtractor @Inject constructor(
                 container = "mp3",
                 label = "Classic MP3",
                 bitrateKbps = 160,
-                sizeBytes = mp3160Size,
+                sizeBytes = highAudioSize,
                 isHls = false,
                 headers = baseHeaders + mapOf(
                     "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                     "X-Internal-Quick" to "true",
-                    "X-Internal-Default" to "true",
                     "X-Internal-Video-Bytes" to mp3160Source.contentLength.toString()
                 )
             )
@@ -355,7 +365,7 @@ class YouTubeExtractor @Inject constructor(
                 container = "mp3",
                 label = "Classic MP3 (320K)",
                 bitrateKbps = 320,
-                sizeBytes = mp3320Size,
+                sizeBytes = highAudioSize,
                 isHls = false,
                 headers = baseHeaders + mapOf(
                     "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
@@ -375,31 +385,49 @@ class YouTubeExtractor @Inject constructor(
             val candidates = byHeight[h].orEmpty()
             if (candidates.isEmpty()) continue
 
-            // Prefer progressive muxed MP4 for 360p/720p if available; otherwise prefer avc1 MP4 adaptive stream
             val progressiveMp4 = candidates.firstOrNull { !it.isAdaptive && it.isMp4 }
             val adaptiveAvc1 = candidates
-                .filter { it.isAdaptive && it.isAvc1 }
+                .filter { it.isAdaptive && it.isAvc1 && !it.isAv01 }
                 .maxByOrNull { it.bitrate }
-            val adaptiveMp4 = candidates
-                .filter { it.isAdaptive && it.isMp4 }
+            val adaptiveVp9 = candidates
+                .filter { it.isAdaptive && (it.isVp9 || (it.isWebm && !it.isAv01)) }
                 .maxByOrNull { it.bitrate }
-            val chosen = progressiveMp4 ?: adaptiveAvc1 ?: adaptiveMp4 ?: candidates.maxByOrNull { it.bitrate } ?: continue
+            val adaptiveMp4NonAv01 = candidates
+                .filter { it.isAdaptive && it.isMp4 && !it.isAv01 }
+                .maxByOrNull { it.bitrate }
 
-            val needsAudioMux = chosen.isAdaptive && primaryM4a != null
-            val totalSizeBytes = if (needsAudioMux && primaryM4a != null) {
-                chosen.contentLength + primaryM4a.contentLength
+            val chosen = if (h >= 1440) {
+                adaptiveVp9 ?: adaptiveAvc1 ?: progressiveMp4 ?: adaptiveMp4NonAv01 ?: candidates.maxByOrNull { it.bitrate }
+            } else {
+                progressiveMp4 ?: adaptiveAvc1 ?: adaptiveVp9 ?: adaptiveMp4NonAv01 ?: candidates.maxByOrNull { it.bitrate }
+            } ?: continue
+
+            val useWebm = chosen.isVp9 || (chosen.isWebm && !chosen.isMp4)
+            val companionAudio = if (useWebm) {
+                primaryOpus ?: primaryM4a
+            } else {
+                primaryM4a ?: primaryOpus
+            }
+            val needsAudioMux = chosen.isAdaptive && companionAudio != null
+            val totalSizeBytes = if (needsAudioMux && companionAudio != null) {
+                chosen.contentLength + companionAudio.contentLength
             } else {
                 chosen.contentLength
+            }
+            val container = if (useWebm && (companionAudio == null || companionAudio.isOpus || companionAudio.isWebm)) {
+                "webm"
+            } else {
+                "mp4"
             }
 
             val (label, subtitle, badge) = snaptubeVideoMeta(h)
             val streamHeaders = LinkedHashMap<String, String>(baseHeaders).apply {
                 put("X-Internal-Subtitle", subtitle)
                 if (badge != null) put("X-Internal-Badge", badge)
-                if (needsAudioMux && primaryM4a != null) {
-                    put("X-Internal-Companion-Audio", primaryM4a.url)
+                if (needsAudioMux && companionAudio != null) {
+                    put("X-Internal-Companion-Audio", companionAudio.url)
                     put("X-Internal-Video-Bytes", chosen.contentLength.toString())
-                    put("X-Internal-Audio-Bytes", primaryM4a.contentLength.toString())
+                    put("X-Internal-Audio-Bytes", companionAudio.contentLength.toString())
                 }
             }
 
@@ -407,7 +435,7 @@ class YouTubeExtractor @Inject constructor(
                 id = "yt-video-${h}p",
                 url = chosen.url,
                 type = MediaType.VIDEO,
-                container = "mp4",
+                container = container,
                 label = label,
                 width = chosen.width,
                 height = h,
@@ -472,18 +500,26 @@ class YouTubeExtractor @Inject constructor(
                 val a = audioArr.optJSONObject(i) ?: continue
                 val u = a.optString("url").takeIf { it.startsWith("http") } ?: continue
                 val mime = a.optString("mimeType").lowercase()
+                val codec = a.optString("codec").lowercase()
                 val br = a.optLong("bitrate", 128_000L)
                 val clen = a.optLong("contentLength", 0L).takeIf { it > 0 }
                     ?: if (duration > 0) (br * duration) / 8L else 0L
+                val isOpus = codec.contains("opus") || mime.contains("opus")
+                val isWebm = mime.contains("webm") || isOpus
+                val isMp4 = mime.contains("mp4") || mime.contains("m4a")
                 formats += YtFormat(
                     itag = a.optInt("itag", 140),
                     url = u,
                     mimeType = mime,
                     isAudio = true,
                     isAdaptive = true,
-                    isMp4 = mime.contains("mp4") || mime.contains("m4a"),
+                    isMp4 = isMp4,
+                    isWebm = isWebm,
                     isAvc1 = false,
-                    isMp4a = mime.contains("mp4") || mime.contains("m4a"),
+                    isVp9 = false,
+                    isAv01 = false,
+                    isMp4a = isMp4 || codec.contains("mp4a"),
+                    isOpus = isOpus,
                     width = null,
                     height = null,
                     bitrate = br,
@@ -496,21 +532,31 @@ class YouTubeExtractor @Inject constructor(
                 val v = videoArr.optJSONObject(i) ?: continue
                 val u = v.optString("url").takeIf { it.startsWith("http") } ?: continue
                 val mime = v.optString("mimeType").lowercase()
+                val codec = v.optString("codec").lowercase()
                 val h = v.optInt("height", 0).takeIf { it > 0 } ?: continue
                 val w = v.optInt("width", 0).takeIf { it > 0 }
                 val br = v.optLong("bitrate", 500_000L)
                 val videoOnly = v.optBoolean("videoOnly", true)
                 val clen = v.optLong("contentLength", 0L).takeIf { it > 0 }
                     ?: if (duration > 0) (br * duration) / 8L else 0L
+                val isAv01 = codec.contains("av01") || codec.contains("av1") || mime.contains("av01")
+                val isVp9 = codec.contains("vp9") || codec.contains("vp09") || mime.contains("vp9") || mime.contains("vp09")
+                val isWebm = mime.contains("webm") || isVp9
+                val isMp4 = mime.contains("mp4")
+                val isAvc1 = !isAv01 && !isVp9 && (codec.contains("avc1") || mime.contains("avc1") || (isMp4 && codec.isEmpty()))
                 formats += YtFormat(
                     itag = v.optInt("itag", 0),
                     url = u,
                     mimeType = mime,
                     isAudio = false,
                     isAdaptive = videoOnly,
-                    isMp4 = mime.contains("mp4"),
-                    isAvc1 = mime.contains("avc1") || mime.contains("mp4"),
+                    isMp4 = isMp4,
+                    isWebm = isWebm,
+                    isAvc1 = isAvc1,
+                    isVp9 = isVp9,
+                    isAv01 = isAv01,
                     isMp4a = false,
+                    isOpus = false,
                     width = w,
                     height = h,
                     bitrate = br,
@@ -579,8 +625,12 @@ class YouTubeExtractor @Inject constructor(
         val isAudio: Boolean,
         val isAdaptive: Boolean,
         val isMp4: Boolean,
+        val isWebm: Boolean,
         val isAvc1: Boolean,
+        val isVp9: Boolean,
+        val isAv01: Boolean,
         val isMp4a: Boolean,
+        val isOpus: Boolean,
         val width: Int?,
         val height: Int?,
         val bitrate: Long,

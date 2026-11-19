@@ -8,7 +8,7 @@ import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.download.DownloadManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -19,8 +19,8 @@ class HomeViewModel @Inject constructor(
     downloadRepository: DownloadRepository
 ) : ViewModel() {
 
-    val recent = downloadRepository.observeAll()
-        .map { list -> list.take(6) }
+    val recent = downloadRepository.observeRecent(6)
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
     fun isUrl(input: String): Boolean = UrlUtils.isProbablyUrl(input)

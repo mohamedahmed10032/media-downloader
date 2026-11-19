@@ -30,6 +30,7 @@ class HomeViewModelTest {
     private val downloadManager = mockk<DownloadManager>(relaxed = true)
     private val downloadRepository = mockk<DownloadRepository> {
         every { observeAll() } returns flowOf(emptyList())
+        every { observeRecent(any()) } returns flowOf(emptyList())
     }
 
     private fun createViewModel() = HomeViewModel(downloadManager, downloadRepository)
@@ -58,7 +59,7 @@ class HomeViewModelTest {
                 totalBytes = 1000L
             )
         }
-        every { downloadRepository.observeAll() } returns flowOf(items)
+        every { downloadRepository.observeRecent(6) } returns flowOf(items.take(6))
 
         val vm = createViewModel()
         val collectJob = backgroundScope.launch(kotlinx.coroutines.test.UnconfinedTestDispatcher(testScheduler)) {

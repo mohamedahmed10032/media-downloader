@@ -32,7 +32,8 @@ object MediaSniffer {
 
     /** Segment / init markers. Matching URLs are never surfaced as downloadable items. */
     private val SEGMENT_HINTS = listOf(
-        ".ts", ".m4s", "/seg-", "seg_", "init.mp4", "-frag", "chunk-", "chunk_", "/dash/segment"
+        ".ts", ".m4s", "/seg-", "seg_", "init.mp4", "init.m4s", "/init-", "_init.", "-init.",
+        "init-v", "init-a", ".mp4/init", "-frag", "chunk-", "chunk_", "/dash/segment"
     )
 
     /** Analytics / tracking hosts that occasionally serve media-looking URLs. */
@@ -40,7 +41,7 @@ object MediaSniffer {
         "google-analytics.com", "googletagmanager.com", "doubleclick.net", "/beacon", "/pixel"
     )
 
-    /** Hover-preview, trailer, VAST preroll, and site intro/bumper URL tokens. */
+    /** Hover-preview, trailer, VAST preroll, image-proxy, honeypot, and site intro/bumper URL tokens. */
     private val PREVIEW_OR_BUMPER_HINTS = listOf(
         "mediabook",
         "videopreview",
@@ -54,6 +55,15 @@ object MediaSniffer {
         "/previews/",
         "thumb_preview",
         "hover_video",
+        "thumb-v",
+        ".t.mp4",
+        ".t.av1.mp4",
+        "pix-fl.phncdn.com",
+        "pix-egi.phncdn.com",
+        ".mp4/plain/",
+        "_fb.mp4",
+        "180p_",
+        "event_reporting",
         "_trailer.",
         "_trailer_",
         "-trailer.",
@@ -87,6 +97,12 @@ object MediaSniffer {
         "storyboard"
     )
 
+    private val moviesDownloadWallRegex = Regex("/movies/[^/]+/download(?:/|$)", RegexOption.IGNORE_CASE)
+    private val rawHexOnlyRegex = Regex("^[0-9a-fA-F]{10,}$")
+    private val hexPathAfterVideoRegex = Regex("/(?:videos|embed|watch)/(?:[^/?#]+/)*[0-9a-fA-F]{10,}/?$", RegexOption.IGNORE_CASE)
+    private val hexLastSeg32Regex = Regex("/[0-9a-fA-F]{32,}/?$")
+    private val kvsRotatingHashRegex = Regex("(/get_file/\\d+/)[0-9a-fA-F]{20,}/", RegexOption.IGNORE_CASE)
+
     private val rangeParamRegex =
         Regex("([?&])(bytestart|byteend|range|rn|rbuf)=[^&#]*", RegexOption.IGNORE_CASE)
 
@@ -94,34 +110,53 @@ object MediaSniffer {
         Regex("[?&](itag|quality|res|resolution)=([^&#]+)", RegexOption.IGNORE_CASE)
 
     /**
+     * True when [rawUrl] is an undecrypted hex cipher blob (raw hex string or hex-only terminal
+     * path segment without a media file extension).
+     */
+    fun isHexCipherUrl(rawUrl: String): Boolean {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty()) return false
+        if (rawHexOnlyRegex.matches(trimmed)) return true
+        val noFragQuery = trimmed.substringBefore('#').substringBefore('?')
+        val lastSeg = noFragQuery.trimEnd('/').substringAfterLast('/')
+        if (lastSeg.contains('.')) return false
+        if (hexLastSeg32Regex.containsMatchIn(noFragQuery)) return true
+        if (hexPathAfterVideoRegex.containsMatchIn(noFragQuery)) return true
+        return false
+    }
+
+    /**
      * Strips byte-range slicing query parameters (`bytestart`, `byteend`, `range`) used by
-     * Instagram, Facebook, and YouTube/TikTok MSE players so that:
-     * 1. 8 separate chunk requests for the same video collapse into 1 canonical URL, and
-     * 2. Downloading the URL fetches the entire media file instead of a partial byte slice.
+     * Instagram, Facebook, and YouTube/TikTok MSE players while preserving auth tokens and `#fragment`.
      */
     fun cleanMediaUrl(rawUrl: String): String {
         val trimmed = rawUrl.trim()
-        if (!trimmed.contains('?')) return trimmed
-        var cleaned = rangeParamRegex.replace(trimmed) { match ->
+        val hashIdx = trimmed.indexOf('#')
+        val withoutFrag = if (hashIdx >= 0) trimmed.substring(0, hashIdx) else trimmed
+        val frag = if (hashIdx >= 0) trimmed.substring(hashIdx) else ""
+        if (!withoutFrag.contains('?')) return trimmed
+        var cleaned = rangeParamRegex.replace(withoutFrag) { match ->
             if (match.groupValues[1] == "?") "?" else ""
         }
         cleaned = cleaned.replace("?&", "?").trimEnd('?', '&')
-        return cleaned
+        return cleaned + frag
     }
 
-    /** True if [rawUrl] belongs to an ad server, VAST preroll, hover preview, or site bumper. */
+    /** True if [rawUrl] belongs to an ad server, VAST preroll, hover preview, login wall, or site bumper. */
     fun isPreviewOrAdUrl(rawUrl: String): Boolean {
         if (rawUrl.isBlank()) return false
         if (AdBlocker.isAd(rawUrl)) return true
         val lower = rawUrl.lowercase()
         if (NOISE_HINTS.any { lower.contains(it) }) return true
+        if (moviesDownloadWallRegex.containsMatchIn(lower)) return true
         return PREVIEW_OR_BUMPER_HINTS.any { lower.contains(it) }
     }
 
-    /** Canonical deduplication key that preserves `itag` / `quality` query discriminators. */
+    /** Canonical deduplication key that preserves `itag` / `quality` query discriminators and normalizes KVS session hashes. */
     fun dedupeKey(rawUrl: String): String {
         val cleaned = cleanMediaUrl(rawUrl)
-        val base = cleaned.substringBefore('?')
+        val baseRaw = cleaned.substringBefore('#').substringBefore('?').trimEnd('/')
+        val base = kvsRotatingHashRegex.replace(baseRaw, "$1_kvs_/")
         val qMatch = qualityParamRegex.find(cleaned)
         return if (qMatch != null) {
             "${base}?${qMatch.groupValues[1].lowercase()}=${qMatch.groupValues[2]}"
@@ -149,10 +184,13 @@ object MediaSniffer {
         if (rawUrl.isBlank()) return StreamType.UNKNOWN
         val cleaned = cleanMediaUrl(rawUrl)
         val url = cleaned.lowercase()
-        if (!url.startsWith("blob:") && isPreviewOrAdUrl(cleaned)) return StreamType.UNKNOWN
+        if (!url.startsWith("blob:")) {
+            if (isHexCipherUrl(cleaned)) return StreamType.UNKNOWN
+            if (isPreviewOrAdUrl(cleaned)) return StreamType.UNKNOWN
+        }
 
         val mime = mimeType?.lowercase()?.substringBefore(';')?.trim()
-        val path = url.substringBefore('?').substringBefore('#')
+        val path = url.substringBefore('?').substringBefore('#').trimEnd('/')
         val ext = path.substringAfterLast('.', "")
 
         // Never treat HTML, JSON, JS, CSS, or static images as downloadable stream manifests/files
@@ -183,7 +221,7 @@ object MediaSniffer {
     fun isSegment(url: String): Boolean {
         if (url.isBlank()) return false
         val lower = url.lowercase()
-        val path = lower.substringBefore('?').substringBefore('#')
+        val path = lower.substringBefore('?').substringBefore('#').trimEnd('/')
         val ext = path.substringAfterLast('.', "")
         if (ext == "ts" || ext == "m4s") return true
         return SEGMENT_HINTS.any { lower.contains(it) }
@@ -200,7 +238,7 @@ object MediaSniffer {
         StreamType.HLS -> "ts"
         StreamType.DASH -> "mp4"
         else -> {
-            val path = url.substringBefore('?').substringBefore('#')
+            val path = url.substringBefore('?').substringBefore('#').trimEnd('/')
             val ext = path.substringAfterLast('.', "").lowercase()
             when {
                 isAudioTrackUrl(url, mimeType) && (ext == "mp4" || ext.isBlank()) -> "m4a"

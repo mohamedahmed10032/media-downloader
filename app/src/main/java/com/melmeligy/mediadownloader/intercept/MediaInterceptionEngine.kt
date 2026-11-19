@@ -95,7 +95,9 @@ class MediaInterceptionEngine @Inject constructor() {
         } else {
             MediaSniffer.cleanMediaUrl(payload.url)
         }
-        if (payload.streamType != StreamType.BLOB && MediaSniffer.isPreviewOrAdUrl(cleanedUrl)) {
+        if (payload.streamType != StreamType.BLOB &&
+            (MediaSniffer.isHexCipherUrl(cleanedUrl) || MediaSniffer.isPreviewOrAdUrl(cleanedUrl))
+        ) {
             return false
         }
 
@@ -111,16 +113,18 @@ class MediaInterceptionEngine @Inject constructor() {
             currentPageThumbnail = payload.thumbnailUrl
         }
 
+        val sanitizedQuality = payload.qualityHint?.takeIf { it > 0 }
         val normalizedPayload = payload.copy(
             url = cleanedUrl,
             pageUrl = payload.pageUrl ?: currentPageUrl,
             pageTitle = payload.pageTitle?.takeIf { it.isNotBlank() } ?: currentPageTitle,
-            thumbnailUrl = payload.thumbnailUrl?.takeIf { it.isNotBlank() } ?: currentPageThumbnail
+            thumbnailUrl = payload.thumbnailUrl?.takeIf { it.isNotBlank() } ?: currentPageThumbnail,
+            qualityHint = sanitizedQuality
         )
 
         val key = normalizedPayload.fingerprint
         if (!accept(key)) {
-            // Merge richer metadata (headers, authoritative flag, qualityHint, size, duration) into existing entry
+            // Merge richer metadata (headers, authoritative flag, max qualityHint, size, duration) into existing entry
             val existing = registry[cleanedUrl]
                 ?: _detections.value.firstOrNull { it.fingerprint == key }
             if (existing != null) {
@@ -128,12 +132,16 @@ class MediaInterceptionEngine @Inject constructor() {
                     putAll(normalizedPayload.headersMap)
                     putAll(existing.headersMap)
                 }
+                val mergedQuality = listOfNotNull(
+                    existing.qualityHint?.takeIf { it > 0 },
+                    normalizedPayload.qualityHint?.takeIf { it > 0 }
+                ).maxOrNull()
                 val upgraded = existing.copy(
                     headersMap = mergedHeaders,
                     pageTitle = normalizedPayload.pageTitle ?: existing.pageTitle,
                     thumbnailUrl = normalizedPayload.thumbnailUrl ?: existing.thumbnailUrl,
                     sizeBytes = existing.sizeBytes ?: normalizedPayload.sizeBytes,
-                    qualityHint = normalizedPayload.qualityHint ?: existing.qualityHint,
+                    qualityHint = mergedQuality,
                     durationSeconds = normalizedPayload.durationSeconds ?: existing.durationSeconds,
                     isAuthoritativePlayer = existing.isAuthoritativePlayer || normalizedPayload.isAuthoritativePlayer
                 )

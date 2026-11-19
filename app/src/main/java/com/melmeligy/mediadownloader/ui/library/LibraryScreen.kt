@@ -220,11 +220,13 @@ private fun Thumb(item: DownloadItem, onClick: () -> Unit) {
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary
         )
-        val uriString = item.contentUri
-        if (item.type != MediaType.AUDIO && !uriString.isNullOrBlank()) {
-            val request = remember(uriString) {
+        val remoteThumb = item.thumbnailUrl?.takeIf { it.startsWith("http") }
+        val localUri = item.contentUri?.takeIf { item.type != MediaType.AUDIO && it.isNotBlank() }
+        val imageData: Any? = remoteThumb ?: localUri?.toUri()
+        if (imageData != null) {
+            val request = remember(imageData) {
                 ImageRequest.Builder(context)
-                    .data(uriString.toUri())
+                    .data(imageData)
                     .size(168, 168)
                     .crossfade(false)
                     .build()

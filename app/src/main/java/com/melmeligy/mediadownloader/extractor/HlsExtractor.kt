@@ -1,6 +1,7 @@
 package com.melmeligy.mediadownloader.extractor
 
 import com.melmeligy.mediadownloader.core.util.UrlUtils
+import com.melmeligy.mediadownloader.domain.extractor.ExtractorRegistry
 import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
@@ -31,6 +32,7 @@ class HlsExtractor @Inject constructor(
     private val mapByteRangeRegex = Regex("""BYTERANGE="(\d+)(?:@(\d+))?"""", RegexOption.IGNORE_CASE)
 
     override fun canHandle(url: String): Boolean {
+        if (ExtractorRegistry.isConfirmedHtml(url)) return false
         val ext = UrlUtils.fileExtension(url)
         return ext == "m3u8" || url.contains(".m3u8", ignoreCase = true)
     }
@@ -48,6 +50,7 @@ class HlsExtractor @Inject constructor(
         headers: Map<String, String>,
         heightHint: Int? = null
     ): ResolvedMedia? {
+        if (ExtractorRegistry.isConfirmedHtml(url)) return null
         val text = http.fetchString(url, headers)
         if (!text.contains("#EXTM3U")) return null
 
@@ -101,11 +104,14 @@ class HlsExtractor @Inject constructor(
                 runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
             } else null
 
-            val totalDurationSeconds = if (!variantText.isNullOrBlank()) {
+            val probedDurationSeconds = if (!variantText.isNullOrBlank()) {
                 extInfRegex.findAll(variantText).sumOf {
                     it.groupValues[1].toDoubleOrNull() ?: 0.0
                 }.roundToLong()
             } else 0L
+
+            val headerDurationSeconds = headers["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+            val totalDurationSeconds = if (probedDurationSeconds > 0L) probedDurationSeconds else headerDurationSeconds
 
             val baseStreamHeaders = if (totalDurationSeconds > 0L) {
                 headers + ("X-Internal-Duration-Seconds" to totalDurationSeconds.toString())
@@ -115,15 +121,17 @@ class HlsExtractor @Inject constructor(
 
             val parsedVariants = rawVariants.mapIndexed { variantIdx, v ->
                 val resolution = v.attrs["RESOLUTION"]
-                var width = resolution?.substringBefore('x')?.toIntOrNull()
-                var height = resolution?.substringAfter('x')?.toIntOrNull()
-                if (width != null && height != null && height > width && width in UrlUtils.KNOWN_HEIGHTS) {
+                var width = resolution?.substringBefore('x')?.toIntOrNull()?.takeIf { it > 0 }
+                var height = resolution?.substringAfter('x')?.toIntOrNull()?.takeIf { it > 0 }
+                if (width != null && height != null && height > width) {
                     // Portrait video (e.g. 720x1280 -> 720p)
                     height = width
+                } else if (height != null && width == null) {
+                    width = (height * 16) / 9
                 }
 
-                val bandwidth = v.attrs["BANDWIDTH"]?.toIntOrNull()
-                val avgBandwidth = v.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull()
+                val bandwidth = v.attrs["BANDWIDTH"]?.toIntOrNull()?.takeIf { it > 0 }
+                val avgBandwidth = v.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull()?.takeIf { it > 0 }
                 val effectiveBandwidth = avgBandwidth ?: bandwidth
 
                 if (height == null) {
@@ -138,7 +146,7 @@ class HlsExtractor @Inject constructor(
                         else -> 240
                     }
                     height = hinted ?: bwHeight
-                    if (height != null) {
+                    if (height != null && width == null) {
                         width = (height * 16) / 9
                     }
                 }
@@ -152,9 +160,13 @@ class HlsExtractor @Inject constructor(
                 val audioGroupId = v.attrs["AUDIO"]
                 val companionAudio = if (audioGroupId != null) audioGroupUrls[audioGroupId] else null
 
-                val videoBytes = if (effectiveBandwidth != null && totalDurationSeconds > 0L) {
-                    (effectiveBandwidth.toLong() * totalDurationSeconds) / 8L
-                } else null
+                val videoBytes = when {
+                    totalDurationSeconds <= 0L -> null
+                    avgBandwidth != null -> (avgBandwidth.toLong() * totalDurationSeconds) / 8L
+                    bandwidth != null -> (bandwidth.toDouble() * 0.72 * totalDurationSeconds / 8.0).roundToLong()
+                        .takeIf { it > 0L }
+                    else -> null
+                }
 
                 val variantHeaders = LinkedHashMap<String, String>(baseStreamHeaders).apply {
                     if (videoBytes != null && videoBytes > 0L) {
@@ -253,7 +265,7 @@ class HlsExtractor @Inject constructor(
                     it.groupValues[1].toDoubleOrNull() ?: 0.0
                 }.roundToLong()
 
-                val inferredHeight = heightHint ?: UrlUtils.inferResolution(url)
+                val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(url)
                 val inferredWidth = inferredHeight?.let { (it * 16) / 9 }
 
                 // 1. Check if playlist advertises exact #EXT-X-BYTERANGE segment lengths (e.g. xHamster/fMP4 HLS)

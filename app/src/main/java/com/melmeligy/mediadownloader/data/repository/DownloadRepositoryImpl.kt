@@ -10,6 +10,7 @@ import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -24,16 +25,19 @@ class DownloadRepositoryImpl @Inject constructor(
     private fun now() = System.currentTimeMillis()
 
     override fun observeAll(): Flow<List<DownloadItem>> =
-        dao.observeAll().map { list -> list.map { it.toDomain() } }
+        dao.observeAll().map { list -> list.map { it.toDomain() } }.distinctUntilChanged()
+
+    override fun observeRecent(limit: Int): Flow<List<DownloadItem>> =
+        dao.observeRecent(limit).map { list -> list.map { it.toDomain() } }.distinctUntilChanged()
 
     override fun observeByType(type: MediaType): Flow<List<DownloadItem>> =
-        dao.observeByType(type).map { list -> list.map { it.toDomain() } }
+        dao.observeByType(type).map { list -> list.map { it.toDomain() } }.distinctUntilChanged()
 
     override fun observeActive(): Flow<List<DownloadItem>> =
-        dao.observeActive().map { list -> list.map { it.toDomain() } }
+        dao.observeActive().map { list -> list.map { it.toDomain() } }.distinctUntilChanged()
 
     override fun observeCompletedByType(type: MediaType): Flow<List<DownloadItem>> =
-        dao.observeCompletedByType(type).map { list -> list.map { it.toDomain() } }
+        dao.observeCompletedByType(type).map { list -> list.map { it.toDomain() } }.distinctUntilChanged()
 
     override suspend fun getById(id: Long): DownloadItem? =
         withContext(dispatchers.io) { dao.getById(id)?.toDomain() }

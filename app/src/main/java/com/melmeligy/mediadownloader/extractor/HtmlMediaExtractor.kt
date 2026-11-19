@@ -64,6 +64,10 @@ class HtmlMediaExtractor @Inject constructor(
     private val kvsTextFieldRegex = Regex(
         """(video_url_text|video_alt_url\d*_text)\s*:\s*['"]([^'"]+)['"]"""
     )
+    private val kvsRedirectFieldRegex = Regex(
+        """(video_url|video_alt_url\d*)_redirect\s*:\s*['"]?(1|true)['"]?""",
+        RegexOption.IGNORE_CASE
+    )
 
     private val playerSourceObjRegex = Regex(
         """\{[^{}]{0,420}?(?:file|src|"file"|"src")\s*:\s*['"](https?://[^'"]+)['"][^{}]{0,420}?\}""",
@@ -140,13 +144,16 @@ class HtmlMediaExtractor @Inject constructor(
             authoritative: Boolean = false,
             extraHeaders: Map<String, String> = emptyMap()
         ) {
-            val resolved = UrlUtils.resolveUrl(pageUrl, unescapeUrl(rawUrl.trim()))
+            val trimmedRaw = unescapeUrl(rawUrl.trim())
+            if (trimmedRaw.contains("THUMBNUM", ignoreCase = true)) return
+            if (type != MediaType.IMAGE && MediaSniffer.isHexCipherUrl(trimmedRaw)) return
+            val resolved = UrlUtils.resolveUrl(pageUrl, trimmedRaw)
             val cleaned = MediaSniffer.cleanMediaUrl(resolved)
             if (!cleaned.startsWith("http")) return
-            if (type != MediaType.IMAGE && MediaSniffer.isPreviewOrAdUrl(cleaned)) return
+            if (type != MediaType.IMAGE && (MediaSniffer.isHexCipherUrl(cleaned) || MediaSniffer.isPreviewOrAdUrl(cleaned))) return
 
             val key = MediaSniffer.dedupeKey(cleaned)
-            val inferredHeight = height ?: UrlUtils.inferResolution(cleaned, label)
+            val inferredHeight = height?.takeIf { it > 0 } ?: UrlUtils.inferResolution(cleaned, label)?.takeIf { it > 0 }
             val finalLabel = when {
                 type == MediaType.IMAGE -> if (label.isNotBlank() && label != "Video") label else "Photo (HD)"
                 label != "Video" && label.isNotBlank() -> label
@@ -183,7 +190,7 @@ class HtmlMediaExtractor @Inject constructor(
                 type = type,
                 container = container,
                 label = finalLabel,
-                width = width,
+                width = width?.takeIf { it > 0 },
                 height = inferredHeight,
                 bitrateKbps = bitrateKbps,
                 sizeBytes = sizeBytes,
@@ -193,9 +200,12 @@ class HtmlMediaExtractor @Inject constructor(
         }
 
         suspend fun addExpandedHls(rawHlsUrl: String, heightHint: Int? = null, authoritative: Boolean = false) {
-            val cleaned = MediaSniffer.cleanMediaUrl(UrlUtils.resolveUrl(pageUrl, unescapeUrl(rawHlsUrl.trim())))
-            if (!cleaned.startsWith("http") || MediaSniffer.isPreviewOrAdUrl(cleaned)) return
-            val expanded = runCatching { hlsExtractor.extract(cleaned, effectiveHeaders(), heightHint) }.getOrNull()
+            val trimmedRaw = unescapeUrl(rawHlsUrl.trim())
+            if (MediaSniffer.isHexCipherUrl(trimmedRaw)) return
+            val cleaned = MediaSniffer.cleanMediaUrl(UrlUtils.resolveUrl(pageUrl, trimmedRaw))
+            if (!cleaned.startsWith("http") || MediaSniffer.isHexCipherUrl(cleaned) || MediaSniffer.isPreviewOrAdUrl(cleaned)) return
+            val sanitizedHint = heightHint?.takeIf { it > 0 }
+            val expanded = runCatching { hlsExtractor.extract(cleaned, effectiveHeaders(), sanitizedHint) }.getOrNull()
             if (expanded != null && expanded.streams.isNotEmpty()) {
                 if (authoritative) authoritativeFound = true
                 expanded.streams.forEach { variant ->
@@ -214,8 +224,8 @@ class HtmlMediaExtractor @Inject constructor(
                     rawUrl = cleaned,
                     type = MediaType.VIDEO,
                     container = "ts",
-                    label = if (heightHint != null) "${heightHint}p" else "HLS (auto)",
-                    height = heightHint,
+                    label = if (sanitizedHint != null) "${sanitizedHint}p" else "HLS (auto)",
+                    height = sanitizedHint,
                     isHls = true,
                     authoritative = authoritative
                 )
@@ -225,7 +235,7 @@ class HtmlMediaExtractor @Inject constructor(
         // Strip related-video arrays & VAST ad blocks before scanning inline scripts
         val cleanedScripts = relatedNoiseRegex.replace(html, " ")
 
-        // ---- 1. JSON-LD Schema.org VideoObject / AudioObject metadata ----
+        // ---- 1. JSON-LD Schema.org VideoObject / AudioObject metadata (unwrapping nested graphs up to depth 5) ----
         var jsonLdTitle: String? = null
         var jsonLdThumb: String? = null
         doc.select("script[type=application/ld+json]").forEach { script ->
@@ -235,10 +245,10 @@ class HtmlMediaExtractor @Inject constructor(
                 if (rawJson.startsWith("[")) {
                     val arr = JSONArray(rawJson)
                     for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.let { objects.add(it) }
+                        arr.optJSONObject(i)?.let { collectJsonLdObjects(it, 0, objects) }
                     }
                 } else if (rawJson.startsWith("{")) {
-                    objects.add(JSONObject(rawJson))
+                    collectJsonLdObjects(JSONObject(rawJson), 0, objects)
                 }
                 for (obj in objects) {
                     if (jsonLdTitle == null) jsonLdTitle = obj.optString("name").takeIf { it.isNotBlank() }
@@ -282,6 +292,7 @@ class HtmlMediaExtractor @Inject constructor(
                 val defs = fv.optJSONArray("mediaDefinitions")
                 if (defs != null) {
                     val remoteEndpoints = mutableListOf<String>()
+                    val pendingHls = mutableListOf<Pair<String, Int?>>()
                     for (i in 0 until defs.length()) {
                         val md = defs.optJSONObject(i) ?: continue
                         val vUrl = unescapeUrl(md.optString("videoUrl").trim())
@@ -296,7 +307,7 @@ class HtmlMediaExtractor @Inject constructor(
                             val qHint = extractMediaDefQuality(md)
                             val fmt = md.optString("format").lowercase()
                             if (fmt == "hls" || vUrl.contains(".m3u8", ignoreCase = true)) {
-                                addExpandedHls(vUrl, qHint, authoritative = true)
+                                pendingHls += (vUrl to qHint)
                             } else {
                                 addStream(
                                     rawUrl = vUrl,
@@ -309,9 +320,60 @@ class HtmlMediaExtractor @Inject constructor(
                             }
                         }
                     }
-                    // Resolve remote get_media JSON endpoints for direct MP4 qualities (240p..1080p)
-                    for (endpoint in remoteEndpoints.distinct().take(2)) {
-                        val remoteJson = runCatching { http.fetchString(endpoint, effectiveHeaders()) }.getOrNull()
+
+                    // Expand per-quality HLS endpoints in parallel instead of sequentially
+                    if (pendingHls.isNotEmpty()) {
+                        val expandedAll = pendingHls.distinctBy { it.first }.map { (hlsUrl, qHint) ->
+                            async(kotlinx.coroutines.Dispatchers.IO) {
+                                val cleanedHls = MediaSniffer.cleanMediaUrl(UrlUtils.resolveUrl(pageUrl, hlsUrl))
+                                if (!cleanedHls.startsWith("http") || MediaSniffer.isPreviewOrAdUrl(cleanedHls)) {
+                                    Triple(cleanedHls, qHint, null)
+                                } else {
+                                    val res = runCatching {
+                                        hlsExtractor.extract(cleanedHls, effectiveHeaders(), qHint?.takeIf { it > 0 })
+                                    }.getOrNull()
+                                    Triple(cleanedHls, qHint, res)
+                                }
+                            }
+                        }.awaitAll()
+                        for ((cleanedHls, qHint, expanded) in expandedAll) {
+                            if (!cleanedHls.startsWith("http") || MediaSniffer.isPreviewOrAdUrl(cleanedHls)) continue
+                            if (expanded != null && expanded.streams.isNotEmpty()) {
+                                authoritativeFound = true
+                                expanded.streams.forEach { variant ->
+                                    val k = MediaSniffer.dedupeKey(variant.url)
+                                    if (!found.containsKey(k)) {
+                                        val merged = LinkedHashMap<String, String>().apply {
+                                            putAll(effectiveHeaders())
+                                            putAll(variant.headers)
+                                            put("X-Internal-Authoritative", "true")
+                                        }
+                                        found[k] = variant.copy(id = "html-${counter++}", headers = merged)
+                                    }
+                                }
+                            } else {
+                                addStream(
+                                    rawUrl = cleanedHls,
+                                    type = MediaType.VIDEO,
+                                    container = "ts",
+                                    label = if (qHint != null) "${qHint}p" else "HLS (auto)",
+                                    height = qHint,
+                                    isHls = true,
+                                    authoritative = true
+                                )
+                            }
+                        }
+                    }
+
+                    // Resolve remote get_media JSON endpoints in parallel for direct MP4/HLS qualities
+                    val remoteResults = remoteEndpoints.distinct().take(2).map { endpoint ->
+                        async(kotlinx.coroutines.Dispatchers.IO) {
+                            runCatching { http.fetchString(endpoint, effectiveHeaders()) }.getOrNull()
+                        }
+                    }.awaitAll()
+
+                    val remoteHls = mutableListOf<Pair<String, Int?>>()
+                    for (remoteJson in remoteResults) {
                         if (!remoteJson.isNullOrBlank() && remoteJson.trimStart().startsWith("[")) {
                             runCatching {
                                 val arr = JSONArray(remoteJson.trim())
@@ -323,7 +385,7 @@ class HtmlMediaExtractor @Inject constructor(
                                     val qHint = extractMediaDefQuality(item)
                                     val fmt = item.optString("format").lowercase()
                                     if (fmt == "hls" || rUrl.contains(".m3u8", ignoreCase = true)) {
-                                        addExpandedHls(rUrl, qHint, authoritative = true)
+                                        remoteHls += (rUrl to qHint)
                                     } else {
                                         addStream(
                                             rawUrl = rUrl,
@@ -338,6 +400,37 @@ class HtmlMediaExtractor @Inject constructor(
                             }
                         }
                     }
+                    if (remoteHls.isNotEmpty()) {
+                        val expandedRemote = remoteHls.distinctBy { it.first }.map { (hlsUrl, qHint) ->
+                            async(kotlinx.coroutines.Dispatchers.IO) {
+                                val cleanedHls = MediaSniffer.cleanMediaUrl(UrlUtils.resolveUrl(pageUrl, hlsUrl))
+                                Triple(
+                                    cleanedHls,
+                                    qHint,
+                                    runCatching { hlsExtractor.extract(cleanedHls, effectiveHeaders(), qHint?.takeIf { it > 0 }) }.getOrNull()
+                                )
+                            }
+                        }.awaitAll()
+                        for ((cleanedHls, qHint, expanded) in expandedRemote) {
+                            if (!cleanedHls.startsWith("http") || MediaSniffer.isPreviewOrAdUrl(cleanedHls)) continue
+                            if (expanded != null && expanded.streams.isNotEmpty()) {
+                                authoritativeFound = true
+                                expanded.streams.forEach { variant ->
+                                    val k = MediaSniffer.dedupeKey(variant.url)
+                                    if (!found.containsKey(k)) {
+                                        val merged = LinkedHashMap<String, String>().apply {
+                                            putAll(effectiveHeaders())
+                                            putAll(variant.headers)
+                                            put("X-Internal-Authoritative", "true")
+                                        }
+                                        found[k] = variant.copy(id = "html-${counter++}", headers = merged)
+                                    }
+                                }
+                            } else {
+                                addStream(cleanedHls, MediaType.VIDEO, "ts", if (qHint != null) "${qHint}p" else "HLS (auto)", height = qHint, isHls = true, authoritative = true)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -347,22 +440,26 @@ class HtmlMediaExtractor @Inject constructor(
             if (customTitle == null) customTitle = unescapeUrl(it)
         }
         (xvThumb169Regex.find(cleanedScripts) ?: xvThumbRegex.find(cleanedScripts))
-            ?.groupValues?.getOrNull(2)?.takeIf { it.startsWith("http") }?.let {
+            ?.groupValues?.getOrNull(2)?.takeIf { it.startsWith("http") && !it.contains("THUMBNUM", ignoreCase = true) }?.let {
                 if (customThumb == null) customThumb = unescapeUrl(it)
             }
         xvHlsRegex.find(cleanedScripts)?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }?.let { hlsUrl ->
             addExpandedHls(hlsUrl, authoritative = true)
         }
-        xvHighRegex.find(cleanedScripts)?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }?.let { highUrl ->
+        val xvHighUrl = xvHighRegex.find(cleanedScripts)?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }
+        val xvLowUrl = xvLowRegex.find(cleanedScripts)?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }
+        xvHighUrl?.let { highUrl ->
             val q = UrlUtils.inferResolution(highUrl) ?: 480
             addStream(highUrl, MediaType.VIDEO, containerFor(highUrl, "mp4"), "${q}p", height = q, authoritative = true)
         }
-        xvLowRegex.find(cleanedScripts)?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }?.let { lowUrl ->
-            val q = UrlUtils.inferResolution(lowUrl) ?: 240
-            addStream(lowUrl, MediaType.VIDEO, containerFor(lowUrl, "mp4"), "${q}p", height = q, authoritative = true)
+        xvLowUrl?.let { lowUrl ->
+            if (xvHighUrl == null || MediaSniffer.dedupeKey(lowUrl) != MediaSniffer.dedupeKey(xvHighUrl)) {
+                val q = UrlUtils.inferResolution(lowUrl) ?: 240
+                addStream(lowUrl, MediaType.VIDEO, containerFor(lowUrl, "mp4"), "${q}p", height = q, authoritative = true)
+            }
         }
 
-        // ---- 4. xHamster (`window.initials = {...}` + `<link rel="preload" href="...m3u8">`) ----
+        // ---- 4. xHamster (`window.initials = {...}` with 7-PRNG hex cipher & hostMap + preload H.264 upgrade) ----
         extractBalancedJsonObjects(html, Regex("""window\.initials\s*=\s*\{""")).forEach { jsonStr ->
             runCatching {
                 val ini = JSONObject(jsonStr)
@@ -374,44 +471,119 @@ class HtmlMediaExtractor @Inject constructor(
                     ve.optLong("duration", 0L).takeIf { it > 0L }?.let { pageDurationSec = it }
                 }
 
-                val sources = ini.optJSONObject("xplayerSettings")?.optJSONObject("sources")
-                    ?: ve?.optJSONObject("sources")
+                val xps = ini.optJSONObject("xplayerSettings")
+                val hostMap = xps?.optJSONObject("hostMap") ?: ini.optJSONObject("hostMap")
+                val sources = xps?.optJSONObject("sources") ?: ve?.optJSONObject("sources")
+
+                fun decodeXhamsterUrl(raw: String?, mapKey: String? = null): String? {
+                    val s = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+                    val decrypted = XhamsterCipher.decryptSourceUrl(unescapeUrl(s))
+                    val mapped = XhamsterCipher.applyHostMap(decrypted, hostMap, mapKey)
+                    val resolved = if (mapped.startsWith("//")) "https:$mapped" else mapped
+                    return resolved.takeIf { it.startsWith("http") && !MediaSniffer.isHexCipherUrl(it) }
+                }
+
                 if (sources != null) {
                     val hlsObj = sources.optJSONObject("hls")
                     if (hlsObj != null) {
-                        val preferredHls = hlsObj.optJSONObject("h264")?.optString("url")
-                            ?.takeIf { it.startsWith("http") }
-                            ?: hlsObj.optJSONObject("mp4")?.optString("url")?.takeIf { it.startsWith("http") }
-                            ?: hlsObj.keys().asSequence().mapNotNull { k ->
-                                hlsObj.optJSONObject(k)?.optString("url")?.takeIf { it.startsWith("http") }
-                            }.firstOrNull()
-                        if (preferredHls != null) {
-                            addExpandedHls(preferredHls, authoritative = true)
+                        // Prefer h264 -> mp4 -> other non-av1 -> av1
+                        val hlsKeys = buildList {
+                            if (hlsObj.has("h264")) add("h264")
+                            if (hlsObj.has("mp4")) add("mp4")
+                            hlsObj.keys().forEach { k ->
+                                if (k != "h264" && k != "mp4" && !k.contains("av1", ignoreCase = true)) add(k)
+                            }
+                            hlsObj.keys().forEach { k ->
+                                if (k.contains("av1", ignoreCase = true)) add(k)
+                            }
+                        }
+                        var addedHls = false
+                        for (k in hlsKeys) {
+                            val entry = hlsObj.opt(k)
+                            val rawUrl = when (entry) {
+                                is JSONObject -> entry.optString("url").ifBlank { entry.optString("fallback") }
+                                is String -> entry
+                                else -> ""
+                            }
+                            val hostKey = if (entry is JSONObject) entry.optString("host").ifBlank { k } else k
+                            val decoded = decodeXhamsterUrl(rawUrl, hostKey) ?: decodeXhamsterUrl(rawUrl, "hls")
+                            if (decoded != null) {
+                                addExpandedHls(decoded, authoritative = true)
+                                addedHls = true
+                                if (!k.contains("av1", ignoreCase = true)) break
+                            }
                         }
                     }
 
                     val stdObj = sources.optJSONObject("standard")
                     if (stdObj != null) {
-                        val stdArr = stdObj.optJSONArray("h264")
-                            ?: stdObj.optJSONArray("mp4")
-                            ?: stdObj.keys().asSequence().mapNotNull { k -> stdObj.optJSONArray(k) }.firstOrNull()
-                        if (stdArr != null) {
-                            for (i in 0 until stdArr.length()) {
-                                val item = stdArr.optJSONObject(i) ?: continue
-                                val primaryUrl = item.optString("url").ifBlank { item.optString("fallback") }
-                                if (primaryUrl.startsWith("http")) {
-                                    val qLabel = item.optString("quality").ifBlank { item.optString("label") }
-                                    val q = UrlUtils.inferResolution(primaryUrl, qLabel)
-                                    addStream(
-                                        rawUrl = primaryUrl,
-                                        type = MediaType.VIDEO,
-                                        container = containerFor(primaryUrl, "mp4"),
-                                        label = qLabel.ifBlank { if (q != null) "${q}p" else "Video" },
-                                        height = q,
-                                        authoritative = true
-                                    )
+                        val stdKeys = buildList {
+                            if (stdObj.has("h264")) add("h264")
+                            if (stdObj.has("mp4")) add("mp4")
+                            stdObj.keys().forEach { k ->
+                                if (k != "h264" && k != "mp4" && !k.contains("av1", ignoreCase = true)) add(k)
+                            }
+                            stdObj.keys().forEach { k ->
+                                if (k.contains("av1", ignoreCase = true)) add(k)
+                            }
+                        }
+                        for (k in stdKeys) {
+                            val stdVal = stdObj.opt(k)
+                            var handledNonEmpty = false
+                            if (stdVal is JSONArray) {
+                                for (i in 0 until stdVal.length()) {
+                                    val item = stdVal.optJSONObject(i) ?: continue
+                                    val rawPrimary = item.optString("url").ifBlank { item.optString("fallback") }
+                                    val hostKey = item.optString("host").ifBlank { item.optString("quality").ifBlank { k } }
+                                    val decoded = decodeXhamsterUrl(rawPrimary, hostKey) ?: decodeXhamsterUrl(rawPrimary, k)
+                                    if (decoded != null) {
+                                        handledNonEmpty = true
+                                        val qLabel = item.optString("quality").ifBlank { item.optString("label") }
+                                        val q = UrlUtils.inferResolution(decoded, qLabel)
+                                        if (decoded.contains(".m3u8", ignoreCase = true) || qLabel.equals("auto", ignoreCase = true)) {
+                                            addExpandedHls(decoded, q, authoritative = true)
+                                        } else {
+                                            addStream(
+                                                rawUrl = decoded,
+                                                type = MediaType.VIDEO,
+                                                container = containerFor(decoded, "mp4"),
+                                                label = qLabel.ifBlank { if (q != null) "${q}p" else "Video" },
+                                                height = q,
+                                                authoritative = true
+                                            )
+                                        }
+                                    }
+                                }
+                            } else if (stdVal is JSONObject) {
+                                val keysIter = stdVal.keys()
+                                while (keysIter.hasNext()) {
+                                    val qKey = keysIter.next()
+                                    val qEntry = stdVal.opt(qKey)
+                                    val rawPrimary = when (qEntry) {
+                                        is String -> qEntry
+                                        is JSONObject -> qEntry.optString("url").ifBlank { qEntry.optString("fallback") }
+                                        else -> ""
+                                    }
+                                    val decoded = decodeXhamsterUrl(rawPrimary, qKey) ?: decodeXhamsterUrl(rawPrimary, k)
+                                    if (decoded != null) {
+                                        handledNonEmpty = true
+                                        val q = UrlUtils.inferResolution(decoded, qKey)
+                                        if (decoded.contains(".m3u8", ignoreCase = true) || qKey.equals("auto", ignoreCase = true)) {
+                                            addExpandedHls(decoded, q, authoritative = true)
+                                        } else {
+                                            addStream(
+                                                rawUrl = decoded,
+                                                type = MediaType.VIDEO,
+                                                container = containerFor(decoded, "mp4"),
+                                                label = if (q != null) "${q}p" else qKey,
+                                                height = q,
+                                                authoritative = true
+                                            )
+                                        }
+                                    }
                                 }
                             }
+                            if (handledNonEmpty && !k.contains("av1", ignoreCase = true)) break
                         }
                     }
                 }
@@ -420,7 +592,19 @@ class HtmlMediaExtractor @Inject constructor(
         doc.select("link[rel=preload][href*=.m3u8]").forEach { link ->
             val href = link.absUrl("href").ifBlank { link.attr("href") }
             if (href.startsWith("http") && !authoritativeFound) {
-                addExpandedHls(href, authoritative = true)
+                if (href.contains(".av1.", ignoreCase = true) || href.contains("_av1", ignoreCase = true)) {
+                    val h264Candidate = href
+                        .replace(".av1.", ".h264.", ignoreCase = true)
+                        .replace("_av1", "_h264", ignoreCase = true)
+                    val upgraded = runCatching { hlsExtractor.extract(h264Candidate, effectiveHeaders()) }.getOrNull()
+                    if (upgraded != null && upgraded.streams.isNotEmpty()) {
+                        addExpandedHls(h264Candidate, authoritative = true)
+                    } else {
+                        addExpandedHls(href, authoritative = true)
+                    }
+                } else {
+                    addExpandedHls(href, authoritative = true)
+                }
             }
         }
 
@@ -430,12 +614,17 @@ class HtmlMediaExtractor @Inject constructor(
         kvsTextFieldRegex.findAll(cleanedScripts).forEach { m ->
             kvsLabels[m.groupValues[1]] = m.groupValues[2]
         }
+        val kvsRedirects = HashSet<String>()
+        kvsRedirectFieldRegex.findAll(cleanedScripts).forEach { m ->
+            kvsRedirects.add(m.groupValues[1])
+        }
         kvsUrlFieldRegex.findAll(cleanedScripts).forEach { m ->
             val fieldName = m.groupValues[1]
+            if (fieldName in kvsRedirects) return@forEach
             val rawKvsUrl = m.groupValues[2]
             val decrypted = decryptKvsUrl(unescapeUrl(rawKvsUrl), kvsLicense)
             val labelText = kvsLabels["${fieldName}_text"].orEmpty()
-            val q = UrlUtils.inferResolution(decrypted, labelText)
+            val q = inferKvsResolution(decrypted, labelText, fieldName)
             if (decrypted.contains(".m3u8", ignoreCase = true)) {
                 addExpandedHls(decrypted, q, authoritative = true)
             } else {
@@ -658,31 +847,67 @@ class HtmlMediaExtractor @Inject constructor(
                 .ifBlank { doc.title() }
                 .ifBlank { UrlUtils.host(pageUrl) ?: "Media" }
 
-        // ---- 11. Probe direct streams concurrently for exact sizeBytes & reject HTML/tiny bumpers ----
+        // ---- 11. Probe direct streams concurrently for exact sizeBytes & reject dead/HTML/image/tiny bumpers ----
         val rawStreams = found.values.toList()
-        val probedStreams = rawStreams.mapIndexed { i, stream ->
-            async {
+        val probeResults = rawStreams.mapIndexed { i, stream ->
+            async(kotlinx.coroutines.Dispatchers.IO) {
                 if (!stream.isHls && stream.type != MediaType.IMAGE && i < MAX_SIZE_PROBES) {
-                    runCatching {
+                    try {
                         val info = http.probe(stream.url, stream.headers)
-                        val ct = info.contentType?.lowercase().orEmpty()
-                        if (ct.startsWith("text/html") || ct.startsWith("application/xhtml") || ct.startsWith("application/json")) {
-                            null
-                        } else if (info.contentLength in 1..40_000L) {
-                            null
-                        } else if (info.contentLength > 0) {
-                            stream.copy(sizeBytes = info.contentLength)
+                        if (info.code !in 200..299) {
+                            null to null
                         } else {
-                            stream
+                            val ct = info.contentType?.lowercase().orEmpty()
+                            if (ct.startsWith("text/html") ||
+                                ct.startsWith("application/xhtml") ||
+                                ct.startsWith("application/json") ||
+                                ct.startsWith("image/")
+                            ) {
+                                null to null
+                            } else if (info.contentLength in 1..40_000L) {
+                                null to null
+                            } else {
+                                val updatedHeaders = if (info.acceptsRanges) {
+                                    stream.headers + ("X-Internal-Accepts-Ranges" to "true")
+                                } else {
+                                    stream.headers
+                                }
+                                val finalStream = stream.copy(
+                                    sizeBytes = info.contentLength.takeIf { it > 0 } ?: stream.sizeBytes,
+                                    headers = updatedHeaders
+                                )
+                                finalStream to null
+                            }
                         }
-                    }.getOrDefault(stream)
-                } else stream
+                    } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+                        if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                            e.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK ||
+                            e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+                        ) {
+                            null to null
+                        } else {
+                            // Transient network/timeout error -> keep only if zero live streams survive
+                            null to stream
+                        }
+                    } catch (_: Exception) {
+                        null to stream
+                    }
+                } else {
+                    stream to null
+                }
             }
-        }.awaitAll().filterNotNull()
+        }.awaitAll()
+
+        val liveProbed = probeResults.mapNotNull { it.first }
+        val probedStreams = if (liveProbed.isNotEmpty()) {
+            liveProbed
+        } else {
+            probeResults.mapNotNull { it.second }
+        }
 
         if (probedStreams.isEmpty()) return@coroutineScope null
 
-        // Deduplicate same-height video variants: prefer direct MP4 with valid size over HLS at the same height
+        // Deduplicate same-height video variants and collapse null-height mirrors (identical size or filename)
         val videos = probedStreams.filter { it.type == MediaType.VIDEO }
         val collapsedVideos = videos
             .groupBy { it.height }
@@ -695,7 +920,7 @@ class HtmlMediaExtractor @Inject constructor(
                     )
                     listOfNotNull(best)
                 } else {
-                    if (videos.any { it.height != null }) emptyList() else group
+                    if (videos.any { it.height != null }) emptyList() else collapseNullHeightMirrors(group)
                 }
             }
             .sortedWith(
@@ -716,6 +941,63 @@ class HtmlMediaExtractor @Inject constructor(
             streams = finalStreams,
             extractor = name
         )
+    }
+
+    private fun collectJsonLdObjects(obj: JSONObject, depth: Int, out: MutableList<JSONObject>) {
+        if (depth > 5) return
+        out.add(obj)
+        if (depth == 5) return
+        val nestedKeys = listOf("@graph", "mainEntity", "subjectOf", "video", "hasPart", "itemListElement")
+        for (key in nestedKeys) {
+            val child = obj.opt(key) ?: continue
+            when (child) {
+                is JSONObject -> collectJsonLdObjects(child, depth + 1, out)
+                is JSONArray -> {
+                    for (i in 0 until child.length()) {
+                        child.optJSONObject(i)?.let { collectJsonLdObjects(it, depth + 1, out) }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun inferKvsResolution(url: String, labelText: String, fieldName: String): Int? {
+        UrlUtils.inferResolution(url, labelText)?.let { return it }
+        val lower = labelText.trim().lowercase()
+        when {
+            lower.contains("full hd") || lower.contains("fhd") -> return 1080
+            lower == "hd" || lower.contains(" hd") || lower.startsWith("hd ") -> return 720
+            lower == "sd" || lower == "hq" || lower.contains(" sd") || lower.startsWith("sd ") ||
+                lower.contains("standard") || lower.contains("normal") -> return 480
+            lower == "lq" || lower.contains("low") -> return 360
+        }
+        if (url.contains("/get_file/", ignoreCase = true) && fieldName == "video_url") {
+            return 480
+        }
+        return null
+    }
+
+    private fun collapseNullHeightMirrors(group: List<MediaStream>): List<MediaStream> {
+        if (group.size <= 1) return group
+        val kept = mutableListOf<MediaStream>()
+        val seenSizes = HashSet<Long>()
+        val seenFiles = HashSet<String>()
+        val ordered = group.sortedWith(
+            compareByDescending<MediaStream> { it.headers["X-Internal-Authoritative"] == "true" }
+                .thenByDescending { it.sizeBytes ?: 0L }
+        )
+        for (s in ordered) {
+            val sz = s.sizeBytes?.takeIf { it > 0L }
+            val fname = UrlUtils.fileNameFromUrl(s.url).lowercase()
+            val dupSize = sz != null && sz in seenSizes
+            val dupFile = fname != "download" && fname.contains('.') && fname in seenFiles
+            if (!dupSize && !dupFile) {
+                kept += s
+                if (sz != null) seenSizes += sz
+                if (fname != "download" && fname.contains('.')) seenFiles += fname
+            }
+        }
+        return kept
     }
 
     /**

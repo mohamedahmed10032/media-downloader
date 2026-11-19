@@ -194,32 +194,39 @@ class HeadlessWebExtractor @Inject constructor(
                     StreamType.DASH -> runCatching { dashExtractor.extract(cleanUrl, headers)?.streams }.getOrNull().orEmpty()
                     StreamType.PROGRESSIVE -> {
                         val info = runCatching { http.probe(cleanUrl, headers) }.getOrNull()
-                        val contentType = (info?.contentType ?: payload.mimeType.orEmpty()).lowercase()
-                        if (contentType.startsWith("text/html") || contentType.startsWith("application/json")) {
+                        if (info != null && info.code !in 200..299) {
                             emptyList()
                         } else {
-                            val isAudio = MediaSniffer.isAudioTrackUrl(cleanUrl, contentType)
-                            val type = if (isAudio) MediaType.AUDIO else MediaType.VIDEO
-                            val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, cleanUrl, contentType)
-                            val size = info?.contentLength?.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
-                            val height = payload.qualityHint ?: UrlUtils.inferResolution(cleanUrl)
-                            if (size != null && size in 1..40_000L) {
+                            val contentType = (info?.contentType ?: payload.mimeType.orEmpty()).lowercase()
+                            if (contentType.startsWith("text/html") ||
+                                contentType.startsWith("application/json") ||
+                                contentType.startsWith("image/")
+                            ) {
                                 emptyList()
                             } else {
-                                listOf(
-                                    MediaStream(
-                                        id = "hl-$idx",
-                                        url = info?.finalUrl?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl,
-                                        type = type,
-                                        container = container,
-                                        label = if (type == MediaType.AUDIO) "Original Audio (${container.uppercase()})"
-                                        else if (height != null) "${height}p" else "HD Video",
-                                        height = height,
-                                        sizeBytes = size,
-                                        isHls = false,
-                                        headers = headers
+                                val isAudio = MediaSniffer.isAudioTrackUrl(cleanUrl, contentType)
+                                val type = if (isAudio) MediaType.AUDIO else MediaType.VIDEO
+                                val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, cleanUrl, contentType)
+                                val size = info?.contentLength?.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
+                                val height = payload.qualityHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(cleanUrl)
+                                if (size != null && size in 1..40_000L) {
+                                    emptyList()
+                                } else {
+                                    listOf(
+                                        MediaStream(
+                                            id = "hl-$idx",
+                                            url = info?.finalUrl?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl,
+                                            type = type,
+                                            container = container,
+                                            label = if (type == MediaType.AUDIO) "Original Audio (${container.uppercase()})"
+                                            else if (height != null) "${height}p" else "HD Video",
+                                            height = height,
+                                            sizeBytes = size,
+                                            isHls = false,
+                                            headers = headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                        )
                                     )
-                                )
+                                }
                             }
                         }
                     }
@@ -266,12 +273,13 @@ class HeadlessWebExtractor @Inject constructor(
             }
 
         val audios = if (bestAudio != null) {
+            val cleanAudioHeaders = bestAudio.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
             listOf(
                 bestAudio.copy(
                     id = "hl-audio-fast",
                     container = "m4a",
                     label = "Fast",
-                    headers = bestAudio.headers + mapOf(
+                    headers = cleanAudioHeaders + mapOf(
                         "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
                         "X-Internal-Quick" to "true"
                     )
@@ -280,7 +288,7 @@ class HeadlessWebExtractor @Inject constructor(
                     id = "hl-audio-mp3",
                     container = "mp3",
                     label = "Classic MP3",
-                    headers = bestAudio.headers + mapOf(
+                    headers = cleanAudioHeaders + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )

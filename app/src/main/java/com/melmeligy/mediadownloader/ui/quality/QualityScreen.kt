@@ -199,13 +199,8 @@ private fun SnaptubeFormatSheetContent(
     val quickVideo = prepared.quickVideo
     val allStreams = remember(imageStreams, musicStreams, videoStreams) { imageStreams + musicStreams + videoStreams }
 
-    var selectedStream by remember(allStreams) {
-        val defaultPick = allStreams.firstOrNull { it.headers["X-Internal-Default"] == "true" }
-            ?: quickVideo.lastOrNull()
-            ?: quickImages.firstOrNull()
-            ?: quickMusic.lastOrNull()
-            ?: allStreams.firstOrNull()
-        mutableStateOf(defaultPick)
+    var selectedStream by remember(prepared) {
+        mutableStateOf(selectDefaultStream(prepared))
     }
 
     var showMoreFormats by rememberSaveable { mutableStateOf(false) }
@@ -750,75 +745,149 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
     var rawMusic = resolved.streams
         .filter { it.type == MediaType.AUDIO }
         .distinctBy { it.id }
+        .map { a ->
+            if (a.headers["X-Internal-Default"] == "true") {
+                a.copy(headers = a.headers - "X-Internal-Default")
+            } else a
+        }
 
     // If a non-YouTube extractor only returned video streams, synthesize Fast (M4A) and Classic MP3 options
-    // using on-device hardware audio track extraction so Music section is always available like Snaptube!
+    // strictly from valid audio-bearing sources (never null/zero-size broken progressive streams or mute adaptive video).
     if (rawMusic.isEmpty() && rawVideos.isNotEmpty()) {
-        // Choose the lightest muxed video stream (preferring progressive MP4 240p/360p) so audio extraction
-        // never wastes bandwidth downloading 1080p/4K video just to demux AAC audio.
-        val muxedCandidates = rawVideos.filter { it.headers["X-Internal-Companion-Audio"] == null }
-            .ifEmpty { rawVideos }
-        val sourceVideo = muxedCandidates
+        val companionCarrier = rawVideos.firstOrNull {
+            it.headers["X-Internal-Companion-Audio"]?.startsWith("http") == true
+        }
+        val validMuxedProgressive = rawVideos
+            .filter {
+                !it.isHls &&
+                    it.headers["X-Internal-Companion-Audio"] == null &&
+                    it.headers["X-Internal-Dash-VideoOnly"] != "true" &&
+                    (it.sizeBytes ?: 0L) > 0L
+            }
             .sortedWith(
-                compareBy<MediaStream> { it.isHls }
-                    .thenBy { it.height ?: Int.MAX_VALUE }
+                compareBy<MediaStream> { it.height ?: Int.MAX_VALUE }
+                    .thenBy { it.sizeBytes ?: Long.MAX_VALUE }
+            )
+            .firstOrNull()
+
+        val validMuxedHls = rawVideos
+            .filter {
+                it.isHls &&
+                    it.headers["X-Internal-Companion-Audio"] == null &&
+                    it.headers["X-Internal-Dash-VideoOnly"] != "true"
+            }
+            .sortedWith(
+                compareBy<MediaStream> { it.height ?: Int.MAX_VALUE }
                     .thenBy { it.sizeBytes?.takeIf { s -> s > 0L } ?: Long.MAX_VALUE }
             )
-            .first()
-        val vSize = sourceVideo.sizeBytes ?: 0L
-        val durationSeconds = sourceVideo.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-            ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
+            .firstOrNull()
 
-        val estM4aSize = if (durationSeconds != null && durationSeconds > 0L) {
-            (128_000L * durationSeconds) / 8L
-        } else if (vSize > 500_000L) {
-            (vSize * 14L) / 100L
-        } else null
+        val sourceVideo = validMuxedProgressive ?: validMuxedHls
 
-        val estMp3Size = if (durationSeconds != null && durationSeconds > 0L) {
-            (160_000L * durationSeconds) / 8L
-        } else if (vSize > 500_000L) {
-            (vSize * 18L) / 100L
-        } else null
+        if (sourceVideo != null) {
+            val vSize = sourceVideo.sizeBytes ?: 0L
+            val durationSeconds = sourceVideo.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
 
-        val baseHeaders = sourceVideo.headers + buildMap {
-            put("X-Internal-Extract-Audio", "true")
-            if (vSize > 0L) put("X-Internal-Video-Bytes", vSize.toString())
-            if (durationSeconds != null && durationSeconds > 0L) {
-                put("X-Internal-Duration-Seconds", durationSeconds.toString())
+            val estM4aSize = if (durationSeconds != null && durationSeconds > 0L) {
+                (128_000L * durationSeconds) / 8L
+            } else if (vSize > 500_000L) {
+                (vSize * 14L) / 100L
+            } else null
+
+            val estMp3Size = if (durationSeconds != null && durationSeconds > 0L) {
+                (160_000L * durationSeconds) / 8L
+            } else if (vSize > 500_000L) {
+                (vSize * 18L) / 100L
+            } else null
+
+            val baseHeaders = sourceVideo.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) } + buildMap {
+                put("X-Internal-Extract-Audio", "true")
+                if (vSize > 0L) put("X-Internal-Video-Bytes", vSize.toString())
+                if (durationSeconds != null && durationSeconds > 0L) {
+                    put("X-Internal-Duration-Seconds", durationSeconds.toString())
+                }
             }
-        }
-        rawMusic = listOf(
-            MediaStream(
-                id = "${sourceVideo.id}-synth-m4a",
-                url = sourceVideo.url,
-                type = MediaType.AUDIO,
-                container = "m4a",
-                label = "Fast",
-                bitrateKbps = 128,
-                sizeBytes = estM4aSize,
-                isHls = sourceVideo.isHls,
-                headers = baseHeaders + mapOf(
-                    "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
-                    "X-Internal-Quick" to "true"
-                )
-            ),
-            MediaStream(
-                id = "${sourceVideo.id}-synth-mp3",
-                url = sourceVideo.url,
-                type = MediaType.AUDIO,
-                container = "mp3",
-                label = "Classic MP3",
-                bitrateKbps = 160,
-                sizeBytes = estMp3Size,
-                isHls = sourceVideo.isHls,
-                headers = baseHeaders + mapOf(
-                    "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
-                    "X-Internal-Quick" to "true",
-                    "X-Internal-Default" to "true"
+            rawMusic = listOf(
+                MediaStream(
+                    id = "${sourceVideo.id}-synth-m4a",
+                    url = sourceVideo.url,
+                    type = MediaType.AUDIO,
+                    container = "m4a",
+                    label = "Fast",
+                    bitrateKbps = 128,
+                    sizeBytes = estM4aSize,
+                    isHls = sourceVideo.isHls,
+                    headers = baseHeaders + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                MediaStream(
+                    id = "${sourceVideo.id}-synth-mp3",
+                    url = sourceVideo.url,
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    bitrateKbps = 160,
+                    sizeBytes = estMp3Size,
+                    isHls = sourceVideo.isHls,
+                    headers = baseHeaders + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
                 )
             )
-        )
+        } else if (companionCarrier != null) {
+            // Adaptive video-only stream with companion audio: route synthesized audio directly to companion URL
+            val companionUrl = companionCarrier.headers["X-Internal-Companion-Audio"]!!
+            val audioIsHls = companionCarrier.headers["X-Internal-Companion-Audio-Hls"] == "true" ||
+                companionUrl.contains(".m3u8", ignoreCase = true)
+            val durationSeconds = companionCarrier.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
+            val audioBytes = companionCarrier.headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
+            val estM4aSize = audioBytes ?: if (durationSeconds != null && durationSeconds > 0L) (128_000L * durationSeconds) / 8L else null
+            val estMp3Size = audioBytes ?: if (durationSeconds != null && durationSeconds > 0L) (160_000L * durationSeconds) / 8L else null
+
+            val cleanBase = companionCarrier.headers.filterKeys {
+                !it.equals("X-Internal-Default", ignoreCase = true) &&
+                    !it.equals("X-Internal-Companion-Audio", ignoreCase = true) &&
+                    !it.equals("X-Internal-Companion-Audio-Hls", ignoreCase = true) &&
+                    !it.equals("X-Internal-Dash-VideoOnly", ignoreCase = true) &&
+                    !it.equals("X-Internal-Video-Bytes", ignoreCase = true) &&
+                    !it.equals("X-Internal-Extract-Audio", ignoreCase = true)
+            }
+            rawMusic = listOf(
+                MediaStream(
+                    id = "${companionCarrier.id}-companion-m4a",
+                    url = companionUrl,
+                    type = MediaType.AUDIO,
+                    container = "m4a",
+                    label = "Fast",
+                    bitrateKbps = 128,
+                    sizeBytes = estM4aSize,
+                    isHls = audioIsHls,
+                    headers = cleanBase + mapOf(
+                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                ),
+                MediaStream(
+                    id = "${companionCarrier.id}-companion-mp3",
+                    url = companionUrl,
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    bitrateKbps = 160,
+                    sizeBytes = estMp3Size,
+                    isHls = audioIsHls,
+                    headers = cleanBase + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            )
+        }
     }
 
     val quickMusic = rawMusic.filter { it.headers["X-Internal-Quick"] == "true" }
@@ -846,4 +915,23 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
         quickMusic = quickMusic,
         quickVideo = quickVideo
     )
+}
+
+/**
+ * Selects the default stream for the format sheet:
+ * - Always defaults to VIDEO on video pages (even when explicit/synthesized audio exists).
+ * - Selects IMAGE on pure image pages and AUDIO on pure audio pages.
+ */
+internal fun selectDefaultStream(prepared: PreparedSnaptubeStreams): MediaStream? {
+    val videoDefault = prepared.video.firstOrNull { it.headers["X-Internal-Default"] == "true" }
+        ?: prepared.quickVideo.lastOrNull()
+        ?: prepared.video.lastOrNull()
+    if (videoDefault != null) return videoDefault
+
+    val imageDefault = prepared.quickImages.firstOrNull() ?: prepared.images.firstOrNull()
+    if (imageDefault != null) return imageDefault
+
+    return prepared.music.firstOrNull { it.headers["X-Internal-Default"] == "true" }
+        ?: prepared.quickMusic.lastOrNull()
+        ?: prepared.music.lastOrNull()
 }

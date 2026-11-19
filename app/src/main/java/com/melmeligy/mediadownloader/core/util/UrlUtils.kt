@@ -12,6 +12,7 @@ object UrlUtils {
     val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "ogg", "opus", "wav", "flac")
     val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic")
 
+    private val HEX_CHARS = "0123456789ABCDEF".toCharArray()
     private val urlLikeRegex = Regex("^[\\w.-]+\\.[a-zA-Z]{2,}(/.*)?$")
     private val embeddedHttpUrlRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
 
@@ -24,31 +25,72 @@ object UrlUtils {
     private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z]{2}\\.)?pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
 
-    /** Cleans social tracking parameters and normalizes paths (e.g. Instagram Reels, Posts, Pinterest). */
+    /** Percent-encodes raw non-ASCII / unsafe characters in a URL without double-encoding existing `%XX` escapes. */
+    fun encodeNonAsciiUrl(rawUrl: String): String {
+        val sb = StringBuilder(rawUrl.length)
+        var i = 0
+        while (i < rawUrl.length) {
+            val ch = rawUrl[i]
+            if (ch == '%' && i + 2 < rawUrl.length &&
+                rawUrl[i + 1].isHexDigit() && rawUrl[i + 2].isHexDigit()
+            ) {
+                sb.append(rawUrl, i, i + 3)
+                i += 3
+                continue
+            }
+            val code = ch.code
+            if (code in 0x21..0x7E && ch != '<' && ch != '>' && ch != '"' &&
+                ch != '{' && ch != '}' && ch != '|' && ch != '\\' && ch != '^' && ch != '`'
+            ) {
+                sb.append(ch)
+                i++
+            } else {
+                val cp = Character.codePointAt(rawUrl, i)
+                val charCount = Character.charCount(cp)
+                val bytes = String(Character.toChars(cp)).toByteArray(Charsets.UTF_8)
+                for (b in bytes) {
+                    sb.append('%')
+                    sb.append(HEX_CHARS[(b.toInt() ushr 4) and 0x0F])
+                    sb.append(HEX_CHARS[b.toInt() and 0x0F])
+                }
+                i += charCount
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun Char.isHexDigit(): Boolean =
+        this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    /** Cleans social tracking parameters and normalizes paths while preserving fragments and encoding Unicode slugs. */
     fun cleanSocialUrl(url: String): String {
-        val trimmed = url.trim()
-        val igReelMatch = instagramReelPattern.find(trimmed)
+        val trimmed = encodeNonAsciiUrl(url.trim())
+        val hashIdx = trimmed.indexOf('#')
+        val withoutFrag = if (hashIdx >= 0) trimmed.substring(0, hashIdx) else trimmed
+        val frag = if (hashIdx >= 0) trimmed.substring(hashIdx) else ""
+
+        val igReelMatch = instagramReelPattern.find(withoutFrag)
         if (igReelMatch != null) {
             val shortcode = igReelMatch.groupValues[1]
-            return "https://www.instagram.com/reel/$shortcode/"
+            return "https://www.instagram.com/reel/$shortcode/$frag"
         }
-        val igPostMatch = instagramPostPattern.find(trimmed)
+        val igPostMatch = instagramPostPattern.find(withoutFrag)
         if (igPostMatch != null) {
             val shortcode = igPostMatch.groupValues[1]
-            return "https://www.instagram.com/p/$shortcode/"
+            return "https://www.instagram.com/p/$shortcode/$frag"
         }
-        val igTvMatch = instagramTvPattern.find(trimmed)
+        val igTvMatch = instagramTvPattern.find(withoutFrag)
         if (igTvMatch != null) {
             val shortcode = igTvMatch.groupValues[1]
-            return "https://www.instagram.com/tv/$shortcode/"
+            return "https://www.instagram.com/tv/$shortcode/$frag"
         }
-        val pinMatch = pinterestPinPattern.find(trimmed)
+        val pinMatch = pinterestPinPattern.find(withoutFrag)
         if (pinMatch != null) {
             val pinId = pinMatch.groupValues[1]
-            return "https://www.pinterest.com/pin/$pinId/"
+            return "https://www.pinterest.com/pin/$pinId/$frag"
         }
         return runCatching {
-            val uri = URI(trimmed)
+            val uri = URI(withoutFrag)
             val query = uri.rawQuery ?: return@runCatching trimmed
             val cleanedQuery = query.split('&').filterNot { param ->
                 val key = param.substringBefore('=').lowercase()
@@ -56,7 +98,8 @@ object UrlUtils {
             }.joinToString("&")
             val newQuery = if (cleanedQuery.isBlank()) "" else "?$cleanedQuery"
             val portPart = if (uri.port != -1) ":${uri.port}" else ""
-            "${uri.scheme}://${uri.host}$portPart${uri.rawPath}$newQuery"
+            val hostPart = uri.rawAuthority ?: "${uri.host}$portPart"
+            "${uri.scheme}://$hostPart${uri.rawPath}$newQuery$frag"
         }.getOrDefault(trimmed)
     }
 
@@ -86,9 +129,10 @@ object UrlUtils {
             !candidate.contains(' ') && isProbablyUrl(candidate) -> "https://$candidate"
             else -> return null
         }
+        val encoded = encodeNonAsciiUrl(withScheme)
         val validated = runCatching {
-            val uri = URI(withScheme)
-            if (uri.host.isNullOrBlank()) null else withScheme
+            val uri = URI(encoded)
+            if (uri.host.isNullOrBlank()) null else encoded
         }.getOrNull() ?: return null
 
         return cleanSocialUrl(validated)
@@ -101,14 +145,14 @@ object UrlUtils {
         return Constants.GOOGLE_SEARCH_PREFIX + encoded
     }
 
-    /** Extracts a lowercase file extension from a URL path, ignoring query/fragment. */
+    /** Extracts a lowercase file extension from a URL path, ignoring trailing slash and query/fragment. */
     fun fileExtension(url: String): String? {
-        val path = runCatching { URI(url).path ?: "" }.getOrElse {
+        val path = runCatching { URI(encodeNonAsciiUrl(url)).path ?: "" }.getOrElse {
             url.substringBefore('?').substringBefore('#')
-        }
+        }.trimEnd('/')
         val name = path.substringAfterLast('/')
         val dot = name.lastIndexOf('.')
-        if (dot < 0 || dot == name.lastIndex) return null
+        if (dot < 0 || dot == name.length - 1) return null
         return name.substring(dot + 1).lowercase()
     }
 
@@ -121,16 +165,16 @@ object UrlUtils {
 
     /** Best-effort readable file name derived from the URL path. */
     fun fileNameFromUrl(url: String): String {
-        val path = runCatching { URI(url).path ?: "" }.getOrDefault("")
+        val path = runCatching { URI(encodeNonAsciiUrl(url)).path ?: "" }.getOrDefault("").trimEnd('/')
         val raw = path.substringAfterLast('/').ifBlank { "download" }
         return runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
     }
 
-    fun host(url: String): String? = runCatching { URI(url).host }.getOrNull()
+    fun host(url: String): String? = runCatching { URI(encodeNonAsciiUrl(url)).host }.getOrNull()
 
     /** Resolves a possibly-relative [ref] against [base] into an absolute URL. */
     fun resolveUrl(base: String, ref: String): String = runCatching {
-        URI(base).resolve(ref.trim()).toString()
+        URI(encodeNonAsciiUrl(base)).resolve(encodeNonAsciiUrl(ref.trim())).toString()
     }.getOrDefault(ref)
 
     private val explicitPHeightRegex = Regex(

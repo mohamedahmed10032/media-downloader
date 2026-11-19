@@ -107,6 +107,7 @@ class HlsSegmentDownloader @Inject constructor(
         val completedMediaSegments = AtomicInteger(0)
         val completedMediaBytes = AtomicLong(0L)
         val completedMediaDurationMs = AtomicLong(0L)
+        val smoothedEstimate = AtomicLong(hintedTotal.coerceAtLeast(0L))
         val tracker = SpeedTracker(0L)
 
         fun computeEstimatedTotal(currentWritten: Long): Long {
@@ -136,7 +137,22 @@ class HlsSegmentDownloader @Inject constructor(
             } else {
                 rawEstimate
             }
-            return maxOf(blended, currentWritten)
+
+            // Smooth VBR oscillations using EMA and clamp >= currentWritten so progress never exceeds 100%
+            val prev = smoothedEstimate.get()
+            val next = if (prev <= 0L) {
+                blended
+            } else {
+                ((prev * 7L) + (blended * 3L)) / 10L
+            }
+            val remainingSegs = (totalMediaSegments - doneSegs).coerceAtLeast(0)
+            val floorWithRemaining = if (remainingSegs > 0 && doneSegs > 0) {
+                maxOf(currentWritten + 1L, next)
+            } else {
+                maxOf(currentWritten, next)
+            }
+            smoothedEstimate.set(floorWithRemaining)
+            return floorWithRemaining
         }
 
         val progressJob = launch {
@@ -150,7 +166,10 @@ class HlsSegmentDownloader @Inject constructor(
             }
         }
 
-        val semaphore = Semaphore(CONCURRENT_SEGMENTS)
+        val cdnLimit = Regex("""(?:[?&/,;])limit=(\d+)(?:[&#/,;]|$)""", RegexOption.IGNORE_CASE)
+            .find(mediaUrl)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 }
+        val maxConcurrent = if (cdnLimit != null) minOf(CONCURRENT_SEGMENTS, cdnLimit) else CONCURRENT_SEGMENTS
+        val semaphore = Semaphore(maxConcurrent)
         val tasks = segments.mapIndexed { index, segment ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
@@ -170,6 +189,7 @@ class HlsSegmentDownloader @Inject constructor(
                 }
             }
         }
+        var succeeded = false
         try {
             FileOutputStream(dest, true).use { output ->
                 val copyBuffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
@@ -187,10 +207,14 @@ class HlsSegmentDownloader @Inject constructor(
                 }
                 output.flush()
             }
+            succeeded = true
         } finally {
             progressJob.cancel()
             tasks.forEach { it.cancel() }
             runCatching { partsDir.deleteRecursively() }
+            if (!succeeded) {
+                runCatching { dest.delete() }
+            }
         }
 
         val finalBytes = dest.length()
@@ -254,6 +278,17 @@ class HlsSegmentDownloader @Inject constructor(
                 }
                 runCatching { partFile.delete() }
                 throw e
+            } catch (e: MediaException) {
+                if (attemptBytes > 0) {
+                    written.addAndGet(-attemptBytes)
+                }
+                runCatching { partFile.delete() }
+                if (e.error == AppError.GEO_BLOCKED || e.error == AppError.NO_MEDIA_FOUND || e.error == AppError.EXPIRED_LINK) {
+                    throw e
+                }
+                attempt++
+                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                delay(400L * attempt)
             } catch (e: Exception) {
                 if (attemptBytes > 0) {
                     written.addAndGet(-attemptBytes)

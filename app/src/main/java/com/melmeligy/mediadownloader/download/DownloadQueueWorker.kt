@@ -12,9 +12,9 @@ import kotlinx.coroutines.CancellationException
 /**
  * WorkManager-driven foreground worker that drains the download queue via [DownloadManager].
  *
- * Running inside WorkManager gives us guaranteed execution, network constraints and
- * survival across process death; calling [setForeground] promotes it to a foreground
- * service with the ongoing progress notification.
+ * Protected against Android 14/15 `ForegroundServiceStartNotAllowedException`: if background
+ * foreground-service promotion is blocked by OS restrictions, the worker degrades gracefully
+ * and continues draining the queue instead of failing or entering an infinite retry loop.
  */
 @HiltWorker
 class DownloadQueueWorker @AssistedInject constructor(
@@ -26,13 +26,24 @@ class DownloadQueueWorker @AssistedInject constructor(
     override suspend fun getForegroundInfo(): ForegroundInfo = manager.currentForegroundInfo()
 
     override suspend fun doWork(): Result = try {
-        setForeground(getForegroundInfo())
-        manager.runQueue { info -> runCatching { setForeground(info) } }
+        trySetForeground(getForegroundInfo())
+        manager.runQueue { info -> trySetForeground(info) }
         Result.success()
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
         // Transient infrastructure failure: let WorkManager retry with backoff.
         Result.retry()
+    }
+
+    private suspend fun trySetForeground(info: ForegroundInfo) {
+        try {
+            setForeground(info)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            // Android 14/15 ForegroundServiceStartNotAllowedException or SecurityException:
+            // continue downloading in WorkManager without failing or retrying indefinitely.
+        }
     }
 }

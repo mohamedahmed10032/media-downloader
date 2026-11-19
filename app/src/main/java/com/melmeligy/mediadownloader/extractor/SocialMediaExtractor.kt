@@ -1048,6 +1048,40 @@ class SocialMediaExtractor @Inject constructor(
         )
     }
 
+    private fun probeSocialStream(candidate: MediaStream, headers: Map<String, String>): MediaStream? {
+        val mergedHeaders = if (headers.isEmpty()) candidate.headers else candidate.headers + headers
+        val info = try {
+            http.probe(candidate.url, mergedHeaders)
+        } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+            if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                e.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK ||
+                e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+            ) {
+                return null
+            }
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+        if (info.code !in 200..299) return null
+        val ct = info.contentType?.lowercase().orEmpty()
+        if (ct.startsWith("text/html") ||
+            ct.startsWith("application/xhtml") ||
+            ct.startsWith("application/json") ||
+            (candidate.type != MediaType.IMAGE && ct.startsWith("image/"))
+        ) {
+            return null
+        }
+        val extra = LinkedHashMap<String, String>(candidate.headers).apply {
+            if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
+        }
+        return candidate.copy(
+            url = info.finalUrl.ifBlank { candidate.url },
+            sizeBytes = info.contentLength.takeIf { it > 0L } ?: candidate.sizeBytes,
+            headers = extra
+        )
+    }
+
     private fun firstChildText(parent: Element, tag: String): String? {
         val children = parent.childNodes
         for (i in 0 until children.length) {

@@ -9,6 +9,7 @@ import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.download.MediaActions
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -20,10 +21,13 @@ class LibraryViewModel @Inject constructor(
 ) : ViewModel() {
 
     val videos = downloadRepository.observeCompletedByType(MediaType.VIDEO)
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
     val audio = downloadRepository.observeCompletedByType(MediaType.AUDIO)
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
     val images = downloadRepository.observeCompletedByType(MediaType.IMAGE)
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
     fun shareIntent(item: DownloadItem): Intent? = mediaActions.shareIntent(item)

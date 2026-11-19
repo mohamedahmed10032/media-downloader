@@ -19,6 +19,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.melmeligy.mediadownloader.R
 
@@ -48,13 +49,39 @@ fun NavHostController.navigateToTopLevelTab(tab: Tab) {
     }
 }
 
-/** Shared scaffold (top app bar + bottom navigation) for the primary tab screens. */
+/** Persistent bottom navigation bar hoisted outside [AppNavHost] animated transitions. */
+@Composable
+fun PersistentBottomBar(
+    navController: NavHostController,
+    currentTab: Tab
+) {
+    NavigationBar {
+        Tab.entries.forEach { tab ->
+            NavigationBarItem(
+                selected = tab == currentTab,
+                onClick = {
+                    if (tab != currentTab) {
+                        navController.navigateToTopLevelTab(tab)
+                    }
+                },
+                icon = { Icon(tab.icon, contentDescription = null) },
+                label = { Text(stringResource(tab.labelRes)) }
+            )
+        }
+    }
+}
+
+/**
+ * Shared top-bar scaffold for the primary tab screens. The bottom navigation bar is hoisted
+ * into [AppNavHost] so switching tabs never fades or remounts the navigation bar.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScaffold(
     navController: NavHostController,
     current: Tab,
     title: String,
+    outerPadding: PaddingValues = PaddingValues(0.dp),
     actions: @Composable RowScope.() -> Unit = {},
     content: @Composable (PaddingValues) -> Unit
 ) {
@@ -63,23 +90,12 @@ fun MainScaffold(
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text(title) }, actions = actions) },
-        bottomBar = {
-            NavigationBar {
-                Tab.entries.forEach { tab ->
-                    NavigationBarItem(
-                        selected = tab == current,
-                        onClick = {
-                            if (tab != current) {
-                                navController.navigateToTopLevelTab(tab)
-                            }
-                        },
-                        icon = { Icon(tab.icon, contentDescription = null) },
-                        label = { Text(stringResource(tab.labelRes)) }
-                    )
-                }
-            }
-        }
-    ) { padding -> content(padding) }
+        topBar = { TopAppBar(title = { Text(title) }, actions = actions) }
+    ) { innerPadding ->
+        val merged = PaddingValues(
+            top = innerPadding.calculateTopPadding(),
+            bottom = maxOf(innerPadding.calculateBottomPadding(), outerPadding.calculateBottomPadding())
+        )
+        content(merged)
+    }
 }
-

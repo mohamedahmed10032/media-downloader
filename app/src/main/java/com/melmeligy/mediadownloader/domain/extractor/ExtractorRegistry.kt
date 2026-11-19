@@ -66,8 +66,13 @@ class ExtractorRegistry @Inject constructor(
             throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
         }
 
+        if (isConfirmedHtml(url)) {
+            throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
+        }
+
         val fallback = extractors.filterNot { it.canHandle(url) }.sortedByDescending { it.priority }
         for (extractor in fallback) {
+            if (isConfirmedHtml(url)) break
             try {
                 val result = extractor.extract(url)
                 if (result != null && result.streams.isNotEmpty()) {
@@ -88,5 +93,33 @@ class ExtractorRegistry @Inject constructor(
         // GENERIC / NO_MEDIA_FOUND are the least useful; prefer anything more specific.
         val weak = setOf(AppError.GENERIC, AppError.NO_MEDIA_FOUND)
         return if (current.error in weak && candidate.error !in weak) candidate else current
+    }
+
+    companion object {
+        private const val MAX_CONFIRMED_HTML = 256
+
+        private val confirmedHtmlUrls: MutableMap<String, Boolean> =
+            java.util.Collections.synchronizedMap(
+                object : LinkedHashMap<String, Boolean>(64, 0.75f, true) {
+                    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean =
+                        size > MAX_CONFIRMED_HTML
+                }
+            )
+
+        fun markConfirmedHtml(url: String) {
+            val key = url.trim()
+            if (key.isNotEmpty()) {
+                confirmedHtmlUrls[key] = true
+            }
+        }
+
+        fun isConfirmedHtml(url: String): Boolean {
+            val key = url.trim()
+            return key.isNotEmpty() && confirmedHtmlUrls.containsKey(key)
+        }
+
+        fun clearConfirmedHtml() {
+            confirmedHtmlUrls.clear()
+        }
     }
 }

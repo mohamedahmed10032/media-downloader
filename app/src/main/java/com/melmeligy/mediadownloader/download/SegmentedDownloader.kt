@@ -4,6 +4,7 @@ import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.Constants
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.extractor.ExtractorHttp
+import com.melmeligy.mediadownloader.extractor.HeadInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -13,6 +14,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.RandomAccessFile
@@ -23,19 +25,21 @@ import javax.inject.Singleton
 /**
  * Multi-threaded, resumable HTTP downloader.
  *
- * When the server supports ranged requests and the size is known, the file is split into
- * N segments downloaded concurrently and written at their byte offsets via [RandomAccessFile].
- * Per-segment progress is persisted to a sidecar `.idx` file so an interrupted download
- * resumes exactly where it stopped. Otherwise it falls back to a single, resumable stream.
- *
- * Cancellation is cooperative: cancelling the calling coroutine stops writing and leaves the
- * partial file + sidecar in place for a later resume.
+ * Enforces CDN `limit=N` concurrency caps, attaches `X-Internal-Download: true` on all
+ * single-stream and segmented requests, resets corrupt/oversized `.idx` sidecars cleanly,
+ * fails loudly on truncated segment streams instead of publishing sparse zero-filled files,
+ * and surfaces permanent HTTP 403/404/410 errors immediately without wasteful retries.
  */
 @Singleton
 class SegmentedDownloader @Inject constructor(
     private val client: OkHttpClient,
     private val http: ExtractorHttp
 ) {
+
+    suspend fun probe(url: String, headers: Map<String, String>): HeadInfo? =
+        withContext(Dispatchers.IO) {
+            runCatching { http.probe(url, headers) }.getOrNull()
+        }
 
     suspend fun download(
         url: String,
@@ -55,19 +59,39 @@ class SegmentedDownloader @Inject constructor(
         }
         var ranged = acceptsRanges || isGoogleVideo
         if (total <= 0 || !ranged) {
-            runCatching { http.probe(url, headers) }.getOrNull()?.let { info ->
-                if (total <= 0) total = info.contentLength
+            val info = withContext(Dispatchers.IO) {
+                try {
+                    http.probe(url, headers)
+                } catch (e: MediaException) {
+                    if (isPermanentError(e.error)) throw e
+                    null
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            if (info != null) {
+                if (info.code !in 200..299 && info.code != 405 && info.code != 416) {
+                    throw http.mapHttpError(info.code)
+                }
+                if (total <= 0 && info.contentLength > 0) total = info.contentLength
                 ranged = ranged || info.acceptsRanges
             }
         }
 
-        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && segmentCount > 1
+        val cdnLimit = extractCdnConnectionLimit(url)
+        val effectiveSegments = if (cdnLimit != null) {
+            minOf(segmentCount, cdnLimit)
+        } else {
+            segmentCount
+        }
+
+        val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && effectiveSegments > 1
         if (!canSegment) {
             singleStream(url, headers, dest, total, ranged, isGoogleVideo, onProgress)
             return@coroutineScope
         }
 
-        val n = segmentCount.coerceIn(2, 8)
+        val n = effectiveSegments.coerceIn(2, 8)
         val bounds = computeBounds(total, n)
         val idxFile = File(dest.parentFile, dest.name + ".idx")
         val positions = loadOrInit(idxFile, dest, bounds, total)
@@ -109,7 +133,12 @@ class SegmentedDownloader @Inject constructor(
             return@coroutineScope
         }
 
-        // All segments complete: clean up sidecar and emit final progress.
+        // Verify all segments completed cleanly with zero truncated holes
+        val allComplete = positions.indices.all { i -> positions[i] == bounds[i].second + 1L }
+        if (!allComplete || !dest.exists() || dest.length() != total) {
+            throw MediaException(AppError.GENERIC, "Incomplete segmented download")
+        }
+
         idxFile.delete()
         onProgress(DownloadProgress(total, total, 0, 0))
     }
@@ -144,6 +173,7 @@ class SegmentedDownloader @Inject constructor(
                     .build()
 
                 var bytesInPass = 0L
+                val expectedPassBytes = chunkEnd - startByte + 1L
                 client.newCall(request).execute().use { response ->
                     if (response.code == 200 && (startByte > 0L || chunkEnd < total - 1L)) {
                         throw RangeNotSupportedException()
@@ -169,14 +199,22 @@ class SegmentedDownloader @Inject constructor(
                         }
                     }
                 }
-                if (bytesInPass <= 0L && positions[index] <= endInclusive) {
-                    throw MediaException(AppError.GENERIC, "Segment stalled at ${positions[index]}")
+                if (bytesInPass < expectedPassBytes) {
+                    throw MediaException(
+                        AppError.GENERIC,
+                        "Truncated segment stream ($bytesInPass/$expectedPassBytes bytes)"
+                    )
                 }
                 attempt = 0
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: RangeNotSupportedException) {
                 throw e
+            } catch (e: MediaException) {
+                if (isPermanentError(e.error)) throw e
+                attempt++
+                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                delay(400L * attempt)
             } catch (e: Exception) {
                 attempt++
                 if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
@@ -214,6 +252,7 @@ class SegmentedDownloader @Inject constructor(
                 }
 
                 val builder = http.buildRequest(url, headers)
+                    .header("X-Internal-Download", "true")
                 if (isGoogleVideo && total > 0L) {
                     val chunkEnd = minOf(total - 1L, existing + GOOGLE_VIDEO_CHUNK_BYTES - 1L)
                     builder.header("Range", "bytes=$existing-$chunkEnd")
@@ -223,6 +262,8 @@ class SegmentedDownloader @Inject constructor(
                 val request = builder.build()
 
                 try {
+                    var bytesInPass = 0L
+                    var responseContentLength = -1L
                     client.newCall(request).execute().use { response ->
                         if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
                         val isPartial = response.code == 206
@@ -232,6 +273,7 @@ class SegmentedDownloader @Inject constructor(
                         } else if (append) {
                             downloaded.set(existing)
                         }
+                        responseContentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
                         val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty body")
                         java.io.FileOutputStream(dest, append).use { output ->
                             val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
@@ -241,17 +283,28 @@ class SegmentedDownloader @Inject constructor(
                                     val read = input.read(buffer)
                                     if (read == -1) break
                                     output.write(buffer, 0, read)
+                                    bytesInPass += read
                                     downloaded.addAndGet(read.toLong())
                                 }
                             }
                             output.flush()
                         }
                     }
-                    // If we drained the entire file (or unknown-length stream), break; otherwise loop next chunk
+                    if (responseContentLength > 0L && bytesInPass < responseContentLength) {
+                        throw MediaException(AppError.GENERIC, "Truncated single-stream transfer")
+                    }
                     if (total <= 0L || downloaded.get() >= total) break
+                    if (bytesInPass <= 0L) {
+                        throw MediaException(AppError.GENERIC, "Single-stream transfer stalled")
+                    }
                     attempt = 0
                 } catch (ce: kotlinx.coroutines.CancellationException) {
                     throw ce
+                } catch (e: MediaException) {
+                    if (isPermanentError(e.error)) throw e
+                    attempt++
+                    if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
+                    delay(500L * attempt)
                 } catch (e: Exception) {
                     attempt++
                     if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
@@ -261,14 +314,16 @@ class SegmentedDownloader @Inject constructor(
         } finally {
             progressJob.cancel()
         }
-        val finalTotal = if (total > 0) total else downloaded.get()
-        onProgress(DownloadProgress(downloaded.get(), finalTotal, 0, 0))
+        val actualFinal = dest.length()
+        val finalTotal = if (total > 0L) maxOf(total, actualFinal) else actualFinal
+        onProgress(DownloadProgress(actualFinal, finalTotal, 0, 0))
     }
 
     private suspend fun emit(done: Long, total: Long, tracker: SpeedTracker, onProgress: ProgressCallback) {
         val speed = tracker.sample(done)
-        val eta = if (speed > 0 && total > 0) ((total - done) / speed).coerceAtLeast(0) else -1
-        onProgress(DownloadProgress(done, total, speed, eta))
+        val effectiveTotal = if (total > 0L) maxOf(total, done) else total
+        val eta = if (speed > 0 && effectiveTotal > 0) ((effectiveTotal - done) / speed).coerceAtLeast(0) else -1
+        onProgress(DownloadProgress(done, effectiveTotal, speed, eta))
     }
 
     private fun computeBounds(total: Long, n: Int): List<Pair<Long, Long>> {
@@ -282,15 +337,20 @@ class SegmentedDownloader @Inject constructor(
 
     private fun loadOrInit(idxFile: File, dest: File, bounds: List<Pair<Long, Long>>, total: Long): LongArray {
         val fresh = LongArray(bounds.size) { bounds[it].first }
-        if (idxFile.exists() && dest.exists() && dest.length() == total) {
+        if (idxFile.exists() && idxFile.length() in 1..MAX_IDX_BYTES && dest.exists() && dest.length() == total) {
             val saved = runCatching {
                 idxFile.readLines().filter { it.isNotBlank() }.map { it.trim().toLong() }
             }.getOrNull()
-            if (saved != null && saved.size == bounds.size) {
-                return LongArray(bounds.size) { saved[it].coerceIn(bounds[it].first, bounds[it].second + 1) }
+            val valid = saved != null &&
+                saved.size == bounds.size &&
+                saved.indices.all { i -> saved[i] in bounds[i].first..(bounds[i].second + 1L) }
+            if (valid && saved != null) {
+                return LongArray(bounds.size) { saved[it] }
             }
         }
-        // Fresh start: (re)allocate the destination to the full size.
+        // Corrupt, oversized, or fresh start: wipe sidecar and (re)allocate clean destination
+        runCatching { idxFile.delete() }
+        runCatching { dest.delete() }
         RandomAccessFile(dest, "rw").use { it.setLength(total) }
         return fresh
     }
@@ -299,7 +359,17 @@ class SegmentedDownloader @Inject constructor(
         runCatching { idxFile.writeText(positions.joinToString("\n")) }
     }
 
+    private fun isPermanentError(error: AppError): Boolean =
+        error == AppError.GEO_BLOCKED || error == AppError.NO_MEDIA_FOUND || error == AppError.EXPIRED_LINK
+
+    internal fun extractCdnConnectionLimit(url: String): Int? {
+        val m = CDN_LIMIT_REGEX.find(url) ?: return null
+        return m.groupValues[1].toIntOrNull()?.takeIf { it > 0 }
+    }
+
     private companion object {
         const val GOOGLE_VIDEO_CHUNK_BYTES = 9_437_184L // 9 MB per ranged request to prevent YouTube CDN throttling
+        const val MAX_IDX_BYTES = 16_384L
+        val CDN_LIMIT_REGEX = Regex("""(?:[?&/,;])limit=(\d+)(?:[&#/,;]|$)""", RegexOption.IGNORE_CASE)
     }
 }

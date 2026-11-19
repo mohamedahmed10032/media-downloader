@@ -7,6 +7,7 @@ import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.download.DownloadManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -18,6 +19,7 @@ class DownloadsViewModel @Inject constructor(
 ) : ViewModel() {
 
     val downloads = downloadRepository.observeActive()
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
     fun pause(id: Long) = viewModelScope.launch { downloadManager.pause(id) }

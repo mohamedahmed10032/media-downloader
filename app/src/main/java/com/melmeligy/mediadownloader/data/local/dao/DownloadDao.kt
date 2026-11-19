@@ -14,6 +14,9 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<DownloadEntity>>
 
+    @Query("SELECT * FROM downloads ORDER BY createdAt DESC LIMIT :limit")
+    fun observeRecent(limit: Int = 6): Flow<List<DownloadEntity>>
+
     @Query("SELECT * FROM downloads WHERE type = :type ORDER BY createdAt DESC")
     fun observeByType(type: MediaType): Flow<List<DownloadEntity>>
 

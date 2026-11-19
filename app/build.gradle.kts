@@ -30,8 +30,8 @@ android {
         applicationId = "com.melmeligy.mediadownloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.1.0"
+        versionCode = 12
+        versionName = "2.2.0"
 
         testInstrumentationRunner = "com.melmeligy.mediadownloader.HiltTestRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -167,6 +167,9 @@ dependencies {
     implementation(libs.okhttp.logging)
     implementation(libs.retrofit)
     implementation(libs.jsoup)
+
+    // Pure-Java LAME MP3 encoder for genuine MPEG Layer-3 audio extraction
+    implementation("de.sciss:jump3r:1.0.5")
 
     // Image loading
     implementation(libs.coil.compose)

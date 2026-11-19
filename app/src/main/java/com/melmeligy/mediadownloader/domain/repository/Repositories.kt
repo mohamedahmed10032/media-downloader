@@ -20,6 +20,7 @@ interface MediaRepository {
 /** Persists and exposes download tasks; the single source of truth for the queue. */
 interface DownloadRepository {
     fun observeAll(): Flow<List<DownloadItem>>
+    fun observeRecent(limit: Int = 6): Flow<List<DownloadItem>>
     fun observeByType(type: MediaType): Flow<List<DownloadItem>>
     fun observeActive(): Flow<List<DownloadItem>>
     fun observeCompletedByType(type: MediaType): Flow<List<DownloadItem>>
