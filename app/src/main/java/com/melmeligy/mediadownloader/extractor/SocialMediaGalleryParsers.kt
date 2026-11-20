@@ -557,21 +557,84 @@ internal object SocialMediaGalleryParsers {
     }
 
     // =========================================================================
-    // 2. PINTEREST (Single Pin, Carousel Pin, Idea/Story Pin, Originals Upgrade)
+    // 2. PINTEREST (Single Pin, Carousel Pin, Idea/Story Pin, Relay SSR & PinResource)
     // =========================================================================
+
+    private val pimgSizeSegmentRegex = Regex("https://i\\.pinimg\\.com/(?:\\d+x\\d*|\\d+x)/")
+    private val pimgSignatureUrlRegex = Regex(
+        "https?://i\\.pinimg\\.com/[^?#]*/([0-9a-fA-F]{32})(?:\\.[a-zA-Z0-9]+)?(?:[?#]|$)"
+    )
+    private val hex32Regex = Regex("^[0-9a-fA-F]{32}$")
+    private val numericIdRegex = Regex("^\\d{6,24}$")
 
     fun upgradePinterestUrlToOriginal(url: String): String {
         val cleaned = unescape(url).trim()
         if (!cleaned.contains("pinimg.com", ignoreCase = true)) return cleaned
-        return cleaned.replace(
-            Regex("https://i\\.pinimg\\.com/(?:\\d+x\\d*|\\d+x)/"),
-            "https://i.pinimg.com/originals/"
-        )
+        return cleaned.replace(pimgSizeSegmentRegex, "https://i.pinimg.com/originals/")
+    }
+
+    fun pinterest736UrlFromOriginal(url: String): String {
+        val cleaned = unescape(url).trim()
+        if (!cleaned.contains("i.pinimg.com/originals/", ignoreCase = true)) return cleaned
+        return cleaned.replace("i.pinimg.com/originals/", "i.pinimg.com/736x/")
     }
 
     fun pinterestThumbUrl(originalUrl: String): String {
         if (!originalUrl.contains("i.pinimg.com/originals/", ignoreCase = true)) return originalUrl
         return originalUrl.replace("i.pinimg.com/originals/", "i.pinimg.com/474x/")
+    }
+
+    /** Extracts the canonical 32-char hex Pinterest image signature from an `i.pinimg.com` URL. */
+    fun pinterestSignatureFromUrl(url: String): String? =
+        pimgSignatureUrlRegex.find(url.trim())?.groupValues?.getOrNull(1)?.lowercase()
+
+    /** Builds the canonical `originals` CDN URL from a 32-char hex Pinterest `imageSignature`. */
+    fun pinterestOriginalUrlFromSignature(signature: String, ext: String = "jpg"): String? {
+        val s = signature.trim().lowercase()
+        if (!hex32Regex.matches(s)) return null
+        val cleanExt = ext.lowercase().trimStart('.').ifBlank { "jpg" }
+        return "https://i.pinimg.com/originals/${s.substring(0, 2)}/${s.substring(2, 4)}/${s.substring(4, 6)}/$s.$cleanExt"
+    }
+
+    /**
+     * Picks the richer parsed Pinterest result so a 1-image cover/og:image NEVER shadows a
+     * multi-slide Carousel or Idea/Story Pin discovered in another script block or API call.
+     */
+    internal fun preferRicherPinterestPost(current: ParsedPost?, candidate: ParsedPost?): ParsedPost? {
+        if (candidate == null) return current
+        if (current == null) return candidate
+        val curMulti = current.slides.size > 1
+        val candMulti = candidate.slides.size > 1
+        return when {
+            candMulti && !curMulti -> candidate
+            curMulti && !candMulti -> current
+            candMulti && curMulti -> if (candidate.slides.size > current.slides.size) candidate else current
+            candidate.videoStreams.isNotEmpty() && current.videoStreams.isEmpty() -> candidate
+            current.videoStreams.isNotEmpty() && candidate.videoStreams.isEmpty() -> current
+            candidate.slides.size > current.slides.size -> candidate
+            else -> current
+        }
+    }
+
+    internal fun hasStructuredPinterestJson(html: String): Boolean {
+        if (html.isBlank()) return false
+        return html.contains("data-relay-response", ignoreCase = true) ||
+            html.contains("__PWS_DATA__", ignoreCase = true) ||
+            html.contains("__PWS_INITIAL_PROPS__", ignoreCase = true) ||
+            html.contains("v3GetPinQuery", ignoreCase = true)
+    }
+
+    internal fun pinterestHtmlHintsMultiSlide(html: String): Boolean {
+        if (html.isBlank()) return false
+        return html.contains("carouselData", ignoreCase = true) ||
+            html.contains("carousel_data", ignoreCase = true) ||
+            html.contains("carouselSlots", ignoreCase = true) ||
+            html.contains("carousel_slots", ignoreCase = true) ||
+            html.contains("storyPinData", ignoreCase = true) ||
+            html.contains("story_pin_data", ignoreCase = true) ||
+            html.contains("\"isCarousel\":true", ignoreCase = true) ||
+            html.contains("story-pin", ignoreCase = true) ||
+            html.contains("carousel-slide", ignoreCase = true)
     }
 
     fun parsePinterestHtml(
@@ -580,6 +643,20 @@ internal object SocialMediaGalleryParsers {
         headers: Map<String, String>
     ): ParsedPost? {
         if (html.isBlank()) return null
+
+        val trimmed = html.trimStart()
+        var best: ParsedPost? = null
+
+        // Fast path: raw JSON string passed directly (PinResource/get, v3/pins, or extracted Relay JSON)
+        if (trimmed.startsWith("{")) {
+            val root = runCatching { JSONObject(trimmed) }.getOrNull()
+            if (root != null) {
+                best = parsePinterestJsonRoot(root, pinId, null, headers, best)
+                if (best != null) return best
+            }
+            return null
+        }
+
         val doc = Jsoup.parse(html)
         val rawTitle = doc.title()
             .replace("| Pinterest", "", ignoreCase = true)
@@ -587,31 +664,39 @@ internal object SocialMediaGalleryParsers {
             .trim()
             .ifBlank { null }
 
-        // Tier 1: Structured JSON scripts (__PWS_DATA__, data-relay-response, application/json)
-        val scripts = doc.select("script[id=__PWS_DATA__], script[data-relay-response=true], script[type=application/json]")
+        // Tier 1: Exhaustively inspect ALL Relay SSR, __PWS_DATA__, __PWS_INITIAL_PROPS__, and JSON scripts.
+        // Never early-return a 1-image cover before inspecting every remaining script block on the page.
+        val scripts = doc.select(
+            "script[data-relay-response=true], script[id=__PWS_DATA__], script[id=__PWS_INITIAL_PROPS__], script[type=application/json]"
+        )
         for (script in scripts) {
             val jsonText = script.data().ifBlank { script.html() }.trim()
             if (!jsonText.startsWith("{")) continue
             val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: continue
-            val pinObj = findPinterestPinObject(root, pinId)
-            if (pinObj != null) {
-                parsePinterestPinObject(pinObj, pinId, rawTitle, headers)?.let { return it }
-            }
+            best = parsePinterestJsonRoot(root, pinId, rawTitle, headers, best)
         }
 
-        // Tier 2: PinResource JSON (if caller passed JSON directly)
-        if (html.trimStart().startsWith("{")) {
-            val root = runCatching { JSONObject(html) }.getOrNull()
-            if (root != null) {
-                val pinObj = root.optJSONObject("resource_response")?.optJSONObject("data")
-                    ?: findPinterestPinObject(root, pinId)
-                if (pinObj != null) {
-                    parsePinterestPinObject(pinObj, pinId, rawTitle, headers)?.let { return it }
+        // Also scan inline JS assignments (e.g. window.__PWS_INITIAL_PROPS__ = {...}) if not yet multi-slide
+        if (best == null || (best.slides.size <= 1 && best.videoStreams.isEmpty())) {
+            val inlineMarkers = listOf("__PWS_INITIAL_PROPS__", "__PWS_DATA__")
+            for (marker in inlineMarkers) {
+                val idx = html.indexOf(marker)
+                if (idx >= 0) {
+                    val brace = html.indexOf('{', idx + marker.length)
+                    if (brace >= 0 && brace - idx < 40) {
+                        extractBalancedJson(html, brace)?.let { block ->
+                            runCatching { JSONObject(block) }.getOrNull()?.let { root ->
+                                best = parsePinterestJsonRoot(root, pinId, rawTitle, headers, best)
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Tier 3: JSON-LD fallback
+        if (best != null) return best
+
+        // Tier 2: JSON-LD fallback (only used when ALL Relay/PWS JSON blocks yielded nothing)
         val ldScripts = doc.select("script[type=application/ld+json]")
         for (script in ldScripts) {
             val txt = script.data().ifBlank { script.html() }.trim()
@@ -620,27 +705,30 @@ internal object SocialMediaGalleryParsers {
             val title = obj.optString("headline").ifBlank { obj.optString("name") }.ifBlank { rawTitle }
             if (img != null) {
                 val orig = upgradePinterestUrlToOriginal(img)
-                return ParsedPost(
-                    title = title ?: "Pinterest Pin",
-                    thumbnailUrl = img,
-                    postId = pinId,
-                    slides = listOf(
-                        GallerySlide(
-                            id = "pin-slide-0",
-                            index = 0,
-                            mediaUrl = orig,
-                            thumbnailUrl = img,
-                            type = MediaType.IMAGE,
-                            container = inferImageExt(orig),
-                            headers = headers,
-                            postId = pinId
+                best = preferRicherPinterestPost(
+                    best,
+                    ParsedPost(
+                        title = title ?: "Pinterest Pin",
+                        thumbnailUrl = img,
+                        postId = pinId,
+                        slides = listOf(
+                            GallerySlide(
+                                id = "pin-slide-0",
+                                index = 0,
+                                mediaUrl = orig,
+                                thumbnailUrl = img,
+                                type = MediaType.IMAGE,
+                                container = inferImageExt(orig),
+                                headers = headers,
+                                postId = pinId
+                            )
                         )
                     )
                 )
             }
         }
 
-        // Tier 4: Video MP4 check (single video pin)
+        // Tier 3: Video MP4 check (single video pin)
         val videoUrls = Regex("https://[a-zA-Z0-9.-]*pinimg\\.com/[a-zA-Z0-9_/-]+\\.mp4")
             .findAll(html).map { it.value }.distinct().toList()
         if (videoUrls.isNotEmpty()) {
@@ -656,16 +744,21 @@ internal object SocialMediaGalleryParsers {
                 )
             }
             val thumb = doc.select("meta[property=og:image]").attr("content").takeIf { it.startsWith("http") }
-            return ParsedPost(
-                title = rawTitle ?: "Pinterest Pin",
-                thumbnailUrl = thumb,
-                postId = pinId,
-                slides = emptyList(),
-                videoStreams = videos
+            best = preferRicherPinterestPost(
+                best,
+                ParsedPost(
+                    title = rawTitle ?: "Pinterest Pin",
+                    thumbnailUrl = thumb,
+                    postId = pinId,
+                    slides = emptyList(),
+                    videoStreams = videos
+                )
             )
         }
 
-        // Tier 5: OG image / originals regex fallback
+        if (best != null) return best
+
+        // Tier 4: OG image / twitter:image fallback (single cover image only)
         val ogImg = doc.select("meta[property=og:image], meta[name=twitter:image]")
             .firstOrNull()?.attr("content")?.takeIf { it.startsWith("http") }
         val origMatches = Regex("https://i\\.pinimg\\.com/originals/[a-zA-Z0-9_/-]+\\.(?:jpg|jpeg|png|webp|gif)")
@@ -674,7 +767,7 @@ internal object SocialMediaGalleryParsers {
         if (bestUrl != null) {
             return ParsedPost(
                 title = rawTitle ?: "Pinterest Pin",
-                thumbnailUrl = ogImg ?: bestUrl,
+                thumbnailUrl = ogImg ?: pinterestThumbUrl(bestUrl),
                 postId = pinId,
                 slides = listOf(
                     GallerySlide(
@@ -694,47 +787,69 @@ internal object SocialMediaGalleryParsers {
         return null
     }
 
+    private fun parsePinterestJsonRoot(
+        root: JSONObject,
+        pinId: String?,
+        fallbackTitle: String?,
+        headers: Map<String, String>,
+        initialBest: ParsedPost?
+    ): ParsedPost? {
+        var best = initialBest
+        val candidates = mutableListOf<JSONObject>()
+
+        // Direct known roots (PinResource/get, v3/pins, Relay v3GetPinQuery)
+        root.optJSONObject("resource_response")?.optJSONObject("data")?.let { candidates += it }
+        root.optJSONObject("response")?.optJSONObject("data")?.optJSONObject("v3GetPinQuery")?.optJSONObject("data")
+            ?.let { candidates += it }
+        root.optJSONObject("data")?.optJSONObject("v3GetPinQuery")?.optJSONObject("data")
+            ?.let { candidates += it }
+        if (root.has("data") && root.optJSONObject("data")?.let { looksLikePinterestPinObject(it) } == true) {
+            candidates += root.getJSONObject("data")
+        }
+
+        // Recursive scan collecting ALL matching pin objects (strictly skipping related/recommended trees)
+        collectPinterestPinObjects(root, pinId, candidates, depth = 0)
+
+        for (candidate in candidates) {
+            if (!pinId.isNullOrBlank()) {
+                val objId = extractPinterestPinId(candidate)
+                if (objId != null && objId != pinId) continue
+            }
+            val parsed = parsePinterestPinObject(candidate, pinId, fallbackTitle, headers)
+            best = preferRicherPinterestPost(best, parsed)
+        }
+        return best
+    }
+
     internal fun parsePinterestPinObject(
         pin: JSONObject,
         fallbackPinId: String?,
         fallbackTitle: String?,
         headers: Map<String, String>
     ): ParsedPost? {
-        val id = pin.optString("id").ifBlank { pin.optString("entityId") }.ifBlank { fallbackPinId }
-        val title = pin.optString("title").ifBlank { pin.optString("grid_title") }
+        val id = extractPinterestPinId(pin) ?: fallbackPinId
+        val title = pin.optString("title")
+            .ifBlank { pin.optString("gridTitle") }
+            .ifBlank { pin.optString("grid_title") }
+            .ifBlank { pin.optString("seoTitle") }
             .ifBlank { pin.optString("description").lineSequence().firstOrNull().orEmpty().take(80) }
             .ifBlank { fallbackTitle ?: "Pinterest Pin" }
 
-        // A. Multi-page Carousel Pin (`carousel_data.carousel_slots`)
-        val carouselSlots = pin.optJSONObject("carousel_data")?.optJSONArray("carousel_slots")
+        // A. Multi-page Carousel Pin (`carouselData.carouselSlots` OR `carousel_data.carousel_slots`)
+        val carouselObj = pin.optJSONObject("carouselData") ?: pin.optJSONObject("carousel_data")
+        val carouselSlots = carouselObj?.optJSONArray("carouselSlots")
+            ?: carouselObj?.optJSONArray("carousel_slots")
+            ?: carouselObj?.optJSONArray("slots")
         if (carouselSlots != null && carouselSlots.length() > 0) {
             val slides = mutableListOf<GallerySlide>()
+            val seenKeys = HashSet<String>()
             for (i in 0 until carouselSlots.length()) {
                 val slot = carouselSlots.optJSONObject(i) ?: continue
-                val imagesObj = slot.optJSONObject("images")
-                val origObj = imagesObj?.optJSONObject("orig")
-                    ?: imagesObj?.optJSONObject("originals")
-                    ?: imagesObj?.optJSONObject("736x")
-                    ?: imagesObj?.optJSONObject("564x")
-                val rawUrl = origObj?.optString("url")?.takeIf { it.startsWith("http") }
-                    ?: slot.optString("image_url").takeIf { it.startsWith("http") }
-                    ?: continue
-                val mediaUrl = upgradePinterestUrlToOriginal(rawUrl)
-                val thumbUrl = imagesObj?.optJSONObject("474x")?.optString("url")?.takeIf { it.startsWith("http") }
-                    ?: imagesObj?.optJSONObject("736x")?.optString("url")?.takeIf { it.startsWith("http") }
-                    ?: rawUrl
-                slides += GallerySlide(
-                    id = "pin-carousel-${slides.size}",
-                    index = slides.size,
-                    mediaUrl = mediaUrl,
-                    thumbnailUrl = thumbUrl,
-                    type = MediaType.IMAGE,
-                    container = inferImageExt(mediaUrl),
-                    width = origObj?.optInt("width", 0)?.takeIf { it > 0 },
-                    height = origObj?.optInt("height", 0)?.takeIf { it > 0 },
-                    headers = headers,
-                    postId = id
-                )
+                val slide = parsePinterestCarouselSlot(slot, slides.size, id, headers) ?: continue
+                val dedupeKey = pinterestSlideDedupeKey(slide)
+                if (seenKeys.add(dedupeKey)) {
+                    slides += slide.copy(id = "pin-carousel-${slides.size}", index = slides.size)
+                }
             }
             if (slides.isNotEmpty()) {
                 return ParsedPost(
@@ -746,14 +861,19 @@ internal object SocialMediaGalleryParsers {
             }
         }
 
-        // B. Idea Pin / Story Pin (`story_pin_data.pages`)
-        val storyPages = pin.optJSONObject("story_pin_data")?.optJSONArray("pages")
+        // B. Idea Pin / Story Pin (`storyPinData.pages` OR `story_pin_data.pages`)
+        val storyObj = pin.optJSONObject("storyPinData") ?: pin.optJSONObject("story_pin_data")
+        val storyPages = storyObj?.optJSONArray("pages")
         if (storyPages != null && storyPages.length() > 0) {
             val slides = mutableListOf<GallerySlide>()
+            val seenKeys = HashSet<String>()
             for (i in 0 until storyPages.length()) {
                 val page = storyPages.optJSONObject(i) ?: continue
-                val pageSlide = parsePinterestStoryPage(page, slides.size, id, headers)
-                if (pageSlide != null) slides += pageSlide
+                val pageSlide = parsePinterestStoryPage(page, slides.size, id, headers) ?: continue
+                val dedupeKey = pinterestSlideDedupeKey(pageSlide)
+                if (seenKeys.add(dedupeKey)) {
+                    slides += pageSlide.copy(id = "pin-story-${slides.size}", index = slides.size)
+                }
             }
             if (slides.isNotEmpty()) {
                 if (slides.size == 1 && slides.first().type == MediaType.VIDEO) {
@@ -785,12 +905,12 @@ internal object SocialMediaGalleryParsers {
             }
         }
 
-        // C. Single Video Pin (`videos.video_list`)
-        val videoList = pin.optJSONObject("videos")?.optJSONObject("video_list")
+        // C. Single Video Pin (`videos.videoList` OR `videos.video_list`)
+        val videoList = extractPinterestVideoList(pin)
         if (videoList != null) {
             val mp4 = extractBestPinterestMp4(videoList)
             if (mp4 != null) {
-                val thumb = extractPinterestImageFromPin(pin)?.second
+                val thumb = extractPinterestImageSpec(pin)?.second
                 return ParsedPost(
                     title = title,
                     thumbnailUrl = thumb,
@@ -811,9 +931,9 @@ internal object SocialMediaGalleryParsers {
             }
         }
 
-        // D. Single Image Pin (`images.orig` / `imageSpec_orig`)
-        val imgPair = extractPinterestImageFromPin(pin) ?: return null
-        val (origUrl, thumbUrl, dims) = imgPair
+        // D. Single Image Pin (`images.orig` / `imageSpec_orig` / `imageSpecOrig` / `imageSignature`)
+        val imgSpec = extractPinterestImageSpec(pin) ?: return null
+        val (origUrl, thumbUrl, dims) = imgSpec
         val upgraded = upgradePinterestUrlToOriginal(origUrl)
         return ParsedPost(
             title = title,
@@ -836,35 +956,85 @@ internal object SocialMediaGalleryParsers {
         )
     }
 
+    private fun parsePinterestCarouselSlot(
+        slot: JSONObject,
+        index: Int,
+        pinId: String?,
+        headers: Map<String, String>
+    ): GallerySlide? {
+        val details = slot.optJSONObject("details")
+
+        // Check video on slot or slot.details first
+        val videoList = extractPinterestVideoList(slot) ?: details?.let { extractPinterestVideoList(it) }
+        if (videoList != null) {
+            val mp4 = extractBestPinterestMp4(videoList)
+            if (mp4 != null) {
+                val thumb = extractPinterestImageSpec(slot)?.second
+                    ?: details?.let { extractPinterestImageSpec(it)?.second }
+                    ?: mp4.first
+                return GallerySlide(
+                    id = "pin-carousel-$index",
+                    index = index,
+                    mediaUrl = mp4.first,
+                    thumbnailUrl = thumb,
+                    type = MediaType.VIDEO,
+                    container = "mp4",
+                    height = mp4.second,
+                    headers = headers,
+                    postId = pinId
+                )
+            }
+        }
+
+        val imgSpec = extractPinterestImageSpec(slot)
+            ?: details?.let { extractPinterestImageSpec(it) }
+            ?: return null
+        val (rawUrl, thumbUrl, dims) = imgSpec
+        val upgraded = upgradePinterestUrlToOriginal(rawUrl)
+        return GallerySlide(
+            id = "pin-carousel-$index",
+            index = index,
+            mediaUrl = upgraded,
+            thumbnailUrl = thumbUrl,
+            type = MediaType.IMAGE,
+            container = inferImageExt(upgraded),
+            width = dims?.first,
+            height = dims?.second,
+            headers = headers,
+            postId = pinId
+        )
+    }
+
     private fun parsePinterestStoryPage(
         page: JSONObject,
         index: Int,
         pinId: String?,
         headers: Map<String, String>
     ): GallerySlide? {
-        val pageImgObj = page.optJSONObject("image")?.optJSONObject("images")
-            ?: page.optJSONObject("images")
-        val pageThumb = pageImgObj?.optJSONObject("474x")?.optString("url")?.takeIf { it.startsWith("http") }
-            ?: pageImgObj?.optJSONObject("originals")?.optString("url")?.takeIf { it.startsWith("http") }
-            ?: pageImgObj?.optJSONObject("orig")?.optString("url")?.takeIf { it.startsWith("http") }
+        val pageImgSpec = extractPinterestImageSpec(page)
+            ?: page.optJSONObject("image")?.let { extractPinterestImageSpec(it) }
 
         val blocks = page.optJSONArray("blocks")
         if (blocks != null) {
             for (bIdx in 0 until blocks.length()) {
                 val block = blocks.optJSONObject(bIdx) ?: continue
-                val videoList = block.optJSONObject("video")?.optJSONObject("video_list")
+                // 1. Video block (`block.video.videoList` / `video_list` / `videoData`)
+                val videoList = extractPinterestVideoList(block)
+                    ?: block.optJSONObject("video")?.let { extractPinterestVideoList(it) }
+                    ?: block.optJSONObject("videoData")?.let { extractPinterestVideoList(it) }
+                    ?: block.optJSONObject("video_data")?.let { extractPinterestVideoList(it) }
                 if (videoList != null) {
                     val mp4 = extractBestPinterestMp4(videoList)
                     if (mp4 != null) {
-                        val bThumb = block.optJSONObject("image")?.optJSONObject("images")
-                            ?.let { it.optJSONObject("474x") ?: it.optJSONObject("originals") ?: it.optJSONObject("orig") }
-                            ?.optString("url")?.takeIf { it.startsWith("http") }
-                            ?: pageThumb
+                        val bThumb = block.optJSONObject("image")?.let { extractPinterestImageSpec(it)?.second }
+                            ?: extractPinterestImageSpec(block)?.second
+                            ?: pageImgSpec?.second
+                            ?: mp4.first
                         return GallerySlide(
                             id = "pin-story-$index",
                             index = index,
                             mediaUrl = mp4.first,
-                            thumbnailUrl = bThumb ?: mp4.first,
+                            thumbnailUrl = bThumb,
                             type = MediaType.VIDEO,
                             container = "mp4",
                             height = mp4.second,
@@ -873,53 +1043,56 @@ internal object SocialMediaGalleryParsers {
                         )
                     }
                 }
-                val bImgs = block.optJSONObject("image")?.optJSONObject("images")
-                if (bImgs != null) {
-                    val orig = bImgs.optJSONObject("originals")
-                        ?: bImgs.optJSONObject("orig")
-                        ?: bImgs.optJSONObject("736x")
-                    val rawUrl = orig?.optString("url")?.takeIf { it.startsWith("http") }
-                    if (rawUrl != null) {
-                        val upgraded = upgradePinterestUrlToOriginal(rawUrl)
-                        val thumb = bImgs.optJSONObject("474x")?.optString("url")?.takeIf { it.startsWith("http") }
-                            ?: rawUrl
-                        return GallerySlide(
-                            id = "pin-story-$index",
-                            index = index,
-                            mediaUrl = upgraded,
-                            thumbnailUrl = thumb,
-                            type = MediaType.IMAGE,
-                            container = inferImageExt(upgraded),
-                            width = orig.optInt("width", 0).takeIf { it > 0 },
-                            height = orig.optInt("height", 0).takeIf { it > 0 },
-                            headers = headers,
-                            postId = pinId
-                        )
-                    }
+
+                // 2. Image block (`block.image`, `block.images`, `block.imageSpec_orig`, `block.imageSignature`)
+                val blockImgSpec = block.optJSONObject("image")?.let { extractPinterestImageSpec(it) }
+                    ?: extractPinterestImageSpec(block)
+                if (blockImgSpec != null) {
+                    val (rawUrl, thumbUrl, dims) = blockImgSpec
+                    val upgraded = upgradePinterestUrlToOriginal(rawUrl)
+                    return GallerySlide(
+                        id = "pin-story-$index",
+                        index = index,
+                        mediaUrl = upgraded,
+                        thumbnailUrl = thumbUrl,
+                        type = MediaType.IMAGE,
+                        container = inferImageExt(upgraded),
+                        width = dims?.first,
+                        height = dims?.second,
+                        headers = headers,
+                        postId = pinId
+                    )
                 }
             }
         }
 
-        if (pageImgObj != null) {
-            val orig = pageImgObj.optJSONObject("originals")
-                ?: pageImgObj.optJSONObject("orig")
-                ?: pageImgObj.optJSONObject("736x")
-            val rawUrl = orig?.optString("url")?.takeIf { it.startsWith("http") } ?: return null
+        if (pageImgSpec != null) {
+            val (rawUrl, thumbUrl, dims) = pageImgSpec
             val upgraded = upgradePinterestUrlToOriginal(rawUrl)
             return GallerySlide(
                 id = "pin-story-$index",
                 index = index,
                 mediaUrl = upgraded,
-                thumbnailUrl = pageThumb ?: rawUrl,
+                thumbnailUrl = thumbUrl,
                 type = MediaType.IMAGE,
                 container = inferImageExt(upgraded),
-                width = orig.optInt("width", 0).takeIf { it > 0 },
-                height = orig.optInt("height", 0).takeIf { it > 0 },
+                width = dims?.first,
+                height = dims?.second,
                 headers = headers,
                 postId = pinId
             )
         }
         return null
+    }
+
+    private fun extractPinterestVideoList(obj: JSONObject): JSONObject? {
+        val videos = obj.optJSONObject("videos")
+        return videos?.optJSONObject("videoList")
+            ?: videos?.optJSONObject("video_list")
+            ?: obj.optJSONObject("videoList")
+            ?: obj.optJSONObject("video_list")
+            ?: obj.optJSONObject("video")?.optJSONObject("videoList")
+            ?: obj.optJSONObject("video")?.optJSONObject("video_list")
     }
 
     private fun extractBestPinterestMp4(videoList: JSONObject): Pair<String, Int?>? {
@@ -940,68 +1113,225 @@ internal object SocialMediaGalleryParsers {
         return bestUrl?.let { it to bestHeight.takeIf { h -> h > 0 } }
     }
 
-    private fun extractPinterestImageFromPin(pin: JSONObject): Triple<String, String, Pair<Int?, Int?>?>? {
-        val images = pin.optJSONObject("images")
-        val orig = images?.optJSONObject("orig")
+    /**
+     * Extracts `(bestImageUrl, previewThumbUrl, (width, height))` from any Pinterest pin,
+     * carousel slot, story page, or image block object, supporting both `camelCase` Relay
+     * schemas, `snake_case` PWS/PinResource schemas, and `imageSignature`-only payloads.
+     */
+    private fun extractPinterestImageSpec(obj: JSONObject): Triple<String, String, Pair<Int?, Int?>?>? {
+        val images = obj.optJSONObject("images")
+        val specObj = images?.optJSONObject("orig")
             ?: images?.optJSONObject("originals")
-            ?: pin.optJSONObject("imageSpec_orig")
+            ?: obj.optJSONObject("imageSpec_orig")
+            ?: obj.optJSONObject("imageSpecOrig")
+            ?: obj.optJSONObject("imageSpec_originals")
+            ?: obj.optJSONObject("imageSpecOriginals")
+            ?: images?.optJSONObject("1200x")
             ?: images?.optJSONObject("736x")
+            ?: obj.optJSONObject("imageSpec_736x")
+            ?: obj.optJSONObject("imageSpec736x")
             ?: images?.optJSONObject("564x")
-        val origUrl = orig?.optString("url")?.takeIf { it.startsWith("http") } ?: return null
-        val thumb = images?.optJSONObject("474x")?.optString("url")?.takeIf { it.startsWith("http") }
-            ?: images?.optJSONObject("736x")?.optString("url")?.takeIf { it.startsWith("http") }
-            ?: origUrl
-        val w = orig.optInt("width", 0).takeIf { it > 0 }
-        val h = orig.optInt("height", 0).takeIf { it > 0 }
-        return Triple(origUrl, thumb, w to h)
+            ?: obj.optJSONObject("imageSpec_564x")
+            ?: images?.optJSONObject("474x")
+            ?: obj.optJSONObject("imageSpec_474x")
+            ?: images?.optJSONObject("236x")
+
+        val directUrl = specObj?.optString("url")?.takeIf { it.startsWith("http") }
+            ?: obj.optString("imageUrl").takeIf { it.startsWith("http") }
+            ?: obj.optString("image_url").takeIf { it.startsWith("http") }
+            ?: obj.optString("url").takeIf { it.startsWith("http") && it.contains("pinimg.com", ignoreCase = true) }
+
+        if (directUrl != null) {
+            val thumb = images?.optJSONObject("474x")?.optString("url")?.takeIf { it.startsWith("http") }
+                ?: obj.optJSONObject("imageSpec_474x")?.optString("url")?.takeIf { it.startsWith("http") }
+                ?: images?.optJSONObject("736x")?.optString("url")?.takeIf { it.startsWith("http") }
+                ?: obj.optJSONObject("imageSpec_736x")?.optString("url")?.takeIf { it.startsWith("http") }
+                ?: directUrl
+            val w = specObj?.optInt("width", 0)?.takeIf { it > 0 }
+            val h = specObj?.optInt("height", 0)?.takeIf { it > 0 }
+            return Triple(directUrl, thumb, w to h)
+        }
+
+        // Fallback: construct canonical URL from 32-char hex `imageSignature` / `image_signature`
+        val sig = obj.optString("imageSignature").ifBlank { obj.optString("image_signature") }
+        val sigOrig = pinterestOriginalUrlFromSignature(sig)
+        if (sigOrig != null) {
+            val sigThumb = pinterest736UrlFromOriginal(sigOrig)
+            return Triple(sigOrig, sigThumb, null)
+        }
+
+        return null
     }
 
-    private fun findPinterestPinObject(obj: JSONObject, targetPinId: String?, depth: Int = 0): JSONObject? {
-        if (depth > 7) return null
-        val id = obj.optString("id").ifBlank { obj.optString("entityId") }
-        val looksLikePin = obj.has("carousel_data") ||
-            obj.has("story_pin_data") ||
-            obj.has("imageSpec_orig") ||
-            (obj.has("images") && (obj.has("grid_title") || obj.has("pinner") || obj.has("domain") || obj.has("videos") || id.isNotBlank()))
+    private fun pinterestSlideDedupeKey(slide: GallerySlide): String {
+        if (slide.type == MediaType.IMAGE) {
+            pinterestSignatureFromUrl(slide.mediaUrl)?.let { return "img:$it" }
+        }
+        return "${slide.type}:${slide.mediaUrl.substringBefore('?')}"
+    }
 
-        if (looksLikePin) {
-            if (targetPinId.isNullOrBlank() || id == targetPinId) {
-                return obj
+    private fun extractPinterestPinId(obj: JSONObject): String? {
+        val rawCandidates = listOf(
+            obj.optString("entityId"),
+            obj.optString("entity_id"),
+            obj.optString("pinId"),
+            obj.optString("pin_id"),
+            obj.optString("id")
+        )
+        for (raw in rawCandidates) {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) continue
+            if (numericIdRegex.matches(trimmed)) return trimmed
+            // Decode Base64 Relay global ID (e.g., "UGluOjY4NzQ5OTc0MzE0NDc2Njg2MQ==" -> "Pin:687499743144766861")
+            val decoded = runCatching {
+                val padded = trimmed.let { p ->
+                    val rem = p.length % 4
+                    if (rem == 0) p else p + "=".repeat(4 - rem)
+                }
+                String(Base64.getDecoder().decode(padded), Charsets.UTF_8)
+            }.getOrNull()
+            if (decoded != null) {
+                val afterColon = decoded.substringAfterLast(':').trim()
+                if (numericIdRegex.matches(afterColon)) return afterColon
+            }
+        }
+        return null
+    }
+
+    private fun looksLikePinterestPinObject(obj: JSONObject): Boolean {
+        if (obj.has("carouselData") || obj.has("carousel_data") ||
+            obj.has("storyPinData") || obj.has("story_pin_data") ||
+            obj.has("imageSpec_orig") || obj.has("imageSpecOrig")
+        ) {
+            return true
+        }
+        val hasId = extractPinterestPinId(obj) != null
+        val hasMedia = obj.has("images") || obj.has("videos") || obj.has("imageSignature") || obj.has("image_signature")
+        val hasPinMeta = obj.has("gridTitle") || obj.has("grid_title") ||
+            obj.has("pinner") || obj.has("domain") || obj.has("videos") || hasId
+        return hasMedia && hasPinMeta
+    }
+
+    private fun isSkippedPinterestFeedKey(key: String): Boolean {
+        val lower = key.lowercase()
+        return lower.contains("related") ||
+            lower.contains("recommend") ||
+            lower.contains("moreideas") ||
+            lower.contains("more_ideas") ||
+            lower.contains("moretoexplore") ||
+            lower.contains("more_to_explore") ||
+            lower.contains("visualsearch") ||
+            lower.contains("visual_search") ||
+            lower == "feed" ||
+            lower == "relatedpins" ||
+            lower == "related_pins"
+    }
+
+    private fun collectPinterestPinObjects(
+        obj: JSONObject,
+        targetPinId: String?,
+        out: MutableList<JSONObject>,
+        depth: Int
+    ) {
+        if (depth > 14 || out.size >= 40) return
+
+        // Direct Redux pin lookup map (`pins[targetPinId]`)
+        if (!targetPinId.isNullOrBlank()) {
+            obj.optJSONObject("pins")?.optJSONObject(targetPinId)?.let { pinned ->
+                if (out.none { it === pinned }) out += pinned
             }
         }
 
-        // Check `pins` map keyed by pinId (common in __PWS_DATA__.props.initialReduxState.pins)
-        if (!targetPinId.isNullOrBlank()) {
-            obj.optJSONObject("pins")?.optJSONObject(targetPinId)?.let { return it }
+        if (looksLikePinterestPinObject(obj)) {
+            val objId = extractPinterestPinId(obj)
+            if (targetPinId.isNullOrBlank() || objId == null || objId == targetPinId) {
+                if (out.none { it === obj }) out += obj
+            }
         }
 
-        var fallbackMatch: JSONObject? = null
         val keys = obj.keys()
         while (keys.hasNext()) {
             val k = keys.next()
-            // Skip "related" / "closeupRelated" feeds so we don't accidentally grab a related pin
-            if (k.contains("related", ignoreCase = true) || k.contains("recommend", ignoreCase = true)) continue
+            if (isSkippedPinterestFeedKey(k)) continue
             val v = obj.opt(k)
             if (v is JSONObject) {
-                val found = findPinterestPinObject(v, targetPinId, depth + 1)
-                if (found != null) {
-                    val foundId = found.optString("id").ifBlank { found.optString("entityId") }
-                    if (targetPinId.isNullOrBlank() || foundId == targetPinId) return found
-                    if (fallbackMatch == null) fallbackMatch = found
-                }
+                collectPinterestPinObjects(v, targetPinId, out, depth + 1)
             } else if (v is JSONArray) {
-                for (i in 0 until minOf(v.length(), 10)) {
+                for (i in 0 until minOf(v.length(), 16)) {
                     val elem = v.optJSONObject(i) ?: continue
-                    val found = findPinterestPinObject(elem, targetPinId, depth + 1)
-                    if (found != null) {
-                        val foundId = found.optString("id").ifBlank { found.optString("entityId") }
-                        if (targetPinId.isNullOrBlank() || foundId == targetPinId) return found
-                        if (fallbackMatch == null) fallbackMatch = found
-                    }
+                    collectPinterestPinObjects(elem, targetPinId, out, depth + 1)
                 }
             }
         }
-        return fallbackMatch
+    }
+
+    /**
+     * Parses the JSON payload captured by [HeadlessWebExtractor.extractPinterestPinPayload],
+     * preferring hydrated Relay/PWS JSON scripts (scoped to [pinId]) and falling back to
+     * strictly scoped main-Pin carousel/story DOM slides.
+     */
+    internal fun parsePinterestHeadlessPayload(
+        payloadJson: String,
+        pinId: String?,
+        headers: Map<String, String>
+    ): ParsedPost? {
+        if (payloadJson.isBlank()) return null
+        val root = runCatching { JSONObject(payloadJson) }.getOrNull() ?: return null
+        val title = root.optString("title")
+            .replace("| Pinterest", "", ignoreCase = true)
+            .replace("- Pinterest", "", ignoreCase = true)
+            .trim()
+            .ifBlank { null }
+
+        var best: ParsedPost? = null
+        val scripts = root.optJSONArray("scripts")
+        if (scripts != null) {
+            for (i in 0 until scripts.length()) {
+                val raw = scripts.optString(i).trim()
+                if (!raw.startsWith("{")) continue
+                val obj = runCatching { JSONObject(raw) }.getOrNull() ?: continue
+                best = parsePinterestJsonRoot(obj, pinId, title, headers, best)
+            }
+        }
+        if (best != null && (best.slides.size > 1 || best.videoStreams.isNotEmpty())) {
+            return best
+        }
+
+        val domImages = root.optJSONArray("domSlides")
+        if (domImages != null && domImages.length() > 0) {
+            val slides = mutableListOf<GallerySlide>()
+            val seen = HashSet<String>()
+            for (i in 0 until domImages.length()) {
+                val rawUrl = domImages.optString(i).trim()
+                if (!rawUrl.startsWith("http") || !rawUrl.contains("pinimg.com", ignoreCase = true)) continue
+                val upgraded = upgradePinterestUrlToOriginal(rawUrl)
+                val slide = GallerySlide(
+                    id = "pin-dom-${slides.size}",
+                    index = slides.size,
+                    mediaUrl = upgraded,
+                    thumbnailUrl = rawUrl,
+                    type = MediaType.IMAGE,
+                    container = inferImageExt(upgraded),
+                    headers = headers,
+                    postId = pinId
+                )
+                if (seen.add(pinterestSlideDedupeKey(slide))) {
+                    slides += slide
+                }
+            }
+            if (slides.isNotEmpty()) {
+                best = preferRicherPinterestPost(
+                    best,
+                    ParsedPost(
+                        title = title ?: "Pinterest Pin",
+                        thumbnailUrl = slides.first().thumbnailUrl,
+                        postId = pinId,
+                        slides = slides
+                    )
+                )
+            }
+        }
+        return best
     }
 
     // =========================================================================

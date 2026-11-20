@@ -309,4 +309,109 @@ class HeadlessWebExtractor @Inject constructor(
             extractor = "Smart Extractor"
         )
     }
+
+    /**
+     * Loads a canonical Pinterest Pin URL in a lightweight offscreen WebView to collect hydrated
+     * Relay/PWS JSON scripts and strictly scoped main-Pin carousel/story slides (explicitly
+     * excluding "More to explore" / related pins feeds).
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun extractPinterestPinPayload(
+        targetUrl: String,
+        timeoutMs: Long = 5_000L
+    ): String? = coroutineScope {
+        val resultHolder = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        var pageFinished = false
+        var webViewRef: WebView? = null
+
+        val scrapeJs = """
+            (function(){
+              try {
+                var scripts = [];
+                var nodes = document.querySelectorAll('script[data-relay-response="true"], script#__PWS_DATA__, script#__PWS_INITIAL_PROPS__, script[type="application/json"]');
+                for (var i = 0; i < nodes.length && scripts.length < 30; i++) {
+                  var t = (nodes[i].textContent || '').trim();
+                  if (t.length > 2 && t[0] === '{' && (t.indexOf('carousel') >= 0 || t.indexOf('storyPin') >= 0 || t.indexOf('story_pin') >= 0 || t.indexOf('v3GetPinQuery') >= 0 || t.indexOf('imageSpec') >= 0 || t.indexOf('pinimg.com') >= 0)) {
+                    scripts.push(t);
+                  }
+                }
+                if (window.__PWS_DATA__) { try { scripts.push(JSON.stringify(window.__PWS_DATA__)); } catch(e){} }
+                if (window.__PWS_INITIAL_PROPS__) { try { scripts.push(JSON.stringify(window.__PWS_INITIAL_PROPS__)); } catch(e){} }
+
+                var domSlides = [];
+                var seen = {};
+                var mainSelectors = '[data-test-id="story-pin-closeup-page"] img, [data-test-id="carousel-slide"] img, [data-test-id="closeup-carousel"] img, [data-test-id="pin-closeup-image"] img, [data-test-id="closeup-brick"] img';
+                var imgs = document.querySelectorAll(mainSelectors);
+                for (var j = 0; j < imgs.length; j++) {
+                  var el = imgs[j];
+                  if (el.closest('[data-test-id*="related"], [data-test-id*="more-ideas"], [data-test-id*="recommend"], [data-test-id*="moreToExplore"]')) continue;
+                  var src = el.currentSrc || el.src || '';
+                  if (src.indexOf('i.pinimg.com/') >= 0 && src.indexOf('/75x75') < 0 && src.indexOf('/30x30') < 0 && !seen[src]) {
+                    seen[src] = true;
+                    domSlides.push(src);
+                  }
+                }
+                return JSON.stringify({ title: document.title || '', scripts: scripts, domSlides: domSlides });
+              } catch(e) { return ''; }
+            })();
+        """.trimIndent()
+
+        try {
+            withContext(dispatchers.main) {
+                val wv = WebView(context).apply {
+                    with(settings) {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        loadsImagesAutomatically = false
+                        userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+                    }
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                }
+                webViewRef = wv
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        super.onPageFinished(view, url)
+                        pageFinished = true
+                    }
+                }
+                wv.loadUrl(targetUrl)
+            }
+
+            val start = System.currentTimeMillis()
+            while (System.currentTimeMillis() - start < timeoutMs) {
+                delay(350)
+                if (!pageFinished && System.currentTimeMillis() - start < 2_200L) continue
+                withContext(dispatchers.main) {
+                    webViewRef?.evaluateJavascript(scrapeJs) { raw ->
+                        if (!raw.isNullOrBlank() && raw != "null" && raw != "\"\"") {
+                            val decoded = runCatching {
+                                org.json.JSONArray("[$raw]").getString(0)
+                            }.getOrNull()
+                            if (!decoded.isNullOrBlank() && decoded.startsWith("{")) {
+                                resultHolder.set(decoded)
+                            }
+                        }
+                    }
+                }
+                val current = resultHolder.get()
+                if (current != null && (current.contains("carouselSlots") || current.contains("carousel_slots") || current.contains("storyPinData") || current.contains("story_pin_data"))) {
+                    break
+                }
+                if (pageFinished && current != null && System.currentTimeMillis() - start > 1_800L) {
+                    break
+                }
+            }
+        } finally {
+            withContext(dispatchers.main) {
+                runCatching {
+                    webViewRef?.stopLoading()
+                    webViewRef?.destroy()
+                }
+            }
+        }
+
+        resultHolder.get()
+    }
 }

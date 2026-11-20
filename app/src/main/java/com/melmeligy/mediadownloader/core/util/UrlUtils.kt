@@ -18,12 +18,13 @@ object UrlUtils {
 
     private val trackingQueryParams = setOf(
         "igsh", "igshid", "evlk", "utm_source", "utm_medium", "utm_campaign", "utm_term",
-        "utm_content", "fbclid", "invite_code", "sender", "sfo", "epik", "share_id"
+        "utm_content", "fbclid", "invite_code", "sender", "sfo", "epik", "share_id",
+        "mt", "nic_v3"
     )
     private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
-    private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z]{2}\\.)?pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
+    private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z0-9-]+\\.)?pinterest\\.[a-z.]+/pin/(?:[^/?#]*--)?(\\d+)", RegexOption.IGNORE_CASE)
     private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
     private val tiktokIdPattern = Regex("tiktok\\.com/(?:@[^/]+/)?(?:video|photo)/(\\d+)", RegexOption.IGNORE_CASE)
     private val redditPostPattern = Regex("(?:reddit\\.com/r/[^/]+/comments|redd\\.it)/([A-Za-z0-9]+)", RegexOption.IGNORE_CASE)

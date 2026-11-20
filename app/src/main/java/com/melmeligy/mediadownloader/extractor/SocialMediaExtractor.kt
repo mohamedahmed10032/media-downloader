@@ -50,7 +50,7 @@ class SocialMediaExtractor @Inject constructor(
     private val twitterStatusRegex =
         Regex("(?:twitter\\.com|x\\.com)/([^/]+)/status/(\\d+)", RegexOption.IGNORE_CASE)
     private val pinterestPinIdRegex =
-        Regex("pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
+        Regex("pinterest\\.[a-z.]+/pin/(?:[^/?#]*--)?(\\d+)", RegexOption.IGNORE_CASE)
 
     override fun canHandle(url: String): Boolean {
         val host = UrlUtils.host(url)?.lowercase() ?: return false
@@ -79,8 +79,9 @@ class SocialMediaExtractor @Inject constructor(
             url
         }
         val host = UrlUtils.host(workingUrl)?.lowercase().orEmpty()
+        val timeoutMs = if (host.contains("pinterest.") || host.contains("pin.it")) 16_000L else 12_000L
         val fastResult = runCatching {
-            withTimeoutOrNull(12_000L) {
+            withTimeoutOrNull(timeoutMs) {
                 when {
                     host.contains("instagram.com") || host.contains("instagr.am") -> extractInstagram(workingUrl)
                     host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") || host.contains("fb.me") -> extractFacebook(workingUrl)
@@ -112,11 +113,15 @@ class SocialMediaExtractor @Inject constructor(
     }
 
     private fun resolveRedirectUrl(rawUrl: String): String {
+        val getFinal = runCatching { http.resolveFinalUrl(rawUrl) }.getOrNull()
+        if (!getFinal.isNullOrBlank() && getFinal.startsWith("http") && getFinal != rawUrl) {
+            return UrlUtils.cleanSocialUrl(getFinal)
+        }
         val probeFinal = runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
         if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http")) {
             return UrlUtils.cleanSocialUrl(probeFinal)
         }
-        return rawUrl
+        return UrlUtils.cleanSocialUrl(rawUrl)
     }
 
     private fun buildGalleryResolvedMedia(
@@ -951,73 +956,111 @@ class SocialMediaExtractor @Inject constructor(
         val desktopHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
             "Referer" to "https://www.pinterest.com/"
         )
 
-        val canonicalUrl = if (rawUrl.contains("pin.it", ignoreCase = true)) {
+        val resolvedUrl = if (rawUrl.contains("pin.it", ignoreCase = true) ||
+            pinterestPinIdRegex.find(rawUrl) == null
+        ) {
             resolveRedirectUrl(rawUrl)
         } else {
-            rawUrl
+            UrlUtils.cleanSocialUrl(rawUrl)
         }
-        val pinId = pinterestPinIdRegex.find(canonicalUrl)?.groupValues?.getOrNull(1)
 
-        val html = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
-        var parsed = if (html.isNotBlank()) {
-            SocialMediaGalleryParsers.parsePinterestHtml(html, pinId, desktopHeaders)
+        val pinId = pinterestPinIdRegex.find(resolvedUrl)?.groupValues?.getOrNull(1)
+            ?: pinterestPinIdRegex.find(rawUrl)?.groupValues?.getOrNull(1)
+        val canonicalUrl = if (!pinId.isNullOrBlank()) {
+            "https://www.pinterest.com/pin/$pinId/"
         } else {
-            null
+            resolvedUrl
         }
 
-        // Resilient fallback: Pinterest public PinResource JSON endpoint when HTML lacks full pin payload
-        if (parsed == null && !pinId.isNullOrBlank()) {
-            runCatching {
-                val dataParam = URLEncoder.encode(
-                    "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"detailed\"}}",
-                    "UTF-8"
-                )
-                val apiUrl = "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam"
-                val apiHeaders = desktopHeaders + mapOf(
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Accept" to "application/json"
-                )
-                val apiJson = http.fetchString(apiUrl, apiHeaders)
-                parsed = SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
+        var bestParsed: SocialMediaGalleryParsers.ParsedPost? = null
+
+        // Tier 1: Fetch canonical Pin HTML and scan ALL Relay SSR / __PWS_DATA__ / JSON blocks
+        val html = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
+        if (html.isNotBlank()) {
+            bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(
+                bestParsed,
+                SocialMediaGalleryParsers.parsePinterestHtml(html, pinId, desktopHeaders)
+            )
+        }
+
+        fun needsMultiSlideUpgrade(): Boolean {
+            val cur = bestParsed ?: return true
+            return cur.slides.size <= 1 && cur.videoStreams.isEmpty()
+        }
+
+        // Tier 2: PinResource/get API fallback — ALWAYS runs when HTML yielded <= 1 image
+        // because top-level og:image / images.orig on Carousel & Story Pins only carry the 1 cover.
+        if (needsMultiSlideUpgrade() && !pinId.isNullOrBlank()) {
+            val fieldSets = listOf("detailed", "unauth_react_main_pin", "auth_web_main_pin")
+            val apiHeaders = desktopHeaders + mapOf(
+                "X-Requested-With" to "XMLHttpRequest",
+                "X-Pinterest-AppState" to "active",
+                "X-Pinterest-PWS-Handler" to "www/pin/[id].js",
+                "Referer" to canonicalUrl,
+                "Accept" to "application/json, text/javascript, */*, q=0.01"
+            )
+            for (fieldSet in fieldSets) {
+                if (!needsMultiSlideUpgrade()) break
+                runCatching {
+                    val dataJson = "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"$fieldSet\"}}"
+                    val dataParam = URLEncoder.encode(dataJson, "UTF-8")
+                    val apiUrl = "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam"
+                    val apiJson = http.fetchString(apiUrl, apiHeaders)
+                    val apiParsed = SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
+                    bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, apiParsed)
+                }
             }
         }
 
-        val resolved = parsed ?: return@coroutineScope null
+        // Tier 3: Pinterest v3/pins endpoint fallback when PinResource omits carousel/story slots
+        if (needsMultiSlideUpgrade() && !pinId.isNullOrBlank()) {
+            runCatching {
+                val v3Headers = desktopHeaders + mapOf(
+                    "Accept" to "application/json",
+                    "Referer" to canonicalUrl
+                )
+                val v3Url = "https://api.pinterest.com/v3/pins/$pinId/?fields=pin.id,pin.title,pin.images,pin.carousel_data,pin.story_pin_data,pin.videos"
+                val v3Json = http.fetchString(v3Url, v3Headers)
+                val v3Parsed = SocialMediaGalleryParsers.parsePinterestHtml(v3Json, pinId, desktopHeaders)
+                bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, v3Parsed)
+            }
+        }
+
+        // Tier 4: Strictly scoped Headless WebView fallback when HTTP still yielded <= 1 image
+        // and the page either hints at a carousel/story pin or lacked hydrated Relay/PWS JSON.
+        if (needsMultiSlideUpgrade() &&
+            (bestParsed == null ||
+                SocialMediaGalleryParsers.pinterestHtmlHintsMultiSlide(html) ||
+                !SocialMediaGalleryParsers.hasStructuredPinterestJson(html))
+        ) {
+            runCatching {
+                val headlessJson = headlessWebExtractor.extractPinterestPinPayload(canonicalUrl)
+                if (!headlessJson.isNullOrBlank()) {
+                    val headlessParsed = SocialMediaGalleryParsers.parsePinterestHeadlessPayload(
+                        payloadJson = headlessJson,
+                        pinId = pinId,
+                        headers = desktopHeaders
+                    )
+                    bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, headlessParsed)
+                }
+            }
+        }
+
+        val resolved = bestParsed ?: return@coroutineScope null
 
         // Multi-image Carousel / Idea Pin / Single Image Pin -> Multi-Image Bottom Sheet
         if (resolved.slides.isNotEmpty()) {
-            // Verify upgraded /originals/ URLs when single-image; fall back to thumbnailUrl if /originals/ 404s
             val verifiedSlides = resolved.slides.mapIndexed { idx, slide ->
                 async {
                     if (slide.type == MediaType.IMAGE &&
                         slide.mediaUrl.contains("/originals/", ignoreCase = true) &&
-                        slide.thumbnailUrl != slide.mediaUrl &&
-                        idx < 12
+                        idx < 24
                     ) {
-                        val info = runCatching { http.probe(slide.mediaUrl, desktopHeaders) }.getOrNull()
-                        if (info != null && info.code in 200..299) {
-                            slide.copy(sizeBytes = info.contentLength.takeIf { it > 0 })
-                        } else if (info != null && info.code == 404) {
-                            // Try .png variant before falling back to 736x/thumbnail
-                            val altExt = if (slide.mediaUrl.endsWith(".jpg", ignoreCase = true)) {
-                                slide.mediaUrl.dropLast(4) + ".png"
-                            } else null
-                            val altInfo = altExt?.let { runCatching { http.probe(it, desktopHeaders) }.getOrNull() }
-                            if (altExt != null && altInfo != null && altInfo.code in 200..299) {
-                                slide.copy(
-                                    mediaUrl = altExt,
-                                    container = "png",
-                                    sizeBytes = altInfo.contentLength.takeIf { it > 0 }
-                                )
-                            } else {
-                                slide.copy(mediaUrl = slide.thumbnailUrl)
-                            }
-                        } else {
-                            slide
-                        }
+                        verifyPinterestOriginalSlide(slide, desktopHeaders)
                     } else {
                         slide
                     }
@@ -1082,6 +1125,46 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         null
+    }
+
+    private fun verifyPinterestOriginalSlide(
+        slide: GallerySlide,
+        headers: Map<String, String>
+    ): GallerySlide {
+        val info = runCatching { http.probe(slide.mediaUrl, headers) }.getOrNull()
+        if (info != null && info.code in 200..299) {
+            return slide.copy(sizeBytes = info.contentLength.takeIf { it > 0 })
+        }
+        if (info == null || info.code != 404) {
+            return slide
+        }
+        // Try alternate original extensions (.png, .webp) when an upgraded/signature-derived .jpg 404s
+        val baseWithoutExt = slide.mediaUrl.substringBeforeLast('.')
+        val altExts = listOf("png", "webp").filterNot { slide.mediaUrl.endsWith(".$it", ignoreCase = true) }
+        for (ext in altExts) {
+            val candidateUrl = "$baseWithoutExt.$ext"
+            val altInfo = runCatching { http.probe(candidateUrl, headers) }.getOrNull()
+            if (altInfo != null && altInfo.code in 200..299) {
+                return slide.copy(
+                    mediaUrl = candidateUrl,
+                    container = ext,
+                    sizeBytes = altInfo.contentLength.takeIf { it > 0 }
+                )
+            }
+        }
+        // Fall back cleanly to 736x or the slide's original thumbnail URL
+        val fallback736 = SocialMediaGalleryParsers.pinterest736UrlFromOriginal(slide.mediaUrl)
+        if (fallback736 != slide.mediaUrl) {
+            val info736 = runCatching { http.probe(fallback736, headers) }.getOrNull()
+            if (info736 != null && info736.code in 200..299) {
+                return slide.copy(
+                    mediaUrl = fallback736,
+                    thumbnailUrl = fallback736,
+                    sizeBytes = info736.contentLength.takeIf { it > 0 }
+                )
+            }
+        }
+        return slide.copy(mediaUrl = slide.thumbnailUrl)
     }
 
     // =========================================================================

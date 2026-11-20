@@ -599,4 +599,234 @@ class MultiImageExtractionAndRoutingTest {
         assertTrue(shouldShowMultiImageSheet(directImage))
         assertEquals(1, extractGallerySlides(directImage).size)
     }
+
+    // =========================================================================
+    // 6. Modern Pinterest Relay SSR (camelCase), imageSignature, PinResource & Scoping
+    // =========================================================================
+
+    @Test
+    fun pinterest_relaySsrCamelCaseCarousel_ignoresCoverAndRelatedPinsAndReturnsAllSlides() {
+        val relayGlobalId = Base64.getEncoder().encodeToString("Pin:687499743144766861".toByteArray())
+        val sig1 = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val sig2 = "11223344556677889900aabbccddeeff"
+        val relatedSig = "ffeeddccbbaa00998877665544332211"
+
+        val html = """
+            <html>
+            <head>
+              <title>Modern Relay Carousel | Pinterest</title>
+              <meta property="og:image" content="https://i.pinimg.com/736x/a1/b2/c3/$sig1.jpg"/>
+            </head>
+            <body>
+              <!-- First Relay script only carries 1 cover image + related pins feed -->
+              <script data-relay-response="true" type="application/json">
+              {
+                "response": {
+                  "data": {
+                    "pinShell": {
+                      "entityId": "687499743144766861",
+                      "imageSpec_orig": { "url": "https://i.pinimg.com/originals/a1/b2/c3/$sig1.jpg" }
+                    },
+                    "closeupRelated": [
+                      {
+                        "entityId": "999999999999999999",
+                        "imageSpec_orig": { "url": "https://i.pinimg.com/originals/ff/ee/dd/$relatedSig.jpg" }
+                      }
+                    ]
+                  }
+                }
+              }
+              </script>
+
+              <!-- Second Relay script (v3GetPinQuery) carries the full camelCase carouselData -->
+              <script data-relay-response="true" type="application/json">
+              {
+                "response": {
+                  "data": {
+                    "v3GetPinQuery": {
+                      "data": {
+                        "id": "$relayGlobalId",
+                        "gridTitle": "Two-Slide Architecture Set",
+                        "imageSpec_orig": { "url": "https://i.pinimg.com/originals/a1/b2/c3/$sig1.jpg" },
+                        "carouselData": {
+                          "carouselSlots": [
+                            {
+                              "details": {
+                                "imageSpecOrig": { "url": "https://i.pinimg.com/736x/a1/b2/c3/$sig1.jpg", "width": 736, "height": 1104 }
+                              }
+                            },
+                            {
+                              "images": {
+                                "736x": { "url": "https://i.pinimg.com/736x/11/22/33/$sig2.jpg", "width": 736, "height": 1104 },
+                                "474x": { "url": "https://i.pinimg.com/474x/11/22/33/$sig2.jpg" }
+                              }
+                            },
+                            {
+                              "images": {
+                                "236x": { "url": "https://i.pinimg.com/236x/11/22/33/$sig2.jpg" }
+                              }
+                            }
+                          ]
+                        },
+                        "relatedPins": [
+                          { "entityId": "888888888888888888", "images": { "orig": { "url": "https://i.pinimg.com/originals/ff/ee/dd/$relatedSig.jpg" } } }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+              </script>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val parsed = SocialMediaGalleryParsers.parsePinterestHtml(html, "687499743144766861", emptyMap())
+        assertNotNull(parsed)
+        assertEquals("Two-Slide Architecture Set", parsed!!.title)
+        // Duplicate 236x copy of sig2 deduplicated; related pin strictly excluded -> exactly 2 slides
+        assertEquals(2, parsed.slides.size)
+        assertEquals("https://i.pinimg.com/originals/a1/b2/c3/$sig1.jpg", parsed.slides[0].mediaUrl)
+        assertEquals("https://i.pinimg.com/originals/11/22/33/$sig2.jpg", parsed.slides[1].mediaUrl)
+        assertEquals("https://i.pinimg.com/474x/11/22/33/$sig2.jpg", parsed.slides[1].thumbnailUrl)
+        assertFalse(parsed.slides.any { it.mediaUrl.contains(relatedSig) })
+    }
+
+    @Test
+    fun pinterest_relayCamelCaseStoryPin_andImageSignatureOnlySlots_extractAllSlides() {
+        val sigPage1 = "abcdef0123456789abcdef0123456789"
+        val sigPage3 = "0123456789abcdef0123456789abcdef"
+
+        val html = """
+            <html><body>
+            <script data-relay-response="true" type="application/json">
+            {
+              "response": {
+                "data": {
+                  "v3GetPinQuery": {
+                    "data": {
+                      "entityId": "777666555444",
+                      "gridTitle": "DIY Coffee Bar",
+                      "storyPinData": {
+                        "pages": [
+                          {
+                            "blocks": [
+                              { "imageSignature": "$sigPage1" }
+                            ]
+                          },
+                          {
+                            "blocks": [
+                              {
+                                "videoData": {
+                                  "videoList": {
+                                    "V_720P": { "url": "https://v1.pinimg.com/videos/step2.mp4", "height": 720 }
+                                  }
+                                },
+                                "image": {
+                                  "imageSpec_474x": { "url": "https://i.pinimg.com/474x/ab/cd/ef/video_poster.jpg" }
+                                }
+                              }
+                            ]
+                          },
+                          {
+                            "image": {
+                              "imageSignature": "$sigPage3"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            </script>
+            </body></html>
+        """.trimIndent()
+
+        val parsed = SocialMediaGalleryParsers.parsePinterestHtml(html, "777666555444", emptyMap())
+        assertNotNull(parsed)
+        assertEquals(3, parsed!!.slides.size)
+        assertEquals(MediaType.IMAGE, parsed.slides[0].type)
+        assertEquals("https://i.pinimg.com/originals/ab/cd/ef/$sigPage1.jpg", parsed.slides[0].mediaUrl)
+        assertEquals("https://i.pinimg.com/736x/ab/cd/ef/$sigPage1.jpg", parsed.slides[0].thumbnailUrl)
+        assertEquals(MediaType.VIDEO, parsed.slides[1].type)
+        assertEquals("https://v1.pinimg.com/videos/step2.mp4", parsed.slides[1].mediaUrl)
+        assertEquals("https://i.pinimg.com/474x/ab/cd/ef/video_poster.jpg", parsed.slides[1].thumbnailUrl)
+        assertEquals(MediaType.IMAGE, parsed.slides[2].type)
+        assertEquals("https://i.pinimg.com/originals/01/23/45/$sigPage3.jpg", parsed.slides[2].mediaUrl)
+    }
+
+    @Test
+    fun pinterest_pinResourceApi_returnsAllCarouselSlidesWhenHtmlOnlyHasSingleCoverImage() = runBlocking {
+        val pinId = "687499743144766861"
+        val sig1 = "10101010101010101010101010101010"
+        val sig2 = "20202020202020202020202020202020"
+
+        val htmlWithOnlyCover = """
+            <html><head>
+              <title>Carousel Pin | Pinterest</title>
+              <meta property="og:image" content="https://i.pinimg.com/736x/10/10/10/$sig1.jpg"/>
+            </head><body></body></html>
+        """.trimIndent()
+
+        val pinResourceJson = """
+            {
+              "resource_response": {
+                "data": {
+                  "id": "$pinId",
+                  "title": "Two Slide Carousel",
+                  "images": {
+                    "orig": { "url": "https://i.pinimg.com/originals/10/10/10/$sig1.jpg" }
+                  },
+                  "carousel_data": {
+                    "carousel_slots": [
+                      { "images": { "orig": { "url": "https://i.pinimg.com/originals/10/10/10/$sig1.jpg" } } },
+                      { "images": { "736x": { "url": "https://i.pinimg.com/736x/20/20/20/$sig2.jpg" } } }
+                    ]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val mockHttp = mockk<ExtractorHttp>()
+        val mockHeadless = mockk<HeadlessWebExtractor>(relaxed = true)
+
+        every { mockHttp.resolveFinalUrl(match { it.contains("pin.it") }, any()) } returns
+            "https://www.pinterest.com/pin/$pinId/sent/?invite_code=abc&sender=123&sfo=1&mt=login"
+        coEvery { mockHttp.fetchString("https://www.pinterest.com/pin/$pinId/", any()) } returns htmlWithOnlyCover
+        coEvery { mockHttp.fetchString(match { it.contains("/resource/PinResource/get/") }, any()) } returns pinResourceJson
+        every { mockHttp.probe(any(), any()) } answers {
+            val u = firstArg<String>()
+            HeadInfo(code = 200, contentType = "image/jpeg", contentLength = 120_000L, acceptsRanges = true, finalUrl = u)
+        }
+
+        val extractor = SocialMediaExtractor(mockHttp, mockHeadless)
+        val resolved = extractor.extract("https://pin.it/3AbCdEf?invite_code=xyz&mt=login")
+
+        assertNotNull(resolved)
+        assertEquals("Pinterest", resolved!!.extractor)
+        assertEquals(pinId, resolved.postId)
+        assertEquals(2, resolved.gallerySlides.size)
+        assertEquals("https://i.pinimg.com/originals/10/10/10/$sig1.jpg", resolved.gallerySlides[0].mediaUrl)
+        assertEquals("https://i.pinimg.com/originals/20/20/20/$sig2.jpg", resolved.gallerySlides[1].mediaUrl)
+        assertTrue(shouldShowMultiImageSheet(resolved))
+    }
+
+    @Test
+    fun pinterest_pinItAndLocalizedShareUrls_canonicalizeCleanly() {
+        assertEquals(
+            "https://www.pinterest.com/pin/687499743144766861/",
+            UrlUtils.cleanSocialUrl("https://in.pinterest.com/pin/687499743144766861/sent/?invite_code=abc&sender=999&sfo=1&mt=login")
+        )
+        assertEquals(
+            "https://www.pinterest.com/pin/687499743144766861/",
+            UrlUtils.cleanSocialUrl("https://www.pinterest.co.uk/pin/minimalist-posters--687499743144766861/?epik=dj0y")
+        )
+        assertEquals(
+            "https://pin.it/3AbCdEf",
+            UrlUtils.cleanSocialUrl("https://pin.it/3AbCdEf?invite_code=abc&sender=123&sfo=1&mt=login")
+        )
+    }
 }

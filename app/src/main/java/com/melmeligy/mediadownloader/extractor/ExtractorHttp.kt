@@ -159,6 +159,29 @@ class ExtractorHttp {
         return executeProbe(c, url, headers, effective)
     }
 
+    /**
+     * Resolves HTTP redirects for short links (e.g. `pin.it`, `t.co`, `fb.watch`) via a standard
+     * GET request without downloading the body, falling back to [url] on error.
+     */
+    fun resolveFinalUrl(url: String, headers: Map<String, String> = emptyMap()): String {
+        val request = buildRequest(url, headers)
+            .header("X-Internal-Download", "true")
+            .get()
+            .build()
+        return runCatching {
+            val redirectClient = client.newBuilder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .callTimeout(6, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+            redirectClient.newCall(request).execute().use { response ->
+                response.request.url.toString().ifBlank { url }
+            }
+        }.getOrDefault(url)
+    }
+
     private fun executeProbe(
         httpClient: OkHttpClient,
         url: String,
