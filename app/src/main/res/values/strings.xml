@@ -37,6 +37,9 @@
     <string name="quality_download">Start download</string>
     <string name="quality_estimated_size">~%1$s</string>
     <string name="quality_unknown_size">Size unknown</string>
+    <string name="sheet_download_title">Download</string>
+    <string name="toast_download_started">Download started in background</string>
+    <string name="toast_batch_download_started">Downloading %1$d items in background</string>
 
     <!-- Downloads -->
     <string name="downloads_title">Downloads</string>

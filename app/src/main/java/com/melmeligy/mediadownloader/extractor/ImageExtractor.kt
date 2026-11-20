@@ -35,21 +35,32 @@ class ImageExtractor @Inject constructor(
         if (!isImage) return null
 
         val container = ext ?: contentType.substringAfter('/', "jpg").ifBlank { "jpg" }
-        val directUrl = info?.finalUrl ?: url
+        val directUrl = info.finalUrl.ifBlank { url }
+        val sizeBytes = info.contentLength.takeIf { it > 0 }
         val stream = MediaStream(
             id = "image-0",
             url = directUrl,
             type = MediaType.IMAGE,
             container = container,
             label = "Original image",
-            sizeBytes = info?.contentLength?.takeIf { it > 0 }
+            sizeBytes = sizeBytes
+        )
+        val slide = com.melmeligy.mediadownloader.domain.model.GallerySlide(
+            id = "image-slide-0",
+            index = 0,
+            mediaUrl = directUrl,
+            thumbnailUrl = directUrl,
+            type = MediaType.IMAGE,
+            container = container,
+            sizeBytes = sizeBytes
         )
         return ResolvedMedia(
             sourceUrl = url,
             title = UrlUtils.fileNameFromUrl(url),
             thumbnailUrl = directUrl,
             streams = listOf(stream),
-            extractor = name
+            extractor = name,
+            gallerySlides = listOf(slide)
         )
     }
 }

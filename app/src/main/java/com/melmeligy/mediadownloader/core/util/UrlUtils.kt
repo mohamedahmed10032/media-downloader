@@ -17,13 +17,17 @@ object UrlUtils {
     private val embeddedHttpUrlRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
 
     private val trackingQueryParams = setOf(
-        "igsh", "igshid", "utm_source", "utm_medium", "utm_campaign", "utm_term",
-        "utm_content", "fbclid", "invite_code", "sender", "sfo"
+        "igsh", "igshid", "evlk", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+        "utm_content", "fbclid", "invite_code", "sender", "sfo", "epik", "share_id"
     )
-    private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
-    private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
-    private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?instagram\\.com/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z]{2}\\.)?pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
+    private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
+    private val tiktokIdPattern = Regex("tiktok\\.com/(?:@[^/]+/)?(?:video|photo)/(\\d+)", RegexOption.IGNORE_CASE)
+    private val redditPostPattern = Regex("(?:reddit\\.com/r/[^/]+/comments|redd\\.it)/([A-Za-z0-9]+)", RegexOption.IGNORE_CASE)
+    private val threadsPostPattern = Regex("threads\\.(?:net|com)/(?:@[^/]+/)?post/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
 
     /** Percent-encodes raw non-ASCII / unsafe characters in a URL without double-encoding existing `%XX` escapes. */
     fun encodeNonAsciiUrl(rawUrl: String): String {
@@ -211,6 +215,53 @@ object UrlUtils {
             dimensionRegex.find(url)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
             delimitedHeightRegex.find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
         }
+        return null
+    }
+
+    /** True when [url] is a known short/redirect link that should be resolved before extraction. */
+    fun isShortOrRedirectUrl(url: String): Boolean {
+        val h = host(url)?.lowercase().orEmpty()
+        if (h == "pin.it" || h.endsWith(".pin.it") ||
+            h == "instagr.am" || h.endsWith(".instagr.am") ||
+            h == "vm.tiktok.com" || h == "vt.tiktok.com" ||
+            h == "t.co" ||
+            h == "fb.watch" || h == "fb.me" ||
+            h == "redd.it"
+        ) {
+            return true
+        }
+        val lower = url.lowercase()
+        return lower.contains("/share/") ||
+            (h.contains("tiktok.com") && lower.contains("/t/")) ||
+            (h.contains("reddit.com") && lower.contains("/s/"))
+    }
+
+    /** Short lowercase platform slug suitable for indexed filenames (e.g., instagram, pinterest, tiktok). */
+    fun platformSlug(extractor: String, sourceUrl: String): String {
+        val ext = extractor.lowercase()
+        val h = host(sourceUrl)?.lowercase().orEmpty()
+        return when {
+            ext.contains("instagram") || h.contains("instagram.com") || h.contains("instagr.am") -> "instagram"
+            ext.contains("pinterest") || h.contains("pinterest.") || h.contains("pin.it") -> "pinterest"
+            ext.contains("tiktok") || h.contains("tiktok.com") -> "tiktok"
+            ext.contains("twitter") || ext.contains("x /") || h.contains("twitter.com") || h.contains("x.com") || h == "t.co" -> "twitter"
+            ext.contains("facebook") || h.contains("facebook.com") || h.contains("fb.watch") || h.contains("fb.com") || h.contains("fb.me") -> "facebook"
+            ext.contains("threads") || h.contains("threads.net") || h.contains("threads.com") -> "threads"
+            ext.contains("reddit") || h.contains("reddit.com") || h.contains("redd.it") -> "reddit"
+            else -> h.removePrefix("www.").substringBefore('.').ifBlank { "media" }
+        }
+    }
+
+    /** Best-effort post/pin/tweet/gallery identifier extracted from a canonical social URL. */
+    fun extractPostId(url: String): String? {
+        instagramPostPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        instagramReelPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        instagramTvPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        pinterestPinPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        twitterStatusPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        tiktokIdPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        redditPostPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        threadsPostPattern.find(url)?.groupValues?.getOrNull(1)?.let { return it }
         return null
     }
 

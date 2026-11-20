@@ -1,26 +1,19 @@
 package com.melmeligy.mediadownloader.ui.share
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.Download
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -29,28 +22,31 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.util.Consumer
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.melmeligy.mediadownloader.MainActivity
+import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.util.UrlUtils
-import com.melmeligy.mediadownloader.domain.model.ThemeMode
 import com.melmeligy.mediadownloader.ui.quality.ChooseFormatStateContent
 import com.melmeligy.mediadownloader.ui.quality.QualityViewModel
 import com.melmeligy.mediadownloader.ui.theme.MediaDownloaderTheme
+import com.melmeligy.mediadownloader.ui.theme.ThemeViewModel
 import dagger.hilt.android.AndroidEntryPoint
 
 /**
- * Snaptube-style transparent floating bottom sheet activity (`ActionSendDispatchActivity` equivalent).
+ * Lightweight translucent floating overlay activity for `Intent.ACTION_SEND` (`text/plain`).
  *
- * Launches directly over the user's current app (Instagram, TikTok, YouTube, X, Chrome, etc.)
- * when the user shares a link via `Intent.ACTION_SEND`, resolves Video and Audio qualities with
- * real sizes, and starts the background download on 1-tap while closing itself immediately.
+ * Launches directly over the user's current app (Instagram, Pinterest, TikTok, X, Reddit,
+ * Facebook, Threads, Chrome, etc.) without pulling Media Downloader's main task into the
+ * foreground. Opens a native Media Downloader Modal Bottom Sheet immediately with a themed
+ * shimmer skeleton and smart-routes:
+ * - Single-image, multi-image carousels/slideshows, and mixed carousels -> [MultiImageBottomSheetContent]
+ * - Videos and audio streams -> existing video/audio quality picker
  */
 @AndroidEntryPoint
 class ShareDialogActivity : ComponentActivity() {
@@ -76,13 +72,21 @@ class ShareDialogActivity : ComponentActivity() {
                 onDispose { removeOnNewIntentListener(listener) }
             }
 
-            MediaDownloaderTheme(themeMode = ThemeMode.SYSTEM) {
+            val themeViewModel: ThemeViewModel = hiltViewModel()
+            val themeMode by themeViewModel.themeMode.collectAsStateWithLifecycle()
+
+            MediaDownloaderTheme(themeMode = themeMode) {
                 ShareOverlaySheet(
                     url = currentUrl,
-                    onQueued = {
+                    onQueued = { count ->
+                        val message = if (count > 1) {
+                            getString(R.string.toast_batch_download_started, count)
+                        } else {
+                            getString(R.string.toast_download_started)
+                        }
                         Toast.makeText(
                             this@ShareDialogActivity,
-                            "Download started in background",
+                            message,
                             Toast.LENGTH_SHORT
                         ).show()
                         finish()
@@ -104,8 +108,12 @@ class ShareDialogActivity : ComponentActivity() {
 
     override fun finish() {
         super.finish()
-        @Suppress("DEPRECATION")
-        overridePendingTransition(0, android.R.anim.fade_out)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, android.R.anim.fade_out)
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, android.R.anim.fade_out)
+        }
     }
 
     private fun extractUrl(intent: Intent?): String? {
@@ -121,39 +129,49 @@ class ShareDialogActivity : ComponentActivity() {
 @Composable
 private fun ShareOverlaySheet(
     url: String,
-    onQueued: () -> Unit,
+    onQueued: (Int) -> Unit,
     onOpenInBrowser: (String) -> Unit,
     onDismiss: () -> Unit,
     viewModel: QualityViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.82f).dp
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
 
     LaunchedEffect(url) {
         viewModel.resolve(url)
     }
 
     LaunchedEffect(Unit) {
-        viewModel.queued.collect { onQueued() }
+        viewModel.queuedCount.collect { count -> onQueued(count) }
     }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        sheetState = sheetState
+        sheetState = sheetState,
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        containerColor = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        scrimColor = Color.Black.copy(alpha = 0.45f),
+        dragHandle = {
+            BottomSheetDefaults.DragHandle(
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)
+            )
+        }
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(max = maxSheetHeight)
-                .padding(bottom = 8.dp)
         ) {
             ChooseFormatStateContent(
                 state = state,
                 url = url,
+                useShimmerLoading = true,
                 onRetry = { viewModel.resolve(url) },
                 onOpenInBrowser = onOpenInBrowser,
-                onDownload = viewModel::download
+                onDownload = viewModel::download,
+                onDownloadBatch = viewModel::downloadBatch
             )
         }
     }

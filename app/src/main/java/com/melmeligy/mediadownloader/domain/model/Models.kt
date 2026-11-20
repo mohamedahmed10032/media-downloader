@@ -24,17 +24,39 @@ data class MediaStream(
     val headers: Map<String, String> = emptyMap()
 )
 
+/**
+ * A single ordered slide inside a single-image, multi-image carousel/album/slideshow,
+ * or mixed photo+video post. Preserves exact reading order via [index].
+ */
+data class GallerySlide(
+    val id: String,
+    val index: Int,
+    val mediaUrl: String,
+    val thumbnailUrl: String = mediaUrl,
+    val type: MediaType = MediaType.IMAGE,
+    val container: String = if (type == MediaType.VIDEO) "mp4" else "jpg",
+    val width: Int? = null,
+    val height: Int? = null,
+    val sizeBytes: Long? = null,
+    val headers: Map<String, String> = emptyMap(),
+    val postId: String? = null
+)
+
 /** The outcome of resolving a link/page: metadata plus every stream we can offer. */
 data class ResolvedMedia(
     val sourceUrl: String,
     val title: String,
     val thumbnailUrl: String? = null,
     val streams: List<MediaStream> = emptyList(),
-    val extractor: String = ""
+    val extractor: String = "",
+    val gallerySlides: List<GallerySlide> = emptyList(),
+    val postId: String? = null
 ) {
     val hasVideo: Boolean get() = streams.any { it.type == MediaType.VIDEO }
     val hasAudio: Boolean get() = streams.any { it.type == MediaType.AUDIO }
     val hasImage: Boolean get() = streams.any { it.type == MediaType.IMAGE }
+    val isGalleryOrPhoto: Boolean
+        get() = gallerySlides.isNotEmpty() || (hasImage && !hasVideo)
 }
 
 /** A persisted, trackable download task. */

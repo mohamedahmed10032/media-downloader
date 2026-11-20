@@ -66,16 +66,19 @@ import coil.compose.AsyncImage
 import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.Resource
 import com.melmeligy.mediadownloader.core.util.FormatUtils
+import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.ui.common.ErrorState
 import com.melmeligy.mediadownloader.ui.common.LoadingState
 import com.melmeligy.mediadownloader.ui.common.asMessage
+import com.melmeligy.mediadownloader.ui.share.MultiImageBottomSheetContent
+import com.melmeligy.mediadownloader.ui.share.MultiImageSheetSkeleton
+import com.melmeligy.mediadownloader.ui.share.shouldShowMultiImageSheet
+import com.melmeligy.mediadownloader.ui.theme.Indigo
 
-private val SnaptubePurple = Color(0xFF7C3AED)
-private val SnaptubePurpleHover = Color(0xFF6D28D9)
-private val SnaptubeDarkText = Color(0xFF141414)
+private val BrandAccent = Indigo
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -114,35 +117,46 @@ fun QualityScreen(
             contentPadding = padding,
             onRetry = { viewModel.resolve(url) },
             onOpenInBrowser = onOpenInBrowser,
-            onDownload = viewModel::download
+            onDownload = viewModel::download,
+            onDownloadBatch = viewModel::downloadBatch
         )
     }
 }
 
 /**
- * Snaptube-authentic 2-stage format selector (`Download video as` -> `More formats / All >`)
- * used by:
+ * Smart-routed download sheet content used by:
  * 1. [com.melmeligy.mediadownloader.ui.share.ShareDialogActivity] (floating overlay sheet),
  * 2. [com.melmeligy.mediadownloader.ui.browser.BrowserScreen] (in-browser modal sheet), and
  * 3. [QualityScreen].
+ *
+ * Routes single-image, multi-image carousels/slideshows, and mixed photo+video carousels to
+ * [MultiImageBottomSheetContent], while keeping video/audio links on the existing format selector.
  */
 @Composable
 fun ChooseFormatStateContent(
     state: Resource<ResolvedMedia>,
     url: String,
     contentPadding: PaddingValues = PaddingValues(0.dp),
+    useShimmerLoading: Boolean = false,
     onRetry: () -> Unit,
     onOpenInBrowser: ((String) -> Unit)? = null,
-    onDownload: (MediaStream) -> Unit
+    onDownload: (MediaStream) -> Unit,
+    onDownloadBatch: ((List<GallerySlide>) -> Unit)? = null
 ) {
     when (state) {
-        is Resource.Loading -> LoadingState(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(280.dp)
-                .padding(contentPadding),
-            message = "Getting video & music formats…"
-        )
+        is Resource.Loading -> {
+            if (useShimmerLoading) {
+                MultiImageSheetSkeleton(contentPadding = contentPadding)
+            } else {
+                LoadingState(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(280.dp)
+                        .padding(contentPadding),
+                    message = "Getting media formats…"
+                )
+            }
+        }
         is Resource.Error -> Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -161,9 +175,11 @@ fun ChooseFormatStateContent(
                 Spacer(modifier = Modifier.height(12.dp))
                 Button(
                     onClick = { onOpenInBrowser(url) },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = SnaptubePurple,
+                        containerColor = BrandAccent,
                         contentColor = Color.White
                     ),
                     shape = RoundedCornerShape(24.dp)
@@ -176,11 +192,22 @@ fun ChooseFormatStateContent(
                 }
             }
         }
-        is Resource.Success -> SnaptubeFormatSheetContent(
-            resolved = state.data,
-            contentPadding = contentPadding,
-            onDownload = onDownload
-        )
+        is Resource.Success -> {
+            val resolved = state.data
+            if (onDownloadBatch != null && shouldShowMultiImageSheet(resolved)) {
+                MultiImageBottomSheetContent(
+                    resolved = resolved,
+                    contentPadding = contentPadding,
+                    onDownloadSelected = onDownloadBatch
+                )
+            } else {
+                SnaptubeFormatSheetContent(
+                    resolved = resolved,
+                    contentPadding = contentPadding,
+                    onDownload = onDownload
+                )
+            }
+        }
     }
 }
 
@@ -257,7 +284,7 @@ private fun SnaptubeFormatSheetContent(
                         .height(50.dp),
                     shape = RoundedCornerShape(25.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = SnaptubePurple,
+                        containerColor = BrandAccent,
                         contentColor = Color.White
                     )
                 ) {
@@ -634,7 +661,7 @@ private fun SnaptubeFormatRow(
         Icon(
             imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
             contentDescription = null,
-            tint = if (isSelected) SnaptubePurple else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+            tint = if (isSelected) BrandAccent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
             modifier = Modifier.size(22.dp)
         )
     }

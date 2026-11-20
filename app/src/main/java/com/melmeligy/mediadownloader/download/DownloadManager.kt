@@ -17,8 +17,10 @@ import com.melmeligy.mediadownloader.core.DispatcherProvider
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.core.util.JsonUtils
+import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.model.DownloadStatus
+import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
@@ -91,6 +93,49 @@ class DownloadManager @Inject constructor(
         val id = repository.enqueue(item)
         schedule()
         return id
+    }
+
+    /**
+     * Enqueues a batch of selected [GallerySlide] items in exact reading order, naming multi-part
+     * posts with zero-padded indexed filenames (e.g., `instagram_<postId>_01.jpg`, `02.jpg`, ...)
+     * so they appear in sequence inside the user's Gallery.
+     */
+    suspend fun enqueueBatch(resolved: ResolvedMedia, slides: List<GallerySlide>): List<Long> {
+        if (slides.isEmpty()) return emptyList()
+        val ordered = slides.sortedBy { it.index }
+        val totalCount = maxOf(resolved.gallerySlides.size, ordered.size)
+        val now = System.currentTimeMillis()
+        val ids = ArrayList<Long>(ordered.size)
+
+        ordered.forEachIndexed { pos, slide ->
+            val slideTitle = buildBatchSlideTitle(resolved, slide, totalCount)
+            val qualityLabel = if (slide.type == MediaType.VIDEO) {
+                "Video (${slide.container.uppercase()})"
+            } else {
+                slide.container.uppercase()
+            }
+            val item = DownloadItem(
+                title = slideTitle,
+                sourceUrl = resolved.sourceUrl,
+                remoteUrl = slide.mediaUrl,
+                type = slide.type,
+                container = slide.container.lowercase().ifBlank { if (slide.type == MediaType.VIDEO) "mp4" else "jpg" },
+                qualityLabel = qualityLabel,
+                status = DownloadStatus.QUEUED,
+                totalBytes = slide.sizeBytes ?: 0L,
+                thumbnailUrl = slide.thumbnailUrl,
+                headersJson = JsonUtils.mapToJson(slide.headers),
+                isHls = false,
+                createdAt = now + pos,
+                updatedAt = now + pos
+            )
+            ids += repository.enqueue(item)
+        }
+
+        if (ids.isNotEmpty()) {
+            schedule()
+        }
+        return ids
     }
 
     suspend fun pause(id: Long) {
@@ -571,8 +616,44 @@ class DownloadManager @Inject constructor(
         AppError.GENERIC -> "Download failed"
     }
 
-    private companion object {
-        const val FOREGROUND_REFRESH_MS = 1000L
-        const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
+    companion object {
+        private const val FOREGROUND_REFRESH_MS = 1000L
+        private const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
+
+        /**
+         * Builds a deterministic, filesystem-safe base title (without extension) for a gallery slide.
+         * Multi-slide posts use zero-padded 1-based indices (e.g. `instagram_Df4fAVSgmen_01`, `02`, ...)
+         * so Gallery apps display slides in exact reading order.
+         */
+        internal fun buildBatchSlideTitle(
+            resolved: ResolvedMedia,
+            slide: GallerySlide,
+            totalSlides: Int
+        ): String {
+            val platform = UrlUtils.platformSlug(resolved.extractor, resolved.sourceUrl)
+            val rawPostId = slide.postId?.takeIf { it.isNotBlank() }
+                ?: resolved.postId?.takeIf { it.isNotBlank() }
+                ?: UrlUtils.extractPostId(resolved.sourceUrl)
+            val cleanId = rawPostId?.let {
+                FormatUtils.sanitizeFileName(it, fallback = "").replace(' ', '_')
+            }?.takeIf { it.isNotBlank() }
+
+            val basePrefix = if (cleanId != null) {
+                "${platform}_$cleanId"
+            } else {
+                val safeTitle = FormatUtils.sanitizeFileName(resolved.title, fallback = platform)
+                    .replace(' ', '_')
+                    .take(48)
+                if (safeTitle.startsWith(platform, ignoreCase = true)) safeTitle else "${platform}_$safeTitle"
+            }
+
+            return if (totalSlides > 1) {
+                val width = if (totalSlides >= 100) 3 else 2
+                val ordinal = (slide.index + 1).toString().padStart(width, '0')
+                "${basePrefix}_$ordinal"
+            } else {
+                basePrefix
+            }
+        }
     }
 }

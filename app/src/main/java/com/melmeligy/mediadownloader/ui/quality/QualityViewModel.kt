@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.Resource
+import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.domain.repository.MediaRepository
@@ -35,6 +36,9 @@ class QualityViewModel @Inject constructor(
     private val _queued = Channel<Unit>(Channel.BUFFERED)
     val queued = _queued.receiveAsFlow()
 
+    private val _queuedCount = Channel<Int>(Channel.BUFFERED)
+    val queuedCount = _queuedCount.receiveAsFlow()
+
     init {
         if (currentUrl.isNotBlank()) {
             resolve(currentUrl)
@@ -61,6 +65,19 @@ class QualityViewModel @Inject constructor(
         viewModelScope.launch {
             downloadManager.enqueue(resolved, stream)
             _queued.send(Unit)
+            _queuedCount.send(1)
+        }
+    }
+
+    fun downloadBatch(slides: List<GallerySlide>) {
+        if (slides.isEmpty()) return
+        val resolved = (_state.value as? Resource.Success)?.data ?: return
+        viewModelScope.launch {
+            val ids = downloadManager.enqueueBatch(resolved, slides)
+            if (ids.isNotEmpty()) {
+                _queued.send(Unit)
+                _queuedCount.send(ids.size)
+            }
         }
     }
 }

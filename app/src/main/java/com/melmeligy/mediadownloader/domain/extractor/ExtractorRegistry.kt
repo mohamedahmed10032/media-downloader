@@ -52,15 +52,23 @@ class ExtractorRegistry @Inject constructor(
         // and found no streams, do not waste 60+ seconds probing generic HTML/HLS/DASH/Direct extractors.
         val host = UrlUtils.host(url)?.lowercase().orEmpty()
         val isWalledSocial = host.contains("instagram.com") ||
+            host.contains("instagr.am") ||
             host.contains("tiktok.com") ||
             host.contains("youtube.com") ||
             host.contains("youtu.be") ||
             host.contains("facebook.com") ||
             host.contains("fb.watch") ||
+            host.contains("fb.com") ||
+            host.contains("fb.me") ||
             host.contains("twitter.com") ||
             host.contains("x.com") ||
+            host.contains("t.co") ||
             host.contains("pinterest.") ||
-            host.contains("pin.it")
+            host.contains("pin.it") ||
+            host.contains("threads.net") ||
+            host.contains("threads.com") ||
+            host.contains("reddit.com") ||
+            host.contains("redd.it")
 
         if (willing.isNotEmpty() && isWalledSocial) {
             throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)

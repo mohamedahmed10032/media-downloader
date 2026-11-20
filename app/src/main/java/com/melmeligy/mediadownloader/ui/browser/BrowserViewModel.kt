@@ -84,6 +84,20 @@ class BrowserViewModel @Inject constructor(
         }
     }
 
+    fun downloadSlides(
+        slides: List<com.melmeligy.mediadownloader.domain.model.GallerySlide>,
+        onStarted: (Int) -> Unit
+    ) {
+        if (slides.isEmpty()) return
+        val resolved = (_formatState.value as? com.melmeligy.mediadownloader.core.Resource.Success)?.data ?: return
+        viewModelScope.launch {
+            val ids = downloadManager.enqueueBatch(resolved, slides)
+            if (ids.isNotEmpty()) {
+                onStarted(ids.size)
+            }
+        }
+    }
+
     /**
      * Blob media is already resolved to a local file by the JS bridge, so it is imported
      * straight into the library instead of going through the quality picker.

@@ -3,6 +3,7 @@ package com.melmeligy.mediadownloader.extractor
 import android.util.Base64
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
+import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
@@ -25,14 +26,15 @@ import javax.inject.Singleton
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * High-priority universal extractor for major social video platforms:
- * 1. Instagram (Reels, Posts, TV, Stories) via Snaptube's Polaris GraphQL + doc_id + embed DASH & video_versions.
- * 2. Facebook (Videos, Watch, Reels, fb.watch) via DASH manifest + browser_native_hd/sd + playable_url.
- * 3. TikTok (Videos, Photos, Audio) via canonical resolution + tikwm API + Universal Hydration JSON.
- * 4. X / Twitter via vxtwitter & fxtwitter APIs.
- *
- * Automatically falls back to [HeadlessWebExtractor] for any unrecognized or JS-heavy web page,
- * ensuring clean, deduplicated Music and Video format lists with exact byte sizes.
+ * High-priority universal extractor for major social platforms (videos, single photos,
+ * multi-image carousels/albums/slideshows, and mixed photo+video carousels):
+ * 1. Instagram (Reels, Posts, Carousels, TV) via FastDL + Polaris GraphQL + doc_id + Embed JSON.
+ * 2. Facebook (Videos, Watch, Reels, fb.watch, Single & Multi-Photo Albums).
+ * 3. TikTok (Videos, Photo Mode Slideshows, Audio) via tikwm API + Hydration JSON.
+ * 4. X / Twitter (Single/Multi-Image, Mixed, Videos) via vxtwitter + fxtwitter + syndication.
+ * 5. Pinterest (Single Pins, Carousel Pins, Idea/Story Pins, Pin Videos, pin.it).
+ * 6. Threads (Single/Multi-Image, Mixed Carousels, Videos).
+ * 7. Reddit (Image Galleries, Single Images, Crossposts, Reddit Videos, redd.it).
  */
 @Singleton
 class SocialMediaExtractor @Inject constructor(
@@ -47,46 +49,107 @@ class SocialMediaExtractor @Inject constructor(
         Regex("(?:reel|reels|p|tv|share/reel|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val twitterStatusRegex =
         Regex("(?:twitter\\.com|x\\.com)/([^/]+)/status/(\\d+)", RegexOption.IGNORE_CASE)
+    private val pinterestPinIdRegex =
+        Regex("pinterest\\.[a-z.]+/pin/(\\d+)", RegexOption.IGNORE_CASE)
 
     override fun canHandle(url: String): Boolean {
         val host = UrlUtils.host(url)?.lowercase() ?: return false
         return host.contains("instagram.com") ||
+            host.contains("instagr.am") ||
             host.contains("tiktok.com") ||
             host.contains("twitter.com") ||
             host.contains("x.com") ||
+            host == "t.co" ||
             host.contains("facebook.com") ||
             host.contains("fb.watch") ||
             host.contains("fb.com") ||
+            host.contains("fb.me") ||
             host.contains("pinterest.") ||
-            host.contains("pin.it")
+            host.contains("pin.it") ||
+            host.contains("threads.net") ||
+            host.contains("threads.com") ||
+            host.contains("reddit.com") ||
+            host.contains("redd.it")
     }
 
     override suspend fun extract(url: String): ResolvedMedia? {
-        val host = UrlUtils.host(url)?.lowercase().orEmpty()
+        val workingUrl = if (UrlUtils.isShortOrRedirectUrl(url)) {
+            resolveRedirectUrl(url)
+        } else {
+            url
+        }
+        val host = UrlUtils.host(workingUrl)?.lowercase().orEmpty()
         val fastResult = runCatching {
-            withTimeoutOrNull(8_000L) {
+            withTimeoutOrNull(12_000L) {
                 when {
-                    host.contains("instagram.com") -> extractInstagram(url)
-                    host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") -> extractFacebook(url)
-                    host.contains("twitter.com") || host.contains("x.com") -> extractTwitter(url)
-                    host.contains("tiktok.com") -> extractTikTok(url)
-                    host.contains("pinterest.") || host.contains("pin.it") -> extractPinterest(url)
+                    host.contains("instagram.com") || host.contains("instagr.am") -> extractInstagram(workingUrl)
+                    host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") || host.contains("fb.me") -> extractFacebook(workingUrl)
+                    host.contains("twitter.com") || host.contains("x.com") -> extractTwitter(workingUrl)
+                    host.contains("tiktok.com") -> extractTikTok(workingUrl)
+                    host.contains("pinterest.") || host.contains("pin.it") -> extractPinterest(workingUrl)
+                    host.contains("threads.net") || host.contains("threads.com") -> extractThreads(workingUrl)
+                    host.contains("reddit.com") || host.contains("redd.it") -> extractReddit(workingUrl)
                     else -> null
                 }
             }
         }.getOrNull()
 
-        if (fastResult != null && fastResult.streams.isNotEmpty()) {
+        if (fastResult != null && (fastResult.streams.isNotEmpty() || fastResult.gallerySlides.isNotEmpty())) {
             return fastResult
         }
 
-        // For Instagram & Pinterest, do NOT fall back to detached Headless WebView
-        if (host.contains("instagram.com") || host.contains("pinterest.") || host.contains("pin.it")) {
+        // For Instagram, Pinterest, Threads, Reddit do NOT fall back to video-only Headless WebView
+        if (host.contains("instagram.com") || host.contains("instagr.am") ||
+            host.contains("pinterest.") || host.contains("pin.it") ||
+            host.contains("threads.net") || host.contains("threads.com") ||
+            host.contains("reddit.com") || host.contains("redd.it")
+        ) {
             return null
         }
 
         // Fallback to Headless WebView to execute JS/GraphQL and intercept live CDN streams
-        return runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+        return runCatching { headlessWebExtractor.extract(workingUrl) }.getOrNull()
+    }
+
+    private fun resolveRedirectUrl(rawUrl: String): String {
+        val probeFinal = runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
+        if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http")) {
+            return UrlUtils.cleanSocialUrl(probeFinal)
+        }
+        return rawUrl
+    }
+
+    private fun buildGalleryResolvedMedia(
+        rawUrl: String,
+        extractorName: String,
+        parsed: SocialMediaGalleryParsers.ParsedPost
+    ): ResolvedMedia {
+        val orderedSlides = parsed.slides.mapIndexed { idx, slide ->
+            slide.copy(index = idx)
+        }
+        val streams = orderedSlides.mapIndexed { idx, slide ->
+            MediaStream(
+                id = slide.id,
+                url = slide.mediaUrl,
+                type = slide.type,
+                container = slide.container,
+                label = if (slide.type == MediaType.VIDEO) "Slide ${idx + 1} (Video)" else "Photo ${idx + 1} (${slide.container.uppercase()})",
+                width = slide.width,
+                height = slide.height,
+                sizeBytes = slide.sizeBytes,
+                isHls = false,
+                headers = slide.headers
+            )
+        }
+        return ResolvedMedia(
+            sourceUrl = rawUrl,
+            title = parsed.title?.takeIf { it.isNotBlank() } ?: "$extractorName Post",
+            thumbnailUrl = parsed.thumbnailUrl ?: orderedSlides.firstOrNull()?.thumbnailUrl,
+            streams = streams,
+            extractor = extractorName,
+            gallerySlides = orderedSlides,
+            postId = parsed.postId ?: UrlUtils.extractPostId(rawUrl)
+        )
     }
 
     // =========================================================================
@@ -203,7 +266,7 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        // Method 0: High-speed FastDL resolver (direct progressive CDN MP4)
+        // Method 0: High-speed FastDL resolver (supports carousels, mixed slides, single photos & Reels)
         runCatching {
             val fastDlHeaders = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -213,71 +276,38 @@ class SocialMediaExtractor @Inject constructor(
                 "X-Requested-With" to "XMLHttpRequest",
                 "Accept" to "*/*"
             )
-            val canonicalUrl = if (rawUrl.contains("/p/")) "https://www.instagram.com/p/$shortcode/" else "https://www.instagram.com/reel/$shortcode/"
+            val canonicalUrl = if (rawUrl.contains("/p/", ignoreCase = true)) {
+                "https://www.instagram.com/p/$shortcode/"
+            } else {
+                "https://www.instagram.com/reel/$shortcode/"
+            }
             val postBody = "q=" + URLEncoder.encode(canonicalUrl, "UTF-8") + "&t=media&lang=en&v=v2"
             val respJson = http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
             val jsonRoot = JSONObject(respJson)
             if (jsonRoot.optString("status") == "ok") {
                 val dataHtml = jsonRoot.optString("data")
                 if (dataHtml.isNotBlank()) {
-                    val doc = Jsoup.parse(dataHtml)
-                    val img = doc.select("div.download-items__thumb img").firstOrNull()
-                    val thumbUrl = img?.let { el ->
-                        el.attr("data-src").takeIf { it.isNotBlank() } ?: el.attr("src")
-                    }
-                    if (!thumbUrl.isNullOrBlank() && thumbUrl.startsWith("http")) {
-                        capturedThumb = thumbUrl
-                    }
-
-                    doc.select("a[href]").forEach { a ->
-                        val href = a.attr("href")
-                        val title = a.attr("title").ifBlank { a.text() }.trim()
-                        if (href.startsWith("http") && !title.contains("SoundCloud", ignoreCase = true) && !title.contains("other video", ignoreCase = true)) {
-                            var directMediaUrl = href
-                            if (href.contains("token=")) {
-                                runCatching {
-                                    val token = href.substringAfter("token=").substringBefore('&')
-                                    val parts = token.split('.')
-                                    if (parts.size >= 2) {
-                                        val payloadBase64 = parts[1]
-                                        val decodedBytes = Base64.decode(payloadBase64, Base64.URL_SAFE or Base64.NO_PADDING)
-                                        val payloadJson = JSONObject(String(decodedBytes, Charsets.UTF_8))
-                                        val innerUrl = payloadJson.optString("url")
-                                        if (innerUrl.isNotBlank() && innerUrl.startsWith("http")) {
-                                            directMediaUrl = innerUrl
-                                        }
-                                    }
-                                }
-                            }
-                            val isThumbnail = title.contains("Thumbnail", ignoreCase = true)
-                            val isExplicitImage = title.contains("Image", ignoreCase = true) || title.contains("Photo", ignoreCase = true)
-                            val urlClean = directMediaUrl.lowercase().substringBefore('?')
-                            val isImageExt = urlClean.endsWith(".jpg") || urlClean.endsWith(".jpeg") || urlClean.endsWith(".png") || urlClean.endsWith(".webp")
-                            val isVideo = title.contains("Video", ignoreCase = true) || urlClean.endsWith(".mp4")
-
-                            if (isThumbnail) {
-                                if (capturedThumb == null && directMediaUrl.startsWith("http")) {
-                                    capturedThumb = directMediaUrl
-                                }
-                                addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Cover Photo (HD)")
-                            } else if (isVideo) {
-                                addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
-                            } else if (isExplicitImage || isImageExt) {
-                                addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Photo (HD)")
-                            } else {
-                                if (directMediaUrl.contains(".mp4")) {
-                                    addCandidate(directMediaUrl, MediaType.VIDEO, "mp4", "High quality (HD 720p)")
-                                } else {
-                                    addCandidate(directMediaUrl, MediaType.IMAGE, "jpg", "Photo (HD)")
-                                }
-                            }
+                    val parsedFastDl = SocialMediaGalleryParsers.parseInstagramFastDlHtml(
+                        dataHtml = dataHtml,
+                        shortcode = shortcode,
+                        headers = defaultHeaders
+                    )
+                    if (parsedFastDl != null) {
+                        if (parsedFastDl.slides.isNotEmpty()) {
+                            return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedFastDl)
+                        }
+                        if (capturedThumb == null && !parsedFastDl.thumbnailUrl.isNullOrBlank()) {
+                            capturedThumb = parsedFastDl.thumbnailUrl
+                        }
+                        parsedFastDl.videoStreams.forEach { v ->
+                            addCandidate(v.url, MediaType.VIDEO, v.container, v.label, v.width, v.height)
                         }
                     }
                 }
             }
         }
 
-        // Method 1: Snaptube Polaris LoggedOut Desktop GraphQL API
+        // Method 1: Polaris LoggedOut Desktop GraphQL API (full carousel_media / edge_sidecar_to_children + DASH)
         if (rawStreams.isEmpty() && mediaId != null) {
             runCatching {
                 val polarisHeaders = mapOf(
@@ -291,11 +321,15 @@ class SocialMediaExtractor @Inject constructor(
                     URLEncoder.encode("{\"media_id\":\"$mediaId\"}", "UTF-8") +
                     "&doc_id=27130156389949648"
                 val polarisJson = http.postForm("https://www.instagram.com/api/graphql", polarisBody, polarisHeaders)
+                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(polarisJson, shortcode, defaultHeaders)
+                if (parsed != null && parsed.slides.isNotEmpty()) {
+                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsed)
+                }
                 parseMediaPayload(polarisJson)
             }
         }
 
-        // Method 2: GraphQL queries with doc_id 8845758582119845
+        // Method 2: GraphQL query with doc_id 8845758582119845
         if (rawStreams.isEmpty()) {
             runCatching {
                 val docHeaders = mapOf(
@@ -305,15 +339,23 @@ class SocialMediaExtractor @Inject constructor(
                 val docUrl = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" +
                     URLEncoder.encode("{\"shortcode\":\"$shortcode\"}", "UTF-8")
                 val docJson = http.fetchString(docUrl, docHeaders)
+                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(docJson, shortcode, defaultHeaders)
+                if (parsed != null && parsed.slides.isNotEmpty()) {
+                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsed)
+                }
                 parseMediaPayload(docJson)
             }
         }
 
-        // Method 3: Embed page captioned
+        // Method 3: Embed page captioned (supports embedded sidecar JSON, single photos & videos)
         if (rawStreams.isEmpty()) {
             val embedUrl = "https://www.instagram.com/p/$shortcode/embed/captioned/"
             val html = runCatching { http.fetchString(embedUrl, defaultHeaders) }.getOrNull().orEmpty()
             if (html.isNotBlank()) {
+                val parsedEmbed = SocialMediaGalleryParsers.parseInstagramEmbedHtml(html, shortcode, defaultHeaders)
+                if (parsedEmbed != null && parsedEmbed.slides.isNotEmpty()) {
+                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedEmbed)
+                }
                 parseMediaPayload(html)
                 val doc = Jsoup.parse(html, embedUrl)
                 doc.select("video[src], video source[src]").forEach { el ->
@@ -543,7 +585,17 @@ class SocialMediaExtractor @Inject constructor(
             addCandidate(match.groupValues[1], MediaType.VIDEO, "mp4", "Fast (360p SD)", height = 360)
         }
 
-        if (rawStreams.isEmpty()) return@coroutineScope null
+        if (rawStreams.isEmpty()) {
+            val parsedPhotos = SocialMediaGalleryParsers.parseFacebookPhotoHtml(
+                html = html,
+                sourceUrl = resolvedUrl,
+                headers = desktopHeaders
+            )
+            if (parsedPhotos != null && parsedPhotos.slides.isNotEmpty()) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Facebook", parsedPhotos)
+            }
+            return@coroutineScope null
+        }
 
         // Probe exact sizes
         val probed = rawStreams.values.take(10).map { stream ->
@@ -640,6 +692,15 @@ class SocialMediaExtractor @Inject constructor(
             val root = runCatching { JSONObject(jsonText) }.getOrNull()
             val data = root?.optJSONObject("data")
             if (data != null) {
+                // Photo Mode slideshow (`data.images[]`) -> Multi-Image Bottom Sheet
+                val parsedPhotos = SocialMediaGalleryParsers.parseTikTokPhotoFromApiData(
+                    data = data,
+                    postId = UrlUtils.extractPostId(canonicalUrl)
+                )
+                if (parsedPhotos != null && parsedPhotos.slides.isNotEmpty()) {
+                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "TikTok", parsedPhotos)
+                }
+
                 val streams = mutableListOf<MediaStream>()
                 val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
                 val play = data.optString("play").takeIf { it.startsWith("http") }
@@ -723,6 +784,14 @@ class SocialMediaExtractor @Inject constructor(
         )
         val html = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
         if (html.isNotBlank()) {
+            val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
+                html = html,
+                postId = UrlUtils.extractPostId(canonicalUrl),
+                headers = desktopHeaders
+            )
+            if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "TikTok", parsedPhotoHtml)
+            }
             val playAddrRegex = Regex("\"playAddr\"\\s*:\\s*\"([^\"]+)\"")
             val playUrl = playAddrRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
             val musicRegex = Regex("\"playUrl\"\\s*:\\s*\"([^\"]+)\"")
@@ -776,7 +845,7 @@ class SocialMediaExtractor @Inject constructor(
     }
 
     // =========================================================================
-    // 4. X / TWITTER (vxtwitter + fxtwitter APIs)
+    // 4. X / TWITTER (vxtwitter + fxtwitter + syndication — Photos, Mixed & Videos)
     // =========================================================================
 
     private suspend fun extractTwitter(rawUrl: String): ResolvedMedia? = coroutineScope {
@@ -786,59 +855,32 @@ class SocialMediaExtractor @Inject constructor(
 
         val apis = listOf(
             "https://api.vxtwitter.com/$user/status/$statusId",
-            "https://api.fxtwitter.com/$user/status/$statusId"
+            "https://api.fxtwitter.com/$user/status/$statusId",
+            "https://cdn.syndication.twimg.com/tweet-result?id=$statusId&token=a"
         )
 
         for (apiUrl in apis) {
             val jsonText = runCatching { http.fetchString(apiUrl) }.getOrNull() ?: continue
-            val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: continue
-            val mediaArr = root.optJSONArray("media_extended")
-                ?: root.optJSONObject("tweet")?.optJSONObject("media")?.optJSONArray("videos")
-                ?: continue
+            val parsed = SocialMediaGalleryParsers.parseTwitterApiJson(jsonText, user, statusId) ?: continue
 
-            val streams = mutableListOf<MediaStream>()
-            var thumb: String? = null
-            for (i in 0 until mediaArr.length()) {
-                val item = mediaArr.optJSONObject(i) ?: continue
-                val mType = item.optString("type").lowercase()
-                val mUrl = item.optString("url")
-                if (thumb == null) thumb = item.optString("thumbnail_url").takeIf { it.startsWith("http") }
-                if ((mType == "video" || mType == "gif") && mUrl.startsWith("http")) {
-                    val sizeObj = item.optJSONObject("size")
-                    val w = sizeObj?.optInt("width", 0)?.takeIf { it > 0 }
-                    val h = sizeObj?.optInt("height", 0)?.takeIf { it > 0 }
-                    val info = runCatching { http.probe(mUrl) }.getOrNull()
-                    val label = when {
-                        h != null && h >= 1080 -> "${h}p FHD"
-                        h != null && h >= 720 -> "${h}p HD"
-                        h != null -> "${h}p"
-                        else -> "HD Video"
-                    }
-                    streams += MediaStream(
-                        id = "tw-$i",
-                        url = mUrl,
-                        type = MediaType.VIDEO,
-                        container = "mp4",
-                        label = label,
-                        width = w,
-                        height = h,
-                        sizeBytes = info?.contentLength?.takeIf { it > 0 },
-                        isHls = false
-                    )
-                }
+            if (parsed.slides.isNotEmpty()) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "X / Twitter", parsed)
             }
 
-            if (streams.isNotEmpty()) {
-                val title = root.optString("text").takeIf { it.isNotBlank() }?.take(80)
-                    ?: root.optJSONObject("tweet")?.optString("text")?.take(80)
-                    ?: "X Video (@$user)"
-
+            if (parsed.videoStreams.isNotEmpty()) {
+                val probedVideos = parsed.videoStreams.map { stream ->
+                    async {
+                        val info = runCatching { http.probe(stream.url) }.getOrNull()
+                        if (info != null && info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
+                    }
+                }.awaitAll()
                 return@coroutineScope ResolvedMedia(
                     sourceUrl = rawUrl,
-                    title = title,
-                    thumbnailUrl = thumb,
-                    streams = streams,
-                    extractor = "X / Twitter"
+                    title = parsed.title ?: "X Video (@$user)",
+                    thumbnailUrl = parsed.thumbnailUrl,
+                    streams = probedVideos,
+                    extractor = "X / Twitter",
+                    postId = statusId
                 )
             }
         }
@@ -902,114 +944,106 @@ class SocialMediaExtractor @Inject constructor(
     }
 
     // =========================================================================
-    // 5. PINTEREST (Original HD Photo + Pin Video extraction)
+    // 5. PINTEREST (pin.it, Single Pins, Carousel Pins, Idea/Story Pins, Pin Videos)
     // =========================================================================
+
     private suspend fun extractPinterest(rawUrl: String): ResolvedMedia? = coroutineScope {
         val desktopHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer" to "https://www.pinterest.com/"
         )
 
-        val html = runCatching { http.fetchString(rawUrl, desktopHeaders) }.getOrNull().orEmpty()
-        if (html.isBlank()) return@coroutineScope null
-
-        val titleRegex = Regex("<title>([^<]+)</title>")
-        val rawTitle = titleRegex.find(html)?.groupValues?.getOrNull(1).orEmpty()
-        val cleanTitle = rawTitle.replace("| Pinterest", "").replace("- Pinterest", "").trim()
-            .ifBlank { "Pinterest Pin" }
-
-        val streams = mutableListOf<MediaStream>()
-        var thumb: String? = null
-
-        // 1. Video extraction (v.pinimg.com)
-        val videoRegex = Regex("https://[a-zA-Z0-9.-]*pinimg\\.com/[a-zA-Z0-9_/-]+\\.mp4")
-        val videoUrls = videoRegex.findAll(html).map { it.value }.distinct().toList()
-        for ((idx, vUrl) in videoUrls.withIndex()) {
-            val vInfo = runCatching { http.probe(vUrl, desktopHeaders) }.getOrNull()
-            streams += MediaStream(
-                id = "pin-video-$idx",
-                url = vUrl,
-                type = MediaType.VIDEO,
-                container = "mp4",
-                label = "High quality (HD)",
-                height = 720,
-                sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
-                isHls = false
-            )
-        }
-
-        // 2. Original HD image extraction (i.pinimg.com/originals/) or high-res 736x fallback
-        val origRegex = Regex("https://i\\.pinimg\\.com/originals/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
-        val origUrls = origRegex.findAll(html).map { it.value }.distinct().toList()
-        val candidateImgUrls = if (origUrls.isNotEmpty()) {
-            origUrls
+        val canonicalUrl = if (rawUrl.contains("pin.it", ignoreCase = true)) {
+            resolveRedirectUrl(rawUrl)
         } else {
-            Regex("https://i\\.pinimg\\.com/736x/[a-zA-Z0-9_/-]+\\.(?:jpg|png|webp|jpeg)")
-                .findAll(html).map { it.value }.distinct().toList()
+            rawUrl
+        }
+        val pinId = pinterestPinIdRegex.find(canonicalUrl)?.groupValues?.getOrNull(1)
+
+        val html = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
+        var parsed = if (html.isNotBlank()) {
+            SocialMediaGalleryParsers.parsePinterestHtml(html, pinId, desktopHeaders)
+        } else {
+            null
         }
 
-        if (candidateImgUrls.isNotEmpty()) {
-            val probedImages = candidateImgUrls.take(6).map { imgUrl ->
+        // Resilient fallback: Pinterest public PinResource JSON endpoint when HTML lacks full pin payload
+        if (parsed == null && !pinId.isNullOrBlank()) {
+            runCatching {
+                val dataParam = URLEncoder.encode(
+                    "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"detailed\"}}",
+                    "UTF-8"
+                )
+                val apiUrl = "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam"
+                val apiHeaders = desktopHeaders + mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Accept" to "application/json"
+                )
+                val apiJson = http.fetchString(apiUrl, apiHeaders)
+                parsed = SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
+            }
+        }
+
+        val resolved = parsed ?: return@coroutineScope null
+
+        // Multi-image Carousel / Idea Pin / Single Image Pin -> Multi-Image Bottom Sheet
+        if (resolved.slides.isNotEmpty()) {
+            // Verify upgraded /originals/ URLs when single-image; fall back to thumbnailUrl if /originals/ 404s
+            val verifiedSlides = resolved.slides.mapIndexed { idx, slide ->
                 async {
-                    val info = runCatching { http.probe(imgUrl, desktopHeaders) }.getOrNull()
-                    val size = info?.contentLength?.takeIf { it > 0 } ?: 0L
-                    val ext = UrlUtils.fileExtension(imgUrl) ?: "jpg"
-                    Triple(imgUrl, size, ext)
+                    if (slide.type == MediaType.IMAGE &&
+                        slide.mediaUrl.contains("/originals/", ignoreCase = true) &&
+                        slide.thumbnailUrl != slide.mediaUrl &&
+                        idx < 12
+                    ) {
+                        val info = runCatching { http.probe(slide.mediaUrl, desktopHeaders) }.getOrNull()
+                        if (info != null && info.code in 200..299) {
+                            slide.copy(sizeBytes = info.contentLength.takeIf { it > 0 })
+                        } else if (info != null && info.code == 404) {
+                            // Try .png variant before falling back to 736x/thumbnail
+                            val altExt = if (slide.mediaUrl.endsWith(".jpg", ignoreCase = true)) {
+                                slide.mediaUrl.dropLast(4) + ".png"
+                            } else null
+                            val altInfo = altExt?.let { runCatching { http.probe(it, desktopHeaders) }.getOrNull() }
+                            if (altExt != null && altInfo != null && altInfo.code in 200..299) {
+                                slide.copy(
+                                    mediaUrl = altExt,
+                                    container = "png",
+                                    sizeBytes = altInfo.contentLength.takeIf { it > 0 }
+                                )
+                            } else {
+                                slide.copy(mediaUrl = slide.thumbnailUrl)
+                            }
+                        } else {
+                            slide
+                        }
+                    } else {
+                        slide
+                    }
                 }
             }.awaitAll()
 
-            val maxSize = probedImages.maxOfOrNull { it.second } ?: 0L
-            val validImages = if (maxSize >= 50_000L) {
-                probedImages.filter { it.second >= 25_000L }
-            } else {
-                probedImages
-            }.sortedByDescending { it.second }
-
-            for ((idx, entry) in validImages.withIndex()) {
-                val (imgUrl, size, ext) = entry
-                if (thumb == null) thumb = imgUrl
-                val label = if (idx == 0) "Photo (Original HD)" else "Photo (Standard)"
-                streams += MediaStream(
-                    id = "pin-img-$idx",
-                    url = imgUrl,
-                    type = MediaType.IMAGE,
-                    container = ext,
-                    label = label,
-                    sizeBytes = size.takeIf { it > 0 },
-                    isHls = false
-                )
-            }
+            return@coroutineScope buildGalleryResolvedMedia(
+                rawUrl = rawUrl,
+                extractorName = "Pinterest",
+                parsed = resolved.copy(slides = verifiedSlides)
+            )
         }
 
-        // 4. Meta tags og:image / twitter:image fallback
-        if (streams.isEmpty()) {
-            val ogImageRegex = Regex("<meta\\s+(?:property|name)=[\"'](?:og:image|twitter:image)[\"']\\s+content=[\"']([^\"']+)[\"']")
-            ogImageRegex.findAll(html).map { it.groupValues[1] }.firstOrNull { it.startsWith("http") }?.let { ogImg ->
-                thumb = ogImg
-                val ext = UrlUtils.fileExtension(ogImg) ?: "jpg"
-                val info = runCatching { http.probe(ogImg, desktopHeaders) }.getOrNull()
-                streams += MediaStream(
-                    id = "pin-img-og",
-                    url = ogImg,
-                    type = MediaType.IMAGE,
-                    container = ext,
-                    label = "Photo (HD)",
-                    sizeBytes = info?.contentLength?.takeIf { it > 0 },
-                    isHls = false
-                )
-            }
-        }
-
-        if (streams.isEmpty()) return@coroutineScope null
-
-        // 5. If video exists, synthesize companion audio options
-        val videos = streams.filter { it.type == MediaType.VIDEO }
-        val audios = if (videos.isNotEmpty()) {
-            val v = videos.first()
+        // Single Video Pin -> existing video + synthesized audio flow (zero regression)
+        if (resolved.videoStreams.isNotEmpty()) {
+            val probedVideos = resolved.videoStreams.map { v ->
+                async {
+                    val info = runCatching { http.probe(v.url, desktopHeaders) }.getOrNull()
+                    if (info != null && info.contentLength > 0) v.copy(sizeBytes = info.contentLength) else v
+                }
+            }.awaitAll()
+            val v = probedVideos.first()
             val vBytes = v.sizeBytes ?: 0L
             val estM4a = if (vBytes > 0L) (vBytes * 16L / 100L).coerceAtLeast(150_000L) else null
             val estMp3 = if (vBytes > 0L) (vBytes * 20L / 100L).coerceAtLeast(180_000L) else null
-            listOf(
+            val audios = listOf(
                 v.copy(
                     id = "pin-audio-fast",
                     type = MediaType.AUDIO,
@@ -1037,15 +1071,158 @@ class SocialMediaExtractor @Inject constructor(
                     )
                 )
             )
-        } else emptyList()
+            return@coroutineScope ResolvedMedia(
+                sourceUrl = rawUrl,
+                title = resolved.title ?: "Pinterest Pin",
+                thumbnailUrl = resolved.thumbnailUrl,
+                streams = probedVideos + audios,
+                extractor = "Pinterest",
+                postId = pinId
+            )
+        }
 
-        ResolvedMedia(
-            sourceUrl = rawUrl,
-            title = cleanTitle,
-            thumbnailUrl = thumb,
-            streams = streams + audios,
-            extractor = "Pinterest"
+        null
+    }
+
+    // =========================================================================
+    // 6. THREADS (Single Photos, Multi-Image / Mixed Carousels & Videos)
+    // =========================================================================
+
+    private suspend fun extractThreads(rawUrl: String): ResolvedMedia? = coroutineScope {
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Sec-Fetch-Mode" to "navigate",
+            "Referer" to "https://www.threads.net/"
         )
+
+        val html = runCatching { http.fetchString(rawUrl, headers) }.getOrNull().orEmpty()
+        if (html.isBlank()) return@coroutineScope null
+
+        val parsed = SocialMediaGalleryParsers.parseThreadsHtml(html, rawUrl, headers)
+            ?: return@coroutineScope null
+
+        if (parsed.slides.isNotEmpty()) {
+            return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Threads", parsed)
+        }
+
+        if (parsed.videoStreams.isNotEmpty()) {
+            val probed = parsed.videoStreams.map { v ->
+                async {
+                    val info = runCatching { http.probe(v.url, headers) }.getOrNull()
+                    if (info != null && info.contentLength > 0) v.copy(sizeBytes = info.contentLength) else v
+                }
+            }.awaitAll()
+            return@coroutineScope ResolvedMedia(
+                sourceUrl = rawUrl,
+                title = parsed.title ?: "Threads Video",
+                thumbnailUrl = parsed.thumbnailUrl,
+                streams = probed,
+                extractor = "Threads",
+                postId = parsed.postId
+            )
+        }
+
+        null
+    }
+
+    // =========================================================================
+    // 7. REDDIT (Galleries, Single Images, Crossposts & Reddit Videos)
+    // =========================================================================
+
+    private suspend fun extractReddit(rawUrl: String): ResolvedMedia? = coroutineScope {
+        val redditHeaders = mapOf(
+            "User-Agent" to "android:com.melmeligy.mediadownloader:v2.3 (by /u/mediadownloader)",
+            "Accept" to "application/json, text/html;q=0.9"
+        )
+
+        val host = UrlUtils.host(rawUrl)?.lowercase().orEmpty()
+        if (host == "i.redd.it") {
+            val ext = SocialMediaGalleryParsers.inferImageExt(rawUrl)
+            val slide = GallerySlide(
+                id = "rd-slide-0",
+                index = 0,
+                mediaUrl = rawUrl,
+                thumbnailUrl = rawUrl,
+                type = MediaType.IMAGE,
+                container = ext,
+                headers = redditHeaders,
+                postId = UrlUtils.fileNameFromUrl(rawUrl).substringBeforeLast('.')
+            )
+            return@coroutineScope buildGalleryResolvedMedia(
+                rawUrl = rawUrl,
+                extractorName = "Reddit",
+                parsed = SocialMediaGalleryParsers.ParsedPost(
+                    title = "Reddit Image",
+                    thumbnailUrl = rawUrl,
+                    postId = slide.postId,
+                    slides = listOf(slide)
+                )
+            )
+        }
+
+        val baseNoQuery = rawUrl.substringBefore('?').trimEnd('/')
+        val jsonUrl = if (baseNoQuery.endsWith(".json", ignoreCase = true)) {
+            "$baseNoQuery?raw_json=1"
+        } else {
+            "$baseNoQuery.json?raw_json=1"
+        }
+
+        val jsonText = runCatching { http.fetchString(jsonUrl, redditHeaders) }.getOrNull()
+        val parsed = jsonText?.let { SocialMediaGalleryParsers.parseRedditJson(it, redditHeaders) }
+
+        if (parsed != null) {
+            if (parsed.slides.isNotEmpty()) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Reddit", parsed)
+            }
+            if (parsed.videoStreams.isNotEmpty()) {
+                return@coroutineScope ResolvedMedia(
+                    sourceUrl = rawUrl,
+                    title = parsed.title ?: "Reddit Video",
+                    thumbnailUrl = parsed.thumbnailUrl,
+                    streams = parsed.videoStreams,
+                    extractor = "Reddit",
+                    postId = parsed.postId
+                )
+            }
+        }
+
+        // HTML OpenGraph fallback if Reddit JSON endpoint is rate-limited
+        val htmlHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        )
+        val html = runCatching { http.fetchString(rawUrl, htmlHeaders) }.getOrNull().orEmpty()
+        if (html.isNotBlank()) {
+            val doc = Jsoup.parse(html, rawUrl)
+            val ogImg = doc.select("meta[property=og:image]").attr("content").takeIf { it.startsWith("http") }
+            if (ogImg != null && (ogImg.contains("i.redd.it") || ogImg.contains("preview.redd.it"))) {
+                val cleanImg = SocialMediaGalleryParsers.unescape(ogImg)
+                val postId = UrlUtils.extractPostId(rawUrl)
+                val slide = GallerySlide(
+                    id = "rd-slide-0",
+                    index = 0,
+                    mediaUrl = cleanImg,
+                    thumbnailUrl = cleanImg,
+                    type = MediaType.IMAGE,
+                    container = SocialMediaGalleryParsers.inferImageExt(cleanImg),
+                    headers = htmlHeaders,
+                    postId = postId
+                )
+                return@coroutineScope buildGalleryResolvedMedia(
+                    rawUrl = rawUrl,
+                    extractorName = "Reddit",
+                    parsed = SocialMediaGalleryParsers.ParsedPost(
+                        title = doc.select("meta[property=og:title]").attr("content").ifBlank { "Reddit Post" },
+                        thumbnailUrl = cleanImg,
+                        postId = postId,
+                        slides = listOf(slide)
+                    )
+                )
+            }
+        }
+
+        null
     }
 
     private fun probeSocialStream(candidate: MediaStream, headers: Map<String, String>): MediaStream? {

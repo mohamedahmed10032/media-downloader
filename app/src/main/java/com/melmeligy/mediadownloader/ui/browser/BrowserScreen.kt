@@ -68,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.melmeligy.mediadownloader.R
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -425,7 +426,10 @@ fun BrowserScreen(
         val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
             onDismissRequest = { showFormatSheet = false },
-            sheetState = sheetState
+            sheetState = sheetState,
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
         ) {
             Column(
                 modifier = Modifier
@@ -435,6 +439,7 @@ fun BrowserScreen(
                 com.melmeligy.mediadownloader.ui.quality.ChooseFormatStateContent(
                     state = formatState,
                     url = currentUrl,
+                    useShimmerLoading = true,
                     onRetry = { openChooseFormatSheet() },
                     onOpenInBrowser = null,
                     onDownload = { stream ->
@@ -442,7 +447,22 @@ fun BrowserScreen(
                             showFormatSheet = false
                             android.widget.Toast.makeText(
                                 context,
-                                "Download started in background",
+                                context.getString(R.string.toast_download_started),
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    },
+                    onDownloadBatch = { slides ->
+                        viewModel.downloadSlides(slides) { count ->
+                            showFormatSheet = false
+                            val msg = if (count > 1) {
+                                context.getString(R.string.toast_batch_download_started, count)
+                            } else {
+                                context.getString(R.string.toast_download_started)
+                            }
+                            android.widget.Toast.makeText(
+                                context,
+                                msg,
                                 android.widget.Toast.LENGTH_SHORT
                             ).show()
                         }
