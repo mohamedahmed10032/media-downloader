@@ -1,6 +1,7 @@
 package com.melmeligy.mediadownloader.extractor
 
 import android.content.Context
+import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
@@ -15,8 +16,12 @@ import com.melmeligy.mediadownloader.download.HlsSegmentDownloader
 import com.melmeligy.mediadownloader.download.MediaStoreWriter
 import com.melmeligy.mediadownloader.download.SegmentedDownloader
 import com.melmeligy.mediadownloader.download.VideoAudioMuxer
+import com.melmeligy.mediadownloader.ui.quality.normalizeAudioOptionSizes
+import com.melmeligy.mediadownloader.ui.quality.prepareSnaptubeStreams
+import com.melmeligy.mediadownloader.ui.share.LoadingSkeletonStyle
 import com.melmeligy.mediadownloader.ui.share.downloadCtaLabel
 import com.melmeligy.mediadownloader.ui.share.extractGallerySlides
+import com.melmeligy.mediadownloader.ui.share.loadingSkeletonStyleForUrl
 import com.melmeligy.mediadownloader.ui.share.masterSelectionLabel
 import com.melmeligy.mediadownloader.ui.share.shouldShowMultiImageSheet
 import com.melmeligy.mediadownloader.util.TestDispatcherProvider
@@ -29,6 +34,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -828,5 +834,247 @@ class MultiImageExtractionAndRoutingTest {
             "https://pin.it/3AbCdEf",
             UrlUtils.cleanSocialUrl("https://pin.it/3AbCdEf?invite_code=abc&sender=123&sfo=1&mt=login")
         )
+    }
+
+    // =========================================================================
+    // 8. Loading Skeleton Routing, TikTok Quality Deduplication & Audio Sizing
+    // =========================================================================
+
+    @Test
+    fun loadingSkeleton_usesNeutralForVideosAndShortLinks_andImageGridOnlyForExplicitPhotoUrls() {
+        // Video URLs and ambiguous/short URLs must NEVER show the 3-column photo grid skeleton
+        val neutralUrls = listOf(
+            "https://www.tiktok.com/@creator/video/7400000000000000001",
+            "https://vm.tiktok.com/ZM8abc123/",
+            "https://vt.tiktok.com/ZS8xyz999/",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.instagram.com/reel/Cxyz123/",
+            "https://www.instagram.com/p/Cxyz123/",
+            "https://www.facebook.com/watch/?v=123456",
+            "https://fb.watch/abc123/",
+            "https://pin.it/3AbCdEf",
+            "https://x.com/user/status/1234567890"
+        )
+        for (url in neutralUrls) {
+            assertEquals("Expected NEUTRAL skeleton for $url", LoadingSkeletonStyle.NEUTRAL, loadingSkeletonStyleForUrl(url))
+        }
+
+        // Only explicit photo/gallery URLs show the 3-column image grid skeleton
+        val imageGridUrls = listOf(
+            "https://www.tiktok.com/@creator/photo/7400000000000000002",
+            "https://www.reddit.com/gallery/abc123",
+            "https://i.redd.it/sample_photo.jpg",
+            "https://i.pinimg.com/originals/aa/bb/cc/sample.jpg",
+            "https://pbs.twimg.com/media/abc123.jpg"
+        )
+        for (url in imageGridUrls) {
+            assertEquals("Expected IMAGE_GRID skeleton for $url", LoadingSkeletonStyle.IMAGE_GRID, loadingSkeletonStyleForUrl(url))
+        }
+    }
+
+    @Test
+    fun tiktok_identicalHdAndPlayStreams_deduplicatedToSingleTruthfulQuality() {
+        val data = JSONObject(
+            """
+            {
+              "id": "7411111111111111111",
+              "title": "Duplicate Stream Clip",
+              "duration": 29,
+              "width": 720,
+              "height": 1280,
+              "hdplay": "https://cdn.tikwm.com/video/hd_signed_a.mp4?token=aaa",
+              "play": "https://cdn.tikwm.com/video/sd_signed_b.mp4?token=bbb",
+              "hd_size": 6186598,
+              "size": 6186598
+            }
+            """.trimIndent()
+        )
+
+        val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(data)
+        val videos = streams.filter { it.type == MediaType.VIDEO }
+
+        assertEquals("Identical hd_size and size must collapse to 1 video stream", 1, videos.size)
+        assertEquals(6_186_598L, videos.first().sizeBytes)
+        assertEquals("Portrait 720x1280 must keep truthful 720p short-side resolution", 720, videos.first().height)
+        assertFalse("Must not fabricate a 1080p FHD label for a 720p clip", videos.first().label.contains("1080"))
+
+        // Verify QualityScreen global deduplication also collapses identical-size duplicates
+        val duplicateStreams = listOf(
+            MediaStream(
+                id = "tt-hd",
+                url = "https://cdn.tikwm.com/video/a.mp4?s=1",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "1080p FHD",
+                height = 1080,
+                sizeBytes = 6_186_598L
+            ),
+            MediaStream(
+                id = "tt-sd",
+                url = "https://cdn.tikwm.com/video/b.mp4?s=2",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "720p HD",
+                height = 720,
+                sizeBytes = 6_186_598L
+            )
+        )
+        val prepared = prepareSnaptubeStreams(
+            ResolvedMedia(
+                sourceUrl = "https://www.tiktok.com/@creator/video/7411111111111111111",
+                title = "Duplicate Stream Clip",
+                thumbnailUrl = null,
+                streams = duplicateStreams,
+                extractor = "TikTok"
+            )
+        )
+        assertEquals("prepareSnaptubeStreams must collapse same-byte-size duplicates", 1, prepared.video.size)
+    }
+
+    @Test
+    fun tiktok_genuinelyLargerHdPlay_preservesBothDistinctQualitiesWithTruthfulSizes() {
+        val data = JSONObject(
+            """
+            {
+              "id": "7422222222222222222",
+              "title": "True HD TikTok",
+              "duration": 30,
+              "width": 1080,
+              "height": 1920,
+              "hdplay": "https://cdn.tikwm.com/video/hd_true.mp4",
+              "play": "https://cdn.tikwm.com/video/sd_true.mp4",
+              "hd_size": 12400000,
+              "size": 5900000
+            }
+            """.trimIndent()
+        )
+
+        val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(data)
+        val videos = streams.filter { it.type == MediaType.VIDEO }
+
+        assertEquals(2, videos.size)
+        val hd = videos.first { it.height == 1080 }
+        val sd = videos.first { it.height == 720 }
+        assertEquals(12_400_000L, hd.sizeBytes)
+        assertEquals(5_900_000L, sd.sizeBytes)
+        assertNotEquals(hd.sizeBytes, sd.sizeBytes)
+    }
+
+    @Test
+    fun tiktok_mp3MusicSource_collapsesToSingleTruthfulOriginalMp3WithoutFakeM4aDuplicate() {
+        val data = JSONObject(
+            """
+            {
+              "id": "7433333333333333333",
+              "title": "MP3 Music Clip",
+              "duration": 29,
+              "play": "https://cdn.tikwm.com/video/clip.mp4",
+              "size": 6186598,
+              "music": "https://sf16-ies-music.tiktokcdn.com/obj/ies-music/track.mp3",
+              "music_info": { "duration": 29 }
+            }
+            """.trimIndent()
+        )
+        val musicProbe = HeadInfo(
+            code = 200,
+            contentType = "audio/mpeg",
+            contentLength = 486_093L,
+            acceptsRanges = true,
+            finalUrl = "https://sf16-ies-music.tiktokcdn.com/obj/ies-music/track.mp3"
+        )
+
+        val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
+            data = data,
+            musicProbe = musicProbe
+        )
+        val audios = streams.filter { it.type == MediaType.AUDIO }
+
+        assertEquals("Already-MP3 source must not fabricate a duplicate M4A row", 1, audios.size)
+        assertEquals("mp3", audios.first().container)
+        assertEquals(486_093L, audios.first().sizeBytes)
+        assertTrue(audios.first().headers["X-Internal-Subtitle"].orEmpty().contains("Original MP3"))
+    }
+
+    @Test
+    fun tiktok_m4aMusicSource_emitsDistinctM4aAndTranscoded160kMp3Sizes() {
+        val data = JSONObject(
+            """
+            {
+              "id": "7444444444444444444",
+              "title": "M4A Music Clip",
+              "duration": 30,
+              "play": "https://cdn.tikwm.com/video/clip.mp4",
+              "size": 6186598,
+              "music": "https://cdn.tikwm.com/music/track.m4a",
+              "music_info": { "duration": 30 }
+            }
+            """.trimIndent()
+        )
+        val musicProbe = HeadInfo(
+            code = 200,
+            contentType = "audio/mp4",
+            contentLength = 480_000L,
+            acceptsRanges = true,
+            finalUrl = "https://cdn.tikwm.com/music/track.m4a"
+        )
+
+        val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
+            data = data,
+            musicProbe = musicProbe
+        )
+        val audios = streams.filter { it.type == MediaType.AUDIO }
+
+        assertEquals(2, audios.size)
+        val m4a = audios.first { it.container == "m4a" }
+        val mp3 = audios.first { it.container == "mp3" }
+        assertEquals(480_000L, m4a.sizeBytes)
+        assertNotNull(mp3.sizeBytes)
+        assertTrue("160K MP3 estimate must exceed 128K M4A source size", mp3.sizeBytes!! > m4a.sizeBytes!!)
+        assertNotEquals(m4a.sizeBytes, mp3.sizeBytes)
+    }
+
+    @Test
+    fun audioSizing_distinctTargetBitratesNeverShowIdenticalByteSizes() {
+        val durationSec = 180L
+        val m4a128Bytes = 2_880_000L // 128 kbps * 180s / 8
+
+        val mp370k = FormatUtils.estimateTranscodedAudioBytes(70, durationSec, m4a128Bytes, 128)!!
+        val mp3128k = FormatUtils.estimateTranscodedAudioBytes(128, durationSec, m4a128Bytes, 128)!!
+        val mp3160k = FormatUtils.estimateTranscodedAudioBytes(160, durationSec, m4a128Bytes, 128)!!
+        val mp3320k = FormatUtils.estimateTranscodedAudioBytes(320, durationSec, m4a128Bytes, 128)!!
+
+        assertTrue("Expected 70K ($mp370k) < 128K ($mp3128k)", mp370k < mp3128k)
+        assertTrue("Expected 128K ($mp3128k) < 160K ($mp3160k)", mp3128k < mp3160k)
+        assertTrue("Expected 160K ($mp3160k) < 320K ($mp3320k)", mp3160k < mp3320k)
+
+        // Verify QualityScreen consistency guard fixes any extractor that cloned M4A size onto MP3 160K
+        val cloned = listOf(
+            MediaStream(
+                id = "a-m4a",
+                url = "https://cdn.example.com/audio.m4a",
+                type = MediaType.AUDIO,
+                container = "m4a",
+                label = "Fast",
+                bitrateKbps = 128,
+                sizeBytes = 486_093L,
+                headers = mapOf("X-Internal-Subtitle" to "M4A (128K), best for mobile play")
+            ),
+            MediaStream(
+                id = "a-mp3",
+                url = "https://cdn.example.com/audio.m4a",
+                type = MediaType.AUDIO,
+                container = "mp3",
+                label = "Classic MP3",
+                bitrateKbps = 160,
+                sizeBytes = 486_093L,
+                headers = mapOf("X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker")
+            )
+        )
+        val normalized = normalizeAudioOptionSizes(cloned)
+        val normM4a = normalized.first { it.id == "a-m4a" }
+        val normMp3 = normalized.first { it.id == "a-mp3" }
+        assertEquals(486_093L, normM4a.sizeBytes)
+        assertTrue("Normalized 160K MP3 size must differ from cloned 128K M4A size", normMp3.sizeBytes!! > normM4a.sizeBytes!!)
     }
 }

@@ -415,13 +415,22 @@ class SocialMediaExtractor @Inject constructor(
             }
 
         val audios = if (bestAudio != null) {
+            val srcBytes = bestAudio.sizeBytes?.takeIf { it > 0L }
+            val srcKbps = bestAudio.bitrateKbps?.takeIf { it in 24..512 } ?: 128
+            val mp3Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 160,
+                sourceSizeBytes = srcBytes,
+                sourceBitrateKbps = srcKbps
+            )
+            val srcBytesHeader = if (srcBytes != null) mapOf("X-Internal-Video-Bytes" to srcBytes.toString()) else emptyMap()
             listOf(
                 bestAudio.copy(
                     id = "ig-audio-fast",
                     container = "m4a",
                     label = "Fast",
-                    headers = bestAudio.headers + mapOf(
-                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                    bitrateKbps = srcKbps,
+                    headers = bestAudio.headers + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
                         "X-Internal-Quick" to "true"
                     )
                 ),
@@ -429,7 +438,9 @@ class SocialMediaExtractor @Inject constructor(
                     id = "ig-audio-mp3",
                     container = "mp3",
                     label = "Classic MP3",
-                    headers = bestAudio.headers + mapOf(
+                    bitrateKbps = 160,
+                    sizeBytes = mp3Size,
+                    headers = bestAudio.headers + srcBytesHeader + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )
@@ -639,13 +650,22 @@ class SocialMediaExtractor @Inject constructor(
             }
 
         val audios = if (bestAudio != null) {
+            val srcBytes = bestAudio.sizeBytes?.takeIf { it > 0L }
+            val srcKbps = bestAudio.bitrateKbps?.takeIf { it in 24..512 } ?: 128
+            val mp3Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 160,
+                sourceSizeBytes = srcBytes,
+                sourceBitrateKbps = srcKbps
+            )
+            val srcBytesHeader = if (srcBytes != null) mapOf("X-Internal-Video-Bytes" to srcBytes.toString()) else emptyMap()
             listOf(
                 bestAudio.copy(
                     id = "fb-audio-fast",
                     container = "m4a",
                     label = "Fast",
-                    headers = bestAudio.headers + mapOf(
-                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                    bitrateKbps = srcKbps,
+                    headers = bestAudio.headers + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
                         "X-Internal-Quick" to "true"
                     )
                 ),
@@ -653,7 +673,9 @@ class SocialMediaExtractor @Inject constructor(
                     id = "fb-audio-mp3",
                     container = "mp3",
                     label = "Classic MP3",
-                    headers = bestAudio.headers + mapOf(
+                    bitrateKbps = 160,
+                    sizeBytes = mp3Size,
+                    headers = bestAudio.headers + srcBytesHeader + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )
@@ -706,68 +728,29 @@ class SocialMediaExtractor @Inject constructor(
                     return@coroutineScope buildGalleryResolvedMedia(rawUrl, "TikTok", parsedPhotos)
                 }
 
-                val streams = mutableListOf<MediaStream>()
                 val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
                 val play = data.optString("play").takeIf { it.startsWith("http") }
                 val music = data.optString("music").takeIf { it.startsWith("http") }
-                val hdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
-                val playSize = data.optLong("size", 0L).takeIf { it > 0L }
+                val apiHdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
+                val apiPlaySize = data.optLong("size", 0L).takeIf { it > 0L }
+                val knownSameApiSize = apiHdSize != null && apiPlaySize != null && apiHdSize == apiPlaySize
 
-                if (hdPlay != null) {
-                    streams += MediaStream(
-                        id = "tt-hd",
-                        url = hdPlay,
-                        type = MediaType.VIDEO,
-                        container = "mp4",
-                        label = "1080p FHD (No Watermark)",
-                        height = 1080,
-                        sizeBytes = hdSize,
-                        isHls = false,
-                        headers = mapOf("X-Internal-Quick" to "true")
-                    )
-                }
-                if (play != null && play != hdPlay) {
-                    streams += MediaStream(
-                        id = "tt-sd",
-                        url = play,
-                        type = MediaType.VIDEO,
-                        container = "mp4",
-                        label = "720p HD (No Watermark)",
-                        height = 720,
-                        sizeBytes = playSize,
-                        isHls = false,
-                        headers = mapOf("X-Internal-Quick" to "true")
-                    )
-                }
-                if (music != null) {
-                    val mInfo = runCatching { http.probe(music) }.getOrNull()
-                    streams += MediaStream(
-                        id = "tt-audio-fast",
-                        url = music,
-                        type = MediaType.AUDIO,
-                        container = "m4a",
-                        label = "Fast",
-                        sizeBytes = mInfo?.contentLength?.takeIf { it > 0 },
-                        isHls = false,
-                        headers = mapOf(
-                            "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
-                            "X-Internal-Quick" to "true"
-                        )
-                    )
-                    streams += MediaStream(
-                        id = "tt-audio-mp3",
-                        url = music,
-                        type = MediaType.AUDIO,
-                        container = "mp3",
-                        label = "Classic MP3",
-                        sizeBytes = mInfo?.contentLength?.takeIf { it > 0 },
-                        isHls = false,
-                        headers = mapOf(
-                            "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
-                            "X-Internal-Quick" to "true"
-                        )
-                    )
-                }
+                val hdProbeDef = if (hdPlay != null && !knownSameApiSize && (apiHdSize == null || play != null)) {
+                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(hdPlay) }.getOrNull() } }
+                } else null
+                val playProbeDef = if (play != null && !knownSameApiSize && (apiPlaySize == null || hdPlay != null)) {
+                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(play) }.getOrNull() } }
+                } else null
+                val musicProbeDef = if (music != null) {
+                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(music) }.getOrNull() } }
+                } else null
+
+                val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
+                    data = data,
+                    hdProbe = hdProbeDef?.await(),
+                    playProbe = playProbeDef?.await(),
+                    musicProbe = musicProbeDef?.await()
+                )
 
                 if (streams.isNotEmpty()) {
                     val title = data.optString("title").takeIf { it.isNotBlank() } ?: "TikTok Video"
@@ -805,8 +788,17 @@ class SocialMediaExtractor @Inject constructor(
             val title = titleRegex.find(html)?.groupValues?.getOrNull(1) ?: "TikTok Video"
 
             val streams = mutableListOf<MediaStream>()
+            val videoProbeDef = if (playUrl != null && playUrl.startsWith("http")) {
+                async { withTimeoutOrNull(4_500L) { runCatching { http.probe(playUrl, desktopHeaders) }.getOrNull() } }
+            } else null
+            val musicProbeDef = if (musicUrl != null && musicUrl.startsWith("http")) {
+                async { withTimeoutOrNull(4_500L) { runCatching { http.probe(musicUrl, desktopHeaders) }.getOrNull() } }
+            } else null
+
+            val vInfo = videoProbeDef?.await()
+            val mInfo = musicProbeDef?.await()
+
             if (playUrl != null && playUrl.startsWith("http")) {
-                val info = runCatching { http.probe(playUrl, desktopHeaders) }.getOrNull()
                 streams += MediaStream(
                     id = "tt-page-v",
                     url = playUrl,
@@ -814,25 +806,66 @@ class SocialMediaExtractor @Inject constructor(
                     container = "mp4",
                     label = "High quality (720p HD)",
                     height = 720,
-                    sizeBytes = info?.contentLength?.takeIf { it > 0 },
+                    sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
                     isHls = false
                 )
             }
             if (musicUrl != null && musicUrl.startsWith("http")) {
-                val mInfo = runCatching { http.probe(musicUrl, desktopHeaders) }.getOrNull()
-                streams += MediaStream(
-                    id = "tt-page-a",
-                    url = musicUrl,
-                    type = MediaType.AUDIO,
-                    container = "m4a",
-                    label = "Fast",
-                    sizeBytes = mInfo?.contentLength?.takeIf { it > 0 },
-                    isHls = false,
-                    headers = mapOf(
-                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
-                        "X-Internal-Quick" to "true"
+                val mBytes = mInfo?.contentLength?.takeIf { it > 0L }
+                val ct = mInfo?.contentType?.lowercase().orEmpty()
+                val ext = UrlUtils.fileExtension(mInfo?.finalUrl ?: musicUrl)?.lowercase().orEmpty()
+                val isM4a = ct.contains("mp4") || ct.contains("aac") || ct.contains("m4a") || ext == "m4a" || ext == "aac"
+                val srcBytesHeader = if (mBytes != null) mapOf("X-Internal-Video-Bytes" to mBytes.toString()) else emptyMap()
+                if (!isM4a && (ct.contains("mpeg") || ct.contains("mp3") || ext == "mp3")) {
+                    streams += MediaStream(
+                        id = "tt-page-a-mp3",
+                        url = musicUrl,
+                        type = MediaType.AUDIO,
+                        container = "mp3",
+                        label = "Classic MP3",
+                        bitrateKbps = 128,
+                        sizeBytes = mBytes,
+                        isHls = false,
+                        headers = srcBytesHeader + mapOf(
+                            "X-Internal-Subtitle" to "Original MP3 audio, best compatibility",
+                            "X-Internal-Quick" to "true"
+                        )
                     )
-                )
+                } else {
+                    val estMp3 = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                        targetBitrateKbps = 160,
+                        sourceSizeBytes = mBytes,
+                        sourceBitrateKbps = 128
+                    )
+                    streams += MediaStream(
+                        id = "tt-page-a",
+                        url = musicUrl,
+                        type = MediaType.AUDIO,
+                        container = "m4a",
+                        label = "Fast",
+                        bitrateKbps = 128,
+                        sizeBytes = mBytes,
+                        isHls = false,
+                        headers = srcBytesHeader + mapOf(
+                            "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                            "X-Internal-Quick" to "true"
+                        )
+                    )
+                    streams += MediaStream(
+                        id = "tt-page-a-mp3",
+                        url = musicUrl,
+                        type = MediaType.AUDIO,
+                        container = "mp3",
+                        label = "Classic MP3",
+                        bitrateKbps = 160,
+                        sizeBytes = estMp3,
+                        isHls = false,
+                        headers = srcBytesHeader + mapOf(
+                            "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                            "X-Internal-Quick" to "true"
+                        )
+                    )
+                }
             }
 
             if (streams.isNotEmpty()) {

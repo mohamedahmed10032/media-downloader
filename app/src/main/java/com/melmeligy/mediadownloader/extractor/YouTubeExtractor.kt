@@ -194,6 +194,7 @@ class YouTubeExtractor @Inject constructor(
             sourceUrl = sourceUrl,
             title = title,
             thumbnail = thumbnail,
+            durationSec = durationSec,
             formats = parsedFormats,
             baseHeaders = dlHeaders
         )
@@ -257,6 +258,7 @@ class YouTubeExtractor @Inject constructor(
         sourceUrl: String,
         title: String,
         thumbnail: String,
+        durationSec: Long,
         formats: List<YtFormat>,
         baseHeaders: Map<String, String>
     ): ResolvedMedia? {
@@ -283,22 +285,51 @@ class YouTubeExtractor @Inject constructor(
 
         val musicStreams = mutableListOf<MediaStream>()
         if (primaryM4a != null) {
+            val validDuration = durationSec.takeIf { it > 0L }
+            val primaryKbps = (primaryM4a.bitrate / 1000L).toInt().takeIf { it in 24..512 } ?: 128
             val baseAudioSize = primaryM4a.contentLength
-            val lowAudioSize = lowAudio?.contentLength?.takeIf { it > 0 } ?: baseAudioSize
-            val highAudioSize = highAudio?.contentLength?.takeIf { it > 0 } ?: baseAudioSize
+            val lowKbps = lowAudio?.let { (it.bitrate / 1000L).toInt().takeIf { b -> b in 24..512 } } ?: primaryKbps
+            val highAudioSource = highAudio ?: primaryM4a
+            val highKbps = (highAudioSource.bitrate / 1000L).toInt().takeIf { it in 24..512 } ?: primaryKbps
+            val durationHeader = if (validDuration != null) mapOf("X-Internal-Duration-Seconds" to validDuration.toString()) else emptyMap()
 
-            // 1. Fast M4A (128K) - Shown in compact sheet AND More formats
+            val mp370Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 70,
+                durationSeconds = validDuration,
+                sourceSizeBytes = lowAudio?.contentLength?.takeIf { it > 0L } ?: baseAudioSize,
+                sourceBitrateKbps = lowKbps
+            ) ?: baseAudioSize
+            val mp3128Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 128,
+                durationSeconds = validDuration,
+                sourceSizeBytes = baseAudioSize,
+                sourceBitrateKbps = primaryKbps
+            ) ?: baseAudioSize
+            val mp3160Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 160,
+                durationSeconds = validDuration,
+                sourceSizeBytes = highAudioSource.contentLength.takeIf { it > 0L } ?: baseAudioSize,
+                sourceBitrateKbps = highKbps
+            ) ?: baseAudioSize
+            val mp3320Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 320,
+                durationSeconds = validDuration,
+                sourceSizeBytes = highAudioSource.contentLength.takeIf { it > 0L } ?: baseAudioSize,
+                sourceBitrateKbps = highKbps
+            ) ?: baseAudioSize
+
+            // 1. Fast M4A (original AAC remux, ~128K) - Shown in compact sheet AND More formats
             musicStreams += MediaStream(
                 id = "yt-audio-fast-m4a",
                 url = primaryM4a.url,
                 type = MediaType.AUDIO,
                 container = "m4a",
                 label = "Fast",
-                bitrateKbps = 128,
+                bitrateKbps = primaryKbps,
                 sizeBytes = baseAudioSize,
                 isHls = false,
-                headers = baseHeaders + mapOf(
-                    "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                headers = baseHeaders + durationHeader + mapOf(
+                    "X-Internal-Subtitle" to "M4A (${primaryKbps}K), best for mobile play",
                     "X-Internal-Quick" to "true",
                     "X-Internal-Video-Bytes" to primaryM4a.contentLength.toString()
                 )
@@ -313,9 +344,9 @@ class YouTubeExtractor @Inject constructor(
                     container = "mp3",
                     label = "Classic MP3 (70K)",
                     bitrateKbps = 70,
-                    sizeBytes = lowAudioSize,
+                    sizeBytes = mp370Size,
                     isHls = false,
-                    headers = baseHeaders + mapOf(
+                    headers = baseHeaders + durationHeader + mapOf(
                         "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
                         "X-Internal-Badge" to "Low",
                         "X-Internal-Video-Bytes" to lowAudio.contentLength.toString()
@@ -331,46 +362,45 @@ class YouTubeExtractor @Inject constructor(
                 container = "mp3",
                 label = "Classic MP3 (128K)",
                 bitrateKbps = 128,
-                sizeBytes = baseAudioSize,
+                sizeBytes = mp3128Size,
                 isHls = false,
-                headers = baseHeaders + mapOf(
+                headers = baseHeaders + durationHeader + mapOf(
                     "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
                     "X-Internal-Video-Bytes" to primaryM4a.contentLength.toString()
                 )
             )
 
             // 4. Classic MP3 (160K) - Shown in compact sheet AND More formats (never marked X-Internal-Default)
-            val mp3160Source = highAudio ?: primaryM4a
             musicStreams += MediaStream(
                 id = "yt-audio-mp3-160k",
-                url = mp3160Source.url,
+                url = highAudioSource.url,
                 type = MediaType.AUDIO,
                 container = "mp3",
                 label = "Classic MP3",
                 bitrateKbps = 160,
-                sizeBytes = highAudioSize,
+                sizeBytes = mp3160Size,
                 isHls = false,
-                headers = baseHeaders + mapOf(
+                headers = baseHeaders + durationHeader + mapOf(
                     "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                     "X-Internal-Quick" to "true",
-                    "X-Internal-Video-Bytes" to mp3160Source.contentLength.toString()
+                    "X-Internal-Video-Bytes" to highAudioSource.contentLength.toString()
                 )
             )
 
             // 5. Classic MP3 (320K) [Slow] - Shown in More formats
             musicStreams += MediaStream(
                 id = "yt-audio-mp3-320k",
-                url = mp3160Source.url,
+                url = highAudioSource.url,
                 type = MediaType.AUDIO,
                 container = "mp3",
                 label = "Classic MP3 (320K)",
                 bitrateKbps = 320,
-                sizeBytes = highAudioSize,
+                sizeBytes = mp3320Size,
                 isHls = false,
-                headers = baseHeaders + mapOf(
+                headers = baseHeaders + durationHeader + mapOf(
                     "X-Internal-Subtitle" to "Supports Bluetooth speakers, phones, car stereos, smartwatches, etc",
                     "X-Internal-Badge" to "Slow",
-                    "X-Internal-Video-Bytes" to mp3160Source.contentLength.toString()
+                    "X-Internal-Video-Bytes" to highAudioSource.contentLength.toString()
                 )
             )
         }
@@ -568,6 +598,7 @@ class YouTubeExtractor @Inject constructor(
                 sourceUrl = sourceUrl,
                 title = title,
                 thumbnail = thumb,
+                durationSec = duration,
                 formats = formats,
                 baseHeaders = emptyMap()
             )

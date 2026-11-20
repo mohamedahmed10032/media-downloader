@@ -73,8 +73,11 @@ import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.ui.common.ErrorState
 import com.melmeligy.mediadownloader.ui.common.LoadingState
 import com.melmeligy.mediadownloader.ui.common.asMessage
+import com.melmeligy.mediadownloader.ui.share.LoadingSkeletonStyle
 import com.melmeligy.mediadownloader.ui.share.MultiImageBottomSheetContent
 import com.melmeligy.mediadownloader.ui.share.MultiImageSheetSkeleton
+import com.melmeligy.mediadownloader.ui.share.NeutralSheetLoadingSkeleton
+import com.melmeligy.mediadownloader.ui.share.loadingSkeletonStyleForUrl
 import com.melmeligy.mediadownloader.ui.share.shouldShowMultiImageSheet
 import com.melmeligy.mediadownloader.ui.theme.Indigo
 
@@ -146,7 +149,10 @@ fun ChooseFormatStateContent(
     when (state) {
         is Resource.Loading -> {
             if (useShimmerLoading) {
-                MultiImageSheetSkeleton(contentPadding = contentPadding)
+                when (loadingSkeletonStyleForUrl(url)) {
+                    LoadingSkeletonStyle.IMAGE_GRID -> MultiImageSheetSkeleton(contentPadding = contentPadding)
+                    LoadingSkeletonStyle.NEUTRAL -> NeutralSheetLoadingSkeleton(contentPadding = contentPadding)
+                }
             } else {
                 LoadingState(
                     modifier = Modifier
@@ -744,6 +750,9 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
     val quickImages = rawImages.take(2)
 
     // Normalize & sort video streams in Snaptube order (144p -> 240p -> 360p -> 480p -> 720p -> 1080p -> 2K -> 4K)
+    // and deduplicate streams that resolve to the exact same URL or identical byte size.
+    val seenVideoUrls = HashSet<String>()
+    val seenVideoSizes = HashSet<Long>()
     val rawVideos = resolved.streams
         .filter { it.type == MediaType.VIDEO }
         .distinctBy { it.id }
@@ -751,6 +760,15 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             compareBy<MediaStream> { it.height ?: Int.MAX_VALUE }
                 .thenBy { it.sizeBytes ?: Long.MAX_VALUE }
         )
+        .filter { v ->
+            val cleanUrlKey = com.melmeligy.mediadownloader.intercept.MediaSniffer.dedupeKey(v.url)
+            if (!seenVideoUrls.add(cleanUrlKey)) return@filter false
+            val sz = v.sizeBytes
+            if (!v.isHls && sz != null && sz > 0L) {
+                if (!seenVideoSizes.add(sz)) return@filter false
+            }
+            true
+        }
         .map { v ->
             val h = v.height
             val normalizedLabel = when {
@@ -873,8 +891,13 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             val durationSeconds = companionCarrier.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
                 ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
             val audioBytes = companionCarrier.headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
-            val estM4aSize = audioBytes ?: if (durationSeconds != null && durationSeconds > 0L) (128_000L * durationSeconds) / 8L else null
-            val estMp3Size = audioBytes ?: if (durationSeconds != null && durationSeconds > 0L) (160_000L * durationSeconds) / 8L else null
+            val estM4aSize = audioBytes ?: FormatUtils.estimateTranscodedAudioBytes(128, durationSeconds)
+            val estMp3Size = FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 160,
+                durationSeconds = durationSeconds,
+                sourceSizeBytes = audioBytes,
+                sourceBitrateKbps = 128
+            )
 
             val cleanBase = companionCarrier.headers.filterKeys {
                 !it.equals("X-Internal-Default", ignoreCase = true) &&
@@ -883,6 +906,8 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
                     !it.equals("X-Internal-Dash-VideoOnly", ignoreCase = true) &&
                     !it.equals("X-Internal-Video-Bytes", ignoreCase = true) &&
                     !it.equals("X-Internal-Extract-Audio", ignoreCase = true)
+            } + buildMap {
+                if (audioBytes != null) put("X-Internal-Video-Bytes", audioBytes.toString())
             }
             rawMusic = listOf(
                 MediaStream(
@@ -916,6 +941,11 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             )
         }
     }
+
+    // Consistency guard: if an extractor emitted both M4A (128K) and transcoded MP3 (160K/320K/70K)
+    // backed by the exact same URL and raw source byte size, compute the target-bitrate MP3 size so
+    // distinct bitrate options never show contradictory identical sizes.
+    rawMusic = normalizeAudioOptionSizes(rawMusic)
 
     val quickMusic = rawMusic.filter { it.headers["X-Internal-Quick"] == "true" }
         .ifEmpty { rawMusic.take(2) }
@@ -961,4 +991,57 @@ internal fun selectDefaultStream(prepared: PreparedSnaptubeStreams): MediaStream
     return prepared.music.firstOrNull { it.headers["X-Internal-Default"] == "true" }
         ?: prepared.quickMusic.lastOrNull()
         ?: prepared.music.lastOrNull()
+}
+
+private val audioSubtitleBitrateRegex = Regex("""\((\d{2,3})K\)""", RegexOption.IGNORE_CASE)
+
+internal fun normalizeAudioOptionSizes(music: List<MediaStream>): List<MediaStream> {
+    if (music.size <= 1) return music
+    val byUrl = music.groupBy { it.url }
+    return music.map { stream ->
+        val siblings = byUrl[stream.url].orEmpty()
+        if (siblings.size <= 1) return@map stream
+
+        val curSize = stream.sizeBytes ?: return@map stream
+        if (curSize <= 0L) return@map stream
+
+        val targetKbps = stream.bitrateKbps?.takeIf { it > 0 }
+            ?: audioSubtitleBitrateRegex.find(stream.label)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: audioSubtitleBitrateRegex.find(stream.headers["X-Internal-Subtitle"].orEmpty())?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?: if (stream.container.equals("mp3", ignoreCase = true)) 160 else 128
+
+        val m4aAnchor = siblings.firstOrNull { it.container.equals("m4a", ignoreCase = true) && it.sizeBytes == curSize }
+        val sameSizeDifferentBitrate = siblings.any { other ->
+            if (other.id == stream.id || other.sizeBytes != curSize) return@any false
+            val otherKbps = other.bitrateKbps?.takeIf { it > 0 }
+                ?: audioSubtitleBitrateRegex.find(other.label)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: audioSubtitleBitrateRegex.find(other.headers["X-Internal-Subtitle"].orEmpty())?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: if (other.container.equals("mp3", ignoreCase = true)) 160 else 128
+            otherKbps != targetKbps
+        }
+
+        if (sameSizeDifferentBitrate && stream.container.equals("mp3", ignoreCase = true)) {
+            val anchorKbps = m4aAnchor?.bitrateKbps?.takeIf { it > 0 } ?: 128
+            val durationSec = stream.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+            val adjusted = FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = targetKbps,
+                durationSeconds = durationSec,
+                sourceSizeBytes = curSize,
+                sourceBitrateKbps = anchorKbps
+            )
+            if (adjusted != null && adjusted != curSize) {
+                val updatedHeaders = if (stream.headers["X-Internal-Video-Bytes"] == null) {
+                    stream.headers + ("X-Internal-Video-Bytes" to curSize.toString())
+                } else {
+                    stream.headers
+                }
+                return@map stream.copy(
+                    bitrateKbps = targetKbps,
+                    sizeBytes = adjusted,
+                    headers = updatedHeaders
+                )
+            }
+        }
+        stream
+    }
 }

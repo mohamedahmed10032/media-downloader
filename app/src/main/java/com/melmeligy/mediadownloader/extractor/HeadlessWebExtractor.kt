@@ -274,13 +274,22 @@ class HeadlessWebExtractor @Inject constructor(
 
         val audios = if (bestAudio != null) {
             val cleanAudioHeaders = bestAudio.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+            val srcBytes = bestAudio.sizeBytes?.takeIf { it > 0L }
+            val srcKbps = bestAudio.bitrateKbps?.takeIf { it in 24..512 } ?: 128
+            val mp3Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 160,
+                sourceSizeBytes = srcBytes,
+                sourceBitrateKbps = srcKbps
+            )
+            val srcBytesHeader = if (srcBytes != null) mapOf("X-Internal-Video-Bytes" to srcBytes.toString()) else emptyMap()
             listOf(
                 bestAudio.copy(
                     id = "hl-audio-fast",
                     container = "m4a",
                     label = "Fast",
-                    headers = cleanAudioHeaders + mapOf(
-                        "X-Internal-Subtitle" to "M4A (128K), best for mobile play",
+                    bitrateKbps = srcKbps,
+                    headers = cleanAudioHeaders + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
                         "X-Internal-Quick" to "true"
                     )
                 ),
@@ -288,7 +297,9 @@ class HeadlessWebExtractor @Inject constructor(
                     id = "hl-audio-mp3",
                     container = "mp3",
                     label = "Classic MP3",
-                    headers = cleanAudioHeaders + mapOf(
+                    bitrateKbps = 160,
+                    sizeBytes = mp3Size,
+                    headers = cleanAudioHeaders + srcBytesHeader + mapOf(
                         "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )

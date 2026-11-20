@@ -67,10 +67,40 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.melmeligy.mediadownloader.R
+import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.ui.theme.Indigo
+
+/** Loading placeholder style chosen upfront from URL shape before metadata arrives. */
+internal enum class LoadingSkeletonStyle { NEUTRAL, IMAGE_GRID }
+
+/**
+ * Picks the loading skeleton style strictly from the shared URL:
+ * - [LoadingSkeletonStyle.IMAGE_GRID] ONLY when the URL explicitly identifies a photo gallery
+ *   or direct image asset (e.g., TikTok `/photo/`, Reddit `/gallery/`, `i.redd.it`, `i.pinimg.com`,
+ *   `pbs.twimg.com/media`, or an explicit image file extension).
+ * - [LoadingSkeletonStyle.NEUTRAL] for all video URLs (TikTok videos, YouTube, Instagram Reels,
+ *   Facebook Watch) and all ambiguous/short links (`vm.tiktok.com`, `pin.it`, `t.co`, `/p/`, etc.)
+ *   so the sheet never misleads the user with a photo grid before switching to video formats.
+ */
+internal fun loadingSkeletonStyleForUrl(url: String): LoadingSkeletonStyle {
+    val trimmed = url.trim()
+    if (trimmed.isBlank()) return LoadingSkeletonStyle.NEUTRAL
+    val lower = trimmed.lowercase()
+    val host = UrlUtils.host(trimmed)?.lowercase().orEmpty()
+
+    val isExplicitGalleryPath =
+        (host.contains("tiktok.com") && lower.contains("/photo/")) ||
+            (host.contains("reddit.com") && lower.contains("/gallery/")) ||
+            host == "i.redd.it" ||
+            host == "i.pinimg.com" ||
+            (host == "pbs.twimg.com" && lower.contains("/media/")) ||
+            UrlUtils.fileExtension(trimmed) in UrlUtils.IMAGE_EXTENSIONS
+
+    return if (isExplicitGalleryPath) LoadingSkeletonStyle.IMAGE_GRID else LoadingSkeletonStyle.NEUTRAL
+}
 
 /**
  * Smart routing predicate:
@@ -542,6 +572,151 @@ fun MultiImageSheetSkeleton(
                     .background(shimmerBrush)
             )
         }
+    }
+}
+
+/**
+ * Clean, neutral loading skeleton styled in Media Downloader's Indigo/Material 3 theme.
+ * Used for video URLs and ambiguous/short links so the sheet never misleads the user with
+ * a 3-column photo grid before switching to the video format selector.
+ */
+@Composable
+fun NeutralSheetLoadingSkeleton(
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(0.dp)
+) {
+    val transition = rememberInfiniteTransition(label = "NeutralSheetShimmer")
+    val shimmerX by transition.animateFloat(
+        initialValue = -300f,
+        targetValue = 900f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1150, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "NeutralShimmerOffset"
+    )
+
+    val base = MaterialTheme.colorScheme.surfaceVariant
+    val highlight = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+    val shimmerBrush = Brush.linearGradient(
+        colors = listOf(base, base.copy(alpha = 0.55f), highlight, base),
+        start = Offset(shimmerX - 240f, 0f),
+        end = Offset(shimmerX, 240f)
+    )
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(contentPadding)
+            .padding(horizontal = 20.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = stringResource(R.string.sheet_download_title),
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontSize = 21.sp,
+                fontWeight = FontWeight.Bold
+            ),
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "Fetching available formats…",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        androidx.compose.material3.LinearProgressIndicator(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .clip(RoundedCornerShape(2.dp)),
+            color = Indigo,
+            trackColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Compact neutral media preview card placeholder
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                .padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(width = 64.dp, height = 44.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(shimmerBrush)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.75f)
+                        .height(14.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(shimmerBrush)
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.42f)
+                        .height(11.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(shimmerBrush)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 2 neutral option rows (fits both video/audio formats and generic media neutrally)
+        repeat(2) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(shimmerBrush)
+                )
+                Spacer(modifier = Modifier.width(14.dp))
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(14.dp)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(shimmerBrush)
+                )
+                Spacer(modifier = Modifier.width(24.dp))
+                Box(
+                    modifier = Modifier
+                        .width(56.dp)
+                        .height(13.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(shimmerBrush)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .clip(RoundedCornerShape(25.dp))
+                .background(shimmerBrush)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 

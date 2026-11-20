@@ -1587,6 +1587,206 @@ internal object SocialMediaGalleryParsers {
         )
     }
 
+    /**
+     * Builds truthful, deduplicated TikTok video and audio streams from a `tikwm` API `data` object
+     * plus optional probed [HeadInfo] measurements.
+     *
+     * - Deduplicates `hdplay` and `play` when they resolve to the same normalized URL, identical
+     *   byte size (within 1% / 4 KB), or when `hdplay` is not genuinely larger than `play`.
+     * - When `music` is already an MP3 (`audio/mpeg` or `.mp3`), collapses cleanly to the single
+     *   truthful original MP3 option instead of fabricating a duplicate M4A row with the same size.
+     * - When `music` is AAC/M4A, emits both M4A (remuxed original size) and Classic MP3 (160K)
+     *   with an accurate target-bitrate estimated size.
+     */
+    fun buildTikTokVideoAndAudioStreams(
+        data: JSONObject,
+        hdProbe: HeadInfo? = null,
+        playProbe: HeadInfo? = null,
+        musicProbe: HeadInfo? = null
+    ): List<MediaStream> {
+        val streams = mutableListOf<MediaStream>()
+
+        val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
+        val play = data.optString("play").takeIf { it.startsWith("http") }
+        val music = data.optString("music").takeIf { it.startsWith("http") }
+
+        val durationSec = data.optLong("duration", 0L).takeIf { it > 0L }
+        val musicDurationSec = data.optJSONObject("music_info")?.optLong("duration", 0L)?.takeIf { it > 0L }
+            ?: durationSec
+        val durationHeader = if (durationSec != null) {
+            mapOf("X-Internal-Duration-Seconds" to durationSec.toString())
+        } else {
+            emptyMap()
+        }
+
+        val apiHdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
+        val apiPlaySize = data.optLong("size", 0L).takeIf { it > 0L }
+        val effectiveHdSize = hdProbe?.contentLength?.takeIf { it > 0L } ?: apiHdSize
+        val effectivePlaySize = playProbe?.contentLength?.takeIf { it > 0L } ?: apiPlaySize
+        val effectiveHdUrl = hdProbe?.finalUrl?.takeIf { it.startsWith("http") } ?: hdPlay
+        val effectivePlayUrl = playProbe?.finalUrl?.takeIf { it.startsWith("http") } ?: play
+
+        val metaWidth = data.optInt("width", 0).takeIf { it > 0 }
+        val metaHeight = data.optInt("height", 0).takeIf { it > 0 }
+        val nominalShortSide = when {
+            metaWidth != null && metaHeight != null -> minOf(metaWidth, metaHeight)
+            metaHeight != null -> metaHeight
+            else -> null
+        }
+
+        val bothPresent = hdPlay != null && play != null
+        val sameStream = if (bothPresent) {
+            val sameUrl = effectiveHdUrl != null && effectivePlayUrl != null &&
+                (effectiveHdUrl == effectivePlayUrl ||
+                    MediaSniffer.dedupeKey(effectiveHdUrl) == MediaSniffer.dedupeKey(effectivePlayUrl))
+            val sameOrNotLargerSize = effectiveHdSize != null && effectivePlaySize != null &&
+                (effectiveHdSize <= effectivePlaySize ||
+                    kotlin.math.abs(effectiveHdSize - effectivePlaySize) <= maxOf(4_096L, effectivePlaySize / 100L))
+            sameUrl || sameOrNotLargerSize
+        } else {
+            false
+        }
+
+        if (bothPresent && !sameStream) {
+            val hdHeight = nominalShortSide?.takeIf { it >= 1080 } ?: 1080
+            streams += MediaStream(
+                id = "tt-hd",
+                url = hdPlay!!,
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "1080p FHD (No Watermark)",
+                width = metaWidth,
+                height = hdHeight,
+                sizeBytes = effectiveHdSize,
+                isHls = false,
+                headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+            )
+            streams += MediaStream(
+                id = "tt-sd",
+                url = play!!,
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "720p HD (No Watermark)",
+                height = 720,
+                sizeBytes = effectivePlaySize,
+                isHls = false,
+                headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+            )
+        } else {
+            val chosenUrl = play ?: hdPlay
+            val chosenSize = if (play != null) effectivePlaySize ?: effectiveHdSize else effectiveHdSize
+            if (chosenUrl != null) {
+                val truthfulHeight = when {
+                    nominalShortSide != null && nominalShortSide >= 1080 -> 1080
+                    nominalShortSide != null && nominalShortSide >= 720 -> 720
+                    nominalShortSide != null && nominalShortSide >= 480 -> nominalShortSide
+                    play == null && hdPlay != null -> 1080
+                    else -> 720
+                }
+                val truthfulLabel = when {
+                    truthfulHeight >= 1080 -> "1080p FHD (No Watermark)"
+                    truthfulHeight >= 720 -> "720p HD (No Watermark)"
+                    else -> "${truthfulHeight}p (No Watermark)"
+                }
+                streams += MediaStream(
+                    id = "tt-video-single",
+                    url = chosenUrl,
+                    type = MediaType.VIDEO,
+                    container = "mp4",
+                    label = truthfulLabel,
+                    width = metaWidth,
+                    height = truthfulHeight,
+                    sizeBytes = chosenSize,
+                    isHls = false,
+                    headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+                )
+            }
+        }
+
+        if (music != null) {
+            val musicBytes = musicProbe?.contentLength?.takeIf { it > 0L }
+            val ct = musicProbe?.contentType?.lowercase().orEmpty()
+            val ext = UrlUtils.fileExtension(musicProbe?.finalUrl ?: music)?.lowercase().orEmpty()
+            val isM4aSource = ct.contains("mp4") || ct.contains("aac") || ct.contains("m4a") || ext == "m4a" || ext == "aac"
+            val isMp3Source = !isM4aSource && (ct.contains("mpeg") || ct.contains("mp3") || ext == "mp3" || ct.isBlank())
+            val inferredKbps = com.melmeligy.mediadownloader.core.util.FormatUtils.inferAudioBitrateKbps(
+                sizeBytes = musicBytes,
+                durationSeconds = musicDurationSec
+            )
+            val audioDurHeader = if (musicDurationSec != null) {
+                mapOf("X-Internal-Duration-Seconds" to musicDurationSec.toString())
+            } else {
+                emptyMap()
+            }
+            val srcBytesHeader = if (musicBytes != null) {
+                mapOf("X-Internal-Video-Bytes" to musicBytes.toString())
+            } else {
+                emptyMap()
+            }
+
+            if (isMp3Source) {
+                // Source is already a single original MP3 track — expose the single truthful original MP3
+                // instead of fabricating a duplicate M4A row with the exact same byte size.
+                val kbpsLabel = inferredKbps?.let { "Original MP3 (${it}K), best compatibility" }
+                    ?: "Original MP3 audio, best compatibility"
+                streams += MediaStream(
+                    id = "tt-audio-mp3",
+                    url = music,
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    bitrateKbps = inferredKbps ?: 128,
+                    sizeBytes = musicBytes,
+                    isHls = false,
+                    headers = audioDurHeader + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to kbpsLabel,
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            } else {
+                // Source is AAC/M4A — offer fast M4A remux (actual size) + genuine 160K Jump3r MP3 transcode
+                val srcKbps = inferredKbps ?: 128
+                val mp3TargetKbps = if (srcKbps == 160) 192 else 160
+                val estMp3Bytes = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                    targetBitrateKbps = mp3TargetKbps,
+                    durationSeconds = musicDurationSec,
+                    sourceSizeBytes = musicBytes,
+                    sourceBitrateKbps = srcKbps
+                )
+                streams += MediaStream(
+                    id = "tt-audio-fast",
+                    url = music,
+                    type = MediaType.AUDIO,
+                    container = "m4a",
+                    label = "Fast",
+                    bitrateKbps = srcKbps,
+                    sizeBytes = musicBytes,
+                    isHls = false,
+                    headers = audioDurHeader + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+                streams += MediaStream(
+                    id = "tt-audio-mp3",
+                    url = music,
+                    type = MediaType.AUDIO,
+                    container = "mp3",
+                    label = "Classic MP3",
+                    bitrateKbps = mp3TargetKbps,
+                    sizeBytes = estMp3Bytes,
+                    isHls = false,
+                    headers = audioDurHeader + srcBytesHeader + mapOf(
+                        "X-Internal-Subtitle" to "MP3 (${mp3TargetKbps}K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Quick" to "true"
+                    )
+                )
+            }
+        }
+
+        return streams
+    }
+
     fun parseTikTokPhotoFromHydrationHtml(
         html: String,
         postId: String?,

@@ -298,12 +298,20 @@ class V220VerificationTest {
         assertEquals("https://googlevideo.test/avc1_1080", v1080.url)
         assertEquals("https://googlevideo.test/m4a_audio", v1080.headers["X-Internal-Companion-Audio"])
 
-        // No audio stream may carry X-Internal-Default=true or fake 185% size multiplier
+        // No audio stream may carry X-Internal-Default=true, and transcoded MP3 rows must reflect
+        // their target CBR bitrate output sizes (100s clip: 70K=875KB, 128K=1.6MB, 160K=2.0MB, 320K=4.0MB)
         val audios = res.streams.filter { it.type == MediaType.AUDIO }
         assertTrue(audios.isNotEmpty())
         assertTrue(audios.none { it.headers["X-Internal-Default"] == "true" })
+        val m4aFast = audios.first { it.id == "yt-audio-fast-m4a" }
+        val mp370 = audios.first { it.id == "yt-audio-mp3-70k" }
+        val mp3160 = audios.first { it.id == "yt-audio-mp3-160k" }
         val mp3320 = audios.first { it.id == "yt-audio-mp3-320k" }
-        assertEquals(1_600_000L, mp3320.sizeBytes)
+        assertEquals(1_600_000L, m4aFast.sizeBytes)
+        assertEquals(875_000L, mp370.sizeBytes)
+        assertEquals(2_000_000L, mp3160.sizeBytes)
+        assertEquals(4_000_000L, mp3320.sizeBytes)
+        assertEquals("1600000", mp3320.headers["X-Internal-Video-Bytes"])
     }
 
     @Test
