@@ -58,7 +58,8 @@ class HlsSegmentDownloader @Inject constructor(
         val byteRangeLength: Long? = null,
         val isInitMap: Boolean = false,
         val keySpec: HlsKeySpec = HlsKeySpec(),
-        val mediaSequence: Long = 0L
+        val mediaSequence: Long = 0L,
+        val discontinuityBlock: Int = 0
     )
 
     suspend fun download(
@@ -228,17 +229,16 @@ class HlsSegmentDownloader @Inject constructor(
         }
         var succeeded = false
         try {
+            val tsNormalizer = MpegTsTimestampNormalizer()
             FileOutputStream(dest, true).use { output ->
-                val copyBuffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
-                for (task in tasks) {
+                for ((index, task) in tasks.withIndex()) {
                     currentCoroutineContext().ensureActive()
                     val partFile = task.await()
-                    partFile.inputStream().use { input ->
-                        while (true) {
-                            val read = input.read(copyBuffer)
-                            if (read == -1) break
-                            output.write(copyBuffer, 0, read)
-                        }
+                    val seg = segments[index]
+                    if (seg.isInitMap) {
+                        partFile.inputStream().use { it.copyTo(output, Constants.DOWNLOAD_BUFFER_SIZE) }
+                    } else {
+                        tsNormalizer.writeSegment(partFile, seg.discontinuityBlock, output)
                     }
                     partFile.delete()
                 }
@@ -492,7 +492,8 @@ class HlsSegmentDownloader @Inject constructor(
         byteRangeLength = byteRangeLength,
         isInitMap = isInitMap,
         keySpec = keySpec,
-        mediaSequence = mediaSequence
+        mediaSequence = mediaSequence,
+        discontinuityBlock = discontinuityBlock
     )
 
     private companion object {

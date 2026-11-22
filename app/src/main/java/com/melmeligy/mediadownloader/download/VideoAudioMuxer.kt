@@ -548,7 +548,9 @@ class VideoAudioMuxer @Inject constructor() {
             val buffer = ByteBuffer.allocateDirect(1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
             var basePtsUs = -1L
+            var maxVideoRawPtsUs = -1L
             var lastVideoRawPtsUs = -1L
+            var maxAudioRawPtsUs = -1L
             var lastAudioRawPtsUs = -1L
             var videoOffsetUs = 0L
             var audioOffsetUs = 0L
@@ -569,14 +571,22 @@ class VideoAudioMuxer @Inject constructor() {
                         if (basePtsUs < 0L) basePtsUs = rawPts
                         val pts = if (trackIndex == videoTrack) {
                             if (lastVideoRawPtsUs >= 0L && abs(rawPts - lastVideoRawPtsUs) > DISCONTINUITY_THRESHOLD_US) {
-                                // Rebase large TS discontinuity (> 2s) smoothly without clamping normal B-frame reorder
-                                videoOffsetUs += (lastVideoRawPtsUs + 33_333L) - rawPts
+                                // Rebase against maxVideoRawPtsUs (not last B-frame PTS) so B-frames never collide across a splice
+                                val anchorUs = maxOf(maxVideoRawPtsUs, lastVideoRawPtsUs)
+                                videoOffsetUs += (anchorUs + 41_667L) - rawPts
+                                maxVideoRawPtsUs = rawPts
+                            } else if (rawPts > maxVideoRawPtsUs) {
+                                maxVideoRawPtsUs = rawPts
                             }
                             lastVideoRawPtsUs = rawPts
                             (rawPts - basePtsUs + videoOffsetUs).coerceAtLeast(0L)
                         } else {
                             if (lastAudioRawPtsUs >= 0L && abs(rawPts - lastAudioRawPtsUs) > DISCONTINUITY_THRESHOLD_US) {
-                                audioOffsetUs += (lastAudioRawPtsUs + 23_220L) - rawPts
+                                val anchorUs = maxOf(maxAudioRawPtsUs, lastAudioRawPtsUs)
+                                audioOffsetUs += (anchorUs + 21_333L) - rawPts
+                                maxAudioRawPtsUs = rawPts
+                            } else if (rawPts > maxAudioRawPtsUs) {
+                                maxAudioRawPtsUs = rawPts
                             }
                             lastAudioRawPtsUs = rawPts
                             (rawPts - basePtsUs + audioOffsetUs).coerceAtLeast(0L)
@@ -766,7 +776,7 @@ class VideoAudioMuxer @Inject constructor() {
         if (!hasVideo && audio == null) return false
 
         val args = mutableListOf(
-            "-fflags", "+genpts+igndts",
+            "-fflags", "+genpts",
             "-i", tsFile.absolutePath,
             "-c", "copy"
         )
@@ -874,7 +884,7 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     private companion object {
-        const val DISCONTINUITY_THRESHOLD_US = 2_000_000L
+        const val DISCONTINUITY_THRESHOLD_US = 1_000_000L
         val AAC_SAMPLE_RATES = intArrayOf(
             96000, 88200, 64000, 48000, 44100, 32000,
             24000, 22050, 16000, 12000, 11025, 8000, 7350
