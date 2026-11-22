@@ -174,7 +174,7 @@ class SegmentedDownloader @Inject constructor(
 
                 var bytesInPass = 0L
                 val expectedPassBytes = chunkEnd - startByte + 1L
-                client.newCall(request).execute().use { response ->
+                client.executeCancellable(request) { response ->
                     if (response.code == 200 && (startByte > 0L || chunkEnd < total - 1L)) {
                         throw RangeNotSupportedException()
                     }
@@ -211,11 +211,13 @@ class SegmentedDownloader @Inject constructor(
             } catch (e: RangeNotSupportedException) {
                 throw e
             } catch (e: MediaException) {
+                currentCoroutineContext().ensureActive()
                 if (isPermanentError(e.error)) throw e
                 attempt++
                 if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
                 delay(400L * attempt)
             } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
                 attempt++
                 if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
                 delay(400L * attempt)
@@ -264,7 +266,7 @@ class SegmentedDownloader @Inject constructor(
                 try {
                     var bytesInPass = 0L
                     var responseContentLength = -1L
-                    client.newCall(request).execute().use { response ->
+                    client.executeCancellable(request) { response ->
                         if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
                         val isPartial = response.code == 206
                         val append = (canResume || existing > 0L) && isPartial
@@ -301,11 +303,13 @@ class SegmentedDownloader @Inject constructor(
                 } catch (ce: kotlinx.coroutines.CancellationException) {
                     throw ce
                 } catch (e: MediaException) {
+                    currentCoroutineContext().ensureActive()
                     if (isPermanentError(e.error)) throw e
                     attempt++
                     if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
                     delay(500L * attempt)
                 } catch (e: Exception) {
+                    currentCoroutineContext().ensureActive()
                     attempt++
                     if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
                     delay(500L * attempt)

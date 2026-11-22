@@ -2,6 +2,7 @@ package com.melmeligy.mediadownloader.download
 
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.extractor.ExtractorHttp
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -153,6 +154,97 @@ class HlsSegmentDownloaderTest {
             fail("Expected MediaException for encrypted stream")
         } catch (e: MediaException) {
             assertTrue(e.message?.contains("encrypted") == true)
+        }
+    }
+
+    @Test
+    fun download_cancelsPromptlyWhenTcpStreamStallsMidRead() = kotlinx.coroutines.runBlocking {
+        val segRequestReceived = java.util.concurrent.CountDownLatch(1)
+        val releaseStalledServer = java.util.concurrent.CountDownLatch(1)
+        val server = java.net.ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))
+        val port = server.localPort
+
+        val serverThread = Thread {
+            try {
+                while (!server.isClosed) {
+                    val socket = try {
+                        server.accept()
+                    } catch (_: Exception) {
+                        break
+                    }
+                    Thread {
+                        socket.use { s ->
+                            val reader = s.getInputStream().bufferedReader()
+                            val requestLine = reader.readLine() ?: return@use
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                            }
+                            val out = s.getOutputStream()
+                            if (requestLine.contains("playlist.m3u8")) {
+                                val body = """
+                                    #EXTM3U
+                                    #EXT-X-TARGETDURATION:10
+                                    #EXTINF:10.0,
+                                    http://127.0.0.1:$port/seg_0.ts
+                                """.trimIndent().toByteArray()
+                                out.write(
+                                    ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                                        "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray()
+                                )
+                                out.write(body)
+                                out.flush()
+                            } else {
+                                out.write(
+                                    ("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n" +
+                                        "Content-Length: 1048576\r\nConnection: close\r\n\r\n").toByteArray()
+                                )
+                                out.write(ByteArray(128) { 0x47 })
+                                out.flush()
+                                segRequestReceived.countDown()
+                                // Stall indefinitely without closing socket until test ends
+                                releaseStalledServer.await(15, java.util.concurrent.TimeUnit.SECONDS)
+                            }
+                        }
+                    }.start()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+
+        try {
+            // Use a long 30s read timeout so passing proves OkHttp call cancellation, not timeout expiry.
+            val client = OkHttpClient.Builder()
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val http = ExtractorHttp(client)
+            val downloader = HlsSegmentDownloader(client, http)
+            val destFile = File(tempFolder.root, "stalled.ts")
+
+            val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                downloader.download("http://127.0.0.1:$port/playlist.m3u8", emptyMap(), destFile) {}
+            }
+
+            assertTrue("Segment request should reach stalled server", segRequestReceived.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Give InputStream.read() a moment to enter blocking wait
+            Thread.sleep(50)
+
+            val startNs = System.nanoTime()
+            kotlinx.coroutines.withTimeout(2000L) {
+                job.cancel()
+                job.join()
+            }
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+            assertTrue("Expected prompt cancellation (< 1500ms) instead of 30s read timeout, took ${elapsedMs}ms", elapsedMs < 1500L)
+
+            val remainingPartDirs = tempFolder.root.listFiles()?.filter { it.name.startsWith("hls_parts_") } ?: emptyList()
+            assertTrue("Temporary part directories should be cleaned up after cancel", remainingPartDirs.isEmpty())
+        } finally {
+            releaseStalledServer.countDown()
+            runCatching { server.close() }
         }
     }
 }

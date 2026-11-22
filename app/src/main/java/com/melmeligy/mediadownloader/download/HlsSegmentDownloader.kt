@@ -246,10 +246,12 @@ class HlsSegmentDownloader @Inject constructor(
                         .header("X-Internal-Download", "true")
                         .get()
                         .build()
-                    client.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use null
+                    client.executeCancellable(req) { resp ->
+                        if (!resp.isSuccessful) return@executeCancellable null
                         resp.body?.bytes()
                     }
+                }.onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
                 }.getOrNull()
             }
 
@@ -289,7 +291,7 @@ class HlsSegmentDownloader @Inject constructor(
                 }
 
                 var retryAfterMs: Long? = null
-                client.newCall(reqBuilder.build()).execute().use { response ->
+                client.executeCancellable(reqBuilder.build()) { response ->
                     if (!response.isSuccessful && response.code != 206) {
                         if (response.code == 429) {
                             retryAfterMs = response.header("Retry-After")?.trim()?.toLongOrNull()
@@ -340,6 +342,7 @@ class HlsSegmentDownloader @Inject constructor(
                 runCatching { partFile.delete() }
                 throw e
             } catch (e: SegmentHttpException) {
+                currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
                 val isRetryable = e.code == 429 || e.code == 408 || e.code in 500..599
@@ -350,6 +353,7 @@ class HlsSegmentDownloader @Inject constructor(
                 val backoffMs = e.retryAfterMs ?: minOf(4_000L, 450L * (1L shl (attempt - 1).coerceAtMost(4)))
                 delay(backoffMs)
             } catch (e: MediaException) {
+                currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
                 if (e.error == AppError.GEO_BLOCKED || e.error == AppError.NO_MEDIA_FOUND || e.error == AppError.EXPIRED_LINK) {
@@ -361,6 +365,7 @@ class HlsSegmentDownloader @Inject constructor(
             } catch (e: Exception) {
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
+                currentCoroutineContext().ensureActive()
                 if (attempt >= maxRetries) throw e
                 attempt++
                 delay(minOf(4_000L, 450L * attempt))

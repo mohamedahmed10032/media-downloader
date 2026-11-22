@@ -34,8 +34,10 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -155,16 +157,19 @@ class DownloadManager @Inject constructor(
     suspend fun pause(id: Long) {
         intents[id] = ControlIntent.PAUSE
         val activeJob = runningJobs[id] ?: retryingJobs[id]
+        // Update status immediately so Home/Downloads UI reflects PAUSED without waiting for socket/muxer teardown.
+        repository.updateStatus(id, DownloadStatus.PAUSED)
         if (activeJob != null) {
             activeJob.cancel()
         } else {
-            repository.updateStatus(id, DownloadStatus.PAUSED)
             intents.remove(id)
         }
+        queueSignal.trySend(Unit)
     }
 
     suspend fun resume(id: Long) {
         intents.remove(id)
+        (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
         val item = repository.getById(id) ?: return
         repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null))
         queueSignal.trySend(Unit)
@@ -173,6 +178,7 @@ class DownloadManager @Inject constructor(
 
     suspend fun retry(id: Long) {
         intents.remove(id)
+        (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
         val item = repository.getById(id) ?: return
         repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null, retryCount = 0))
         queueSignal.trySend(Unit)
@@ -182,13 +188,15 @@ class DownloadManager @Inject constructor(
     suspend fun cancel(id: Long) {
         intents[id] = ControlIntent.CANCEL
         val activeJob = runningJobs[id] ?: retryingJobs[id]
+        // Remove the item immediately so Home/Downloads cards disappear without blocking on I/O cleanup.
+        repository.delete(id)
         if (activeJob != null) {
             activeJob.cancel()
         } else {
-            cleanupStaging(id)
-            repository.delete(id)
+            withContext(dispatchers.io) { cleanupStaging(id) }
             intents.remove(id)
         }
+        queueSignal.trySend(Unit)
     }
 
     suspend fun clearCompleted() = repository.clearCompleted()
@@ -282,6 +290,7 @@ class DownloadManager @Inject constructor(
             capBeforeFinalizing: Boolean = true,
             force: Boolean = false
         ) {
+            if (intents[item.id] != null || !currentCoroutineContext().isActive) return
             val safeDownloaded = maxOf(highWaterDownloaded, downloaded.coerceAtLeast(0L))
             highWaterDownloaded = safeDownloaded
             val safeTotal = if (item.isHls) {
@@ -597,13 +606,13 @@ class DownloadManager @Inject constructor(
             repository.setCompleted(item.id, uri, bytes)
             notifier.notifyComplete(item.id, item.title)
         } catch (ce: CancellationException) {
-            withContext(NonCancellable) { handleCancellation(item, staging) }
+            withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
             throw ce
         } catch (e: Exception) {
             // If the user cancelled or paused (which can surface as IOException on closed sockets),
             // never treat it as a failure or auto-retry.
             if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
-                withContext(NonCancellable) { handleCancellation(item, staging) }
+                withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
                 return
             }
             handleFailure(item, staging, e, queueScope)
@@ -618,7 +627,11 @@ class DownloadManager @Inject constructor(
                 repository.delete(item.id)
             }
             ControlIntent.PAUSE -> repository.updateStatus(item.id, DownloadStatus.PAUSED)
-            null -> repository.updateStatus(item.id, DownloadStatus.QUEUED) // system stop -> resume later
+            null -> {
+                if (repository.getById(item.id) != null) {
+                    repository.updateStatus(item.id, DownloadStatus.QUEUED) // system stop -> resume later
+                }
+            }
         }
     }
 
@@ -643,14 +656,14 @@ class DownloadManager @Inject constructor(
                 try {
                     delay(backoffMs)
                     if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
-                        withContext(NonCancellable) { handleCancellation(item, staging) }
+                        withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
                         return@launch
                     }
                     if (repository.getById(item.id) == null) return@launch
                     repository.updateStatus(item.id, DownloadStatus.QUEUED)
                     queueSignal.trySend(Unit)
                 } catch (ce: CancellationException) {
-                    withContext(NonCancellable) { handleCancellation(item, staging) }
+                    withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
                     throw ce
                 }
             }

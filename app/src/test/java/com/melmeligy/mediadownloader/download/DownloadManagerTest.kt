@@ -15,6 +15,7 @@ import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.slot
 import io.mockk.unmockkAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -228,6 +229,237 @@ class DownloadManagerTest {
             }
             assertEquals("Must never emit transient RUNNING 100%/0-speed snapshot", emptyList<Any>(), badGlitchSnapshots)
             assertEquals(112_000L, currentItem.totalBytes)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun pause_updatesStatusImmediatelyWhileActiveDownloadIsStalled() = kotlinx.coroutines.runBlocking {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_pause_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings(maxConcurrentDownloads = 1)
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+            coEvery { settingsRepository.current() } returns settings
+
+            var currentItem: DownloadItem? = DownloadItem(
+                id = 101L,
+                title = "Pause Test",
+                sourceUrl = "https://example.com/page",
+                remoteUrl = "https://example.com/master.m3u8",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "480p",
+                isHls = true,
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+            val downloadStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val cleanupGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val downloadCancelled = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                val item = currentItem
+                if (item != null && item.status == com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED) {
+                    val running = item.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    currentItem = running
+                    listOf(running)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                val item = currentItem
+                kotlinx.coroutines.flow.flowOf(if (item != null && item.isActive) listOf(item) else emptyList())
+            }
+            coEvery { repository.getById(101L) } answers { currentItem }
+            coEvery { repository.updateStatus(101L, any()) } answers {
+                val st = secondArg<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+                currentItem = currentItem?.copy(status = st)
+            }
+            coEvery {
+                hlsDownloader.download(any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                downloadStarted.complete(Unit)
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    downloadCancelled.complete(Unit)
+                    cleanupGate.await()
+                }
+            }
+
+            val queueJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+                downloadManager.runQueue { }
+            }
+
+            kotlinx.coroutines.withTimeout(2000L) { downloadStarted.await() }
+
+            // Pause must update DB status to PAUSED immediately, even before worker cleanup finishes
+            downloadManager.pause(101L)
+            assertEquals(
+                com.melmeligy.mediadownloader.domain.model.DownloadStatus.PAUSED,
+                currentItem?.status
+            )
+
+            // Worker coroutine must have been cancelled promptly
+            kotlinx.coroutines.withTimeout(2000L) { downloadCancelled.await() }
+            cleanupGate.complete(Unit)
+            kotlinx.coroutines.withTimeout(2000L) { queueJob.join() }
+            assertEquals(
+                com.melmeligy.mediadownloader.domain.model.DownloadStatus.PAUSED,
+                currentItem?.status
+            )
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun cancel_deletesItemImmediatelyWhileActiveDownloadIsStalled() = kotlinx.coroutines.runBlocking {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_cancel_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings(maxConcurrentDownloads = 1)
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+            coEvery { settingsRepository.current() } returns settings
+
+            var currentItem: DownloadItem? = DownloadItem(
+                id = 102L,
+                title = "Cancel Test",
+                sourceUrl = "https://example.com/page",
+                remoteUrl = "https://example.com/master.m3u8",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "480p",
+                isHls = true,
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+            val downloadStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val cleanupGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val downloadCancelled = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                val item = currentItem
+                if (item != null && item.status == com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED) {
+                    val running = item.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    currentItem = running
+                    listOf(running)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                val item = currentItem
+                kotlinx.coroutines.flow.flowOf(if (item != null && item.isActive) listOf(item) else emptyList())
+            }
+            coEvery { repository.getById(102L) } answers { currentItem }
+            coEvery { repository.delete(102L) } answers { currentItem = null }
+            coEvery { repository.updateStatus(102L, any()) } answers {
+                val st = secondArg<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+                currentItem = currentItem?.copy(status = st)
+            }
+            coEvery {
+                hlsDownloader.download(any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                downloadStarted.complete(Unit)
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    downloadCancelled.complete(Unit)
+                    cleanupGate.await()
+                }
+            }
+
+            val queueJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+                downloadManager.runQueue { }
+            }
+
+            kotlinx.coroutines.withTimeout(2000L) { downloadStarted.await() }
+
+            // Cancel must remove the item immediately before worker cleanup completes
+            downloadManager.cancel(102L)
+            org.junit.Assert.assertNull(currentItem)
+
+            kotlinx.coroutines.withTimeout(2000L) { downloadCancelled.await() }
+            cleanupGate.complete(Unit)
+            kotlinx.coroutines.withTimeout(2000L) { queueJob.join() }
+            org.junit.Assert.assertNull(currentItem)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun pauseThenResume_waitsForCleanTeardownAndEndsInQueued() = kotlinx.coroutines.runBlocking {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_pause_resume_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings(maxConcurrentDownloads = 1)
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+            coEvery { settingsRepository.current() } returns settings
+
+            var currentItem: DownloadItem? = DownloadItem(
+                id = 103L,
+                title = "Pause Resume Test",
+                sourceUrl = "https://example.com/page",
+                remoteUrl = "https://example.com/master.m3u8",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "480p",
+                isHls = true,
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+            val downloadStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var claimCount = 0
+
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                val item = currentItem
+                if (claimCount == 0 && item != null && item.status == com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED) {
+                    claimCount++
+                    val running = item.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    currentItem = running
+                    listOf(running)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                val item = currentItem
+                kotlinx.coroutines.flow.flowOf(if (item != null && item.isActive) listOf(item) else emptyList())
+            }
+            coEvery { repository.getById(103L) } answers { currentItem }
+            coEvery { repository.update(any()) } answers { currentItem = firstArg() }
+            coEvery { repository.updateStatus(103L, any()) } answers {
+                val st = secondArg<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+                currentItem = currentItem?.copy(status = st)
+            }
+            coEvery {
+                hlsDownloader.download(any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                downloadStarted.complete(Unit)
+                kotlinx.coroutines.awaitCancellation()
+            }
+
+            val queueJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+                downloadManager.runQueue { }
+            }
+
+            kotlinx.coroutines.withTimeout(2000L) { downloadStarted.await() }
+            downloadManager.pause(103L)
+            downloadManager.resume(103L)
+
+            kotlinx.coroutines.withTimeout(2000L) { queueJob.join() }
+            assertEquals(
+                com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                currentItem?.status
+            )
         } finally {
             tempDir.deleteRecursively()
         }
