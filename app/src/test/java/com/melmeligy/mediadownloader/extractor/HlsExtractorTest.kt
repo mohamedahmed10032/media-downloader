@@ -76,14 +76,14 @@ class HlsExtractorTest {
         assertEquals(2, result.streams.size)
 
         val stream720 = result.streams.first { it.height == 720 }
-        // Peak-only BANDWIDTH applies 0.85 factor: 2,000,000 * 0.85 * 60 / 8 = 12,750,000 bytes
-        assertEquals(12_750_000L, stream720.sizeBytes)
+        // Without segment probes, full BANDWIDTH is used (no artificial 0.85 under-shoot): 2,000,000 * 60 / 8 = 15,000,000 bytes
+        assertEquals(15_000_000L, stream720.sizeBytes)
         assertEquals("60", stream720.headers["X-Internal-Duration-Seconds"])
         assertEquals("true", stream720.headers["X-Internal-Size-Estimated"])
 
         val stream360 = result.streams.first { it.height == 360 }
-        // Peak-only BANDWIDTH applies 0.85 factor: 800,000 * 0.85 * 60 / 8 = 5,100,000 bytes
-        assertEquals(5_100_000L, stream360.sizeBytes)
+        // Full BANDWIDTH: 800,000 * 60 / 8 = 6,000,000 bytes
+        assertEquals(6_000_000L, stream360.sizeBytes)
         assertEquals("60", stream360.headers["X-Internal-Duration-Seconds"])
         assertEquals("true", stream360.headers["X-Internal-Size-Estimated"])
     }
@@ -192,5 +192,98 @@ class HlsExtractorTest {
         coEvery { http.fetchString(any(), any()) } returns "<html>not a playlist</html>"
         val extractor = HlsExtractor(http)
         assertEquals(null, extractor.extract("https://h.com/x.m3u8"))
+    }
+
+    @Test
+    fun calibratesPeakBandwidthVariantsFromInteriorSegments_avoidingSkewedFirstSegment() = runTest {
+        // Mirrors real topcinemaa/okstream HLS: peak-only BANDWIDTH without AVERAGE-BANDWIDTH,
+        // seg[0] is heavily skewed (2.2x), interior segments reflect true average bitrate (+5% over declared after 0.94 TS overhead).
+        val master = """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=2900000,RESOLUTION=1920x1080
+            1080.m3u8
+            #EXT-X-STREAM-INF:BANDWIDTH=455000,RESOLUTION=854x480
+            480.m3u8
+        """.trimIndent()
+
+        val variant1080 = buildString {
+            appendLine("#EXTM3U")
+            appendLine("#EXT-X-TARGETDURATION:10")
+            for (i in 0 until 12) {
+                appendLine("#EXTINF:10.0,")
+                appendLine("seg_$i.ts")
+            }
+            appendLine("#EXT-X-ENDLIST")
+        }
+
+        val http = mockk<ExtractorHttp>()
+        coEvery { http.fetchString("https://cdn.example/master.m3u8", any()) } returns master
+        coEvery { http.fetchString("https://cdn.example/1080.m3u8", any()) } returns variant1080
+        // Skewed seg_0 (9 MB), steady interior segments (4.0 MB per 10s -> 3.2 Mbps TS * 0.94 = 3.008 Mbps -> scale ~1.0372)
+        coEvery { http.probe("https://cdn.example/seg_0.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 9_000_000L, true, "https://cdn.example/seg_0.ts")
+        coEvery { http.probe("https://cdn.example/seg_4.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 4_000_000L, true, "https://cdn.example/seg_4.ts")
+        coEvery { http.probe("https://cdn.example/seg_8.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 4_000_000L, true, "https://cdn.example/seg_8.ts")
+
+        val extractor = HlsExtractor(http)
+        val result = extractor.extract("https://cdn.example/master.m3u8")!!
+
+        val stream1080 = result.streams.first { it.height == 1080 }
+        val stream480 = result.streams.first { it.height == 480 }
+
+        // True interior MP4 size for 120s of 1080p: 4,000,000 * 12 * 0.94 = 45,120,000 bytes (NOT 0.85 * 43.5M = 36.97M!)
+        assertEquals(45_120_000L, stream1080.sizeBytes)
+        // 480p scales proportionally by the same 1.0372x factor -> ~7,079,172 bytes (NOT old 5,801,250 bytes!)
+        assertTrue(
+            "480p calibrated estimate (${stream480.sizeBytes}) should be near ~7.08 MB, not under-shot",
+            stream480.sizeBytes in 6_900_000L..7_250_000L
+        )
+    }
+
+    @Test
+    fun directMediaPlaylist_withManySegments_averagesThreeInteriorSegmentsInsteadOfSkewedSeg0() = runTest {
+        val playlist = buildString {
+            appendLine("#EXTM3U")
+            appendLine("#EXT-X-TARGETDURATION:10")
+            for (i in 0 until 12) {
+                appendLine("#EXTINF:10.0,")
+                appendLine("seg_$i.ts")
+            }
+            appendLine("#EXT-X-ENDLIST")
+        }
+
+        val http = mockk<ExtractorHttp>()
+        coEvery { http.fetchString("https://cdn.example/video-480p.m3u8", any()) } returns playlist
+        // Adversarial inflated seg_0 (5 MB), interior segments (1.0 MB each)
+        coEvery { http.probe("https://cdn.example/seg_0.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 5_000_000L, true, "https://cdn.example/seg_0.ts")
+        coEvery { http.probe("https://cdn.example/seg_3.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 1_000_000L, true, "https://cdn.example/seg_3.ts")
+        coEvery { http.probe("https://cdn.example/seg_6.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 1_000_000L, true, "https://cdn.example/seg_6.ts")
+        coEvery { http.probe("https://cdn.example/seg_9.ts", any(), any()) } returns HeadInfo(206, "video/mp2t", 1_000_000L, true, "https://cdn.example/seg_9.ts")
+
+        val extractor = HlsExtractor(http)
+        val result = extractor.extract("https://cdn.example/video-480p.m3u8")!!
+        val stream = result.streams.single()
+
+        // 1,000,000 B / 10s * 120s * 0.94 = 11,280,000 bytes (NOT 5MB * 12 = 60,000,000 bytes!)
+        assertEquals(11_280_000L, stream.sizeBytes)
+    }
+
+    @Test
+    fun adversarialProbeFailure_fallsBackCleanlyToUnpenalizedDeclaredBandwidth() = runTest {
+        val master = """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=854x480
+            480.m3u8
+        """.trimIndent()
+        val variant = "#EXTM3U\n#EXTINF:10.0,\ns0.ts\n#EXTINF:10.0,\ns1.ts\n#EXTINF:10.0,\ns2.ts\n#EXTINF:10.0,\ns3.ts\n#EXT-X-ENDLIST"
+
+        val http = mockk<ExtractorHttp>()
+        coEvery { http.fetchString("https://cdn.example/master.m3u8", any()) } returns master
+        coEvery { http.fetchString("https://cdn.example/480.m3u8", any()) } returns variant
+        coEvery { http.probe(any(), any(), any()) } throws java.io.IOException("probe timeout")
+        coEvery { http.probe(any(), any()) } throws java.io.IOException("probe timeout")
+
+        val result = HlsExtractor(http).extract("https://cdn.example/master.m3u8")!!
+        // 800,000 * 40 / 8 = 4,000,000 bytes (1.0x fallback, no exception leaked)
+        assertEquals(4_000_000L, result.streams.single().sizeBytes)
     }
 }

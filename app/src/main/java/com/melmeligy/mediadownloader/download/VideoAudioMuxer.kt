@@ -168,6 +168,10 @@ class VideoAudioMuxer @Inject constructor() {
             if (!isWebmVideo && isWebmAudio) return false
             if (!isWebmVideo && !isMp4Audio) return false
 
+            if (!isWebmVideo && Media3Mp4Remuxer.muxMp4(videoFile, audioFile, outputFile)) {
+                return true
+            }
+
             val outputFormat = if (isWebmVideo) {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
             } else {
@@ -252,6 +256,12 @@ class VideoAudioMuxer @Inject constructor() {
             extractor.selectTrack(audioTrack)
             val format = extractor.getTrackFormat(audioTrack)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: return false
+
+            val audioHasAdts = format.containsKey(MediaFormat.KEY_IS_ADTS) &&
+                runCatching { format.getInteger(MediaFormat.KEY_IS_ADTS) == 1 }.getOrDefault(false)
+            if (audioHasAdts) {
+                runCatching { format.setInteger(MediaFormat.KEY_IS_ADTS, 0) }
+            }
             ensureAacCsd0IfNeeded(format)
 
             var sampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
@@ -262,24 +272,73 @@ class VideoAudioMuxer @Inject constructor() {
             decoder.start()
 
             val info = MediaCodec.BufferInfo()
+            var extractorDone = false
             var inputDone = false
             var outputDone = false
             var totalEncodedBytes = 0L
 
+            val adtsReadBuffer = if (audioHasAdts) ByteBuffer.allocateDirect(512 * 1024) else null
+            val pendingAdtsFrames = ArrayDeque<Pair<ByteArray, Long>>()
+
             BufferedOutputStream(FileOutputStream(outputFile)).use { out ->
                 while (!outputDone) {
                     if (!inputDone) {
+                        if (audioHasAdts && pendingAdtsFrames.isEmpty() && !extractorDone) {
+                            adtsReadBuffer!!.clear()
+                            val sampleSize = extractor.readSampleData(adtsReadBuffer, 0)
+                            if (sampleSize < 0) {
+                                extractorDone = true
+                            } else {
+                                val pts = extractor.sampleTime.coerceAtLeast(0L)
+                                val raw = ByteArray(sampleSize)
+                                adtsReadBuffer.position(0)
+                                adtsReadBuffer.get(raw, 0, sampleSize)
+                                val slices = RemuxTimelineNormalizer.splitAndStripAdtsFrames(
+                                    data = raw,
+                                    offset = 0,
+                                    length = raw.size,
+                                    basePtsUs = pts,
+                                    fallbackSampleRate = sampleRate
+                                )
+                                if (slices.isNotEmpty()) {
+                                    for (slice in slices) {
+                                        val payload = raw.copyOfRange(slice.payloadOffset, slice.payloadOffset + slice.payloadLength)
+                                        pendingAdtsFrames.addLast(payload to slice.presentationTimeUs)
+                                    }
+                                } else if (raw.isNotEmpty()) {
+                                    pendingAdtsFrames.addLast(raw to pts)
+                                }
+                                extractor.advance()
+                            }
+                        }
+
                         val inIdx = decoder.dequeueInputBuffer(10_000L)
                         if (inIdx >= 0) {
                             val inBuf = decoder.getInputBuffer(inIdx)!!
-                            val sampleSize = extractor.readSampleData(inBuf, 0)
-                            if (sampleSize < 0) {
-                                decoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
+                            inBuf.clear()
+                            if (audioHasAdts) {
+                                val nextFrame = pendingAdtsFrames.removeFirstOrNull()
+                                if (nextFrame != null) {
+                                    val (frameBytes, framePts) = nextFrame
+                                    val copyLen = minOf(frameBytes.size, inBuf.remaining())
+                                    inBuf.put(frameBytes, 0, copyLen)
+                                    decoder.queueInputBuffer(inIdx, 0, copyLen, framePts, 0)
+                                } else if (extractorDone) {
+                                    decoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    inputDone = true
+                                } else {
+                                    decoder.queueInputBuffer(inIdx, 0, 0, 0L, 0)
+                                }
                             } else {
-                                val pts = extractor.sampleTime.coerceAtLeast(0L)
-                                decoder.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
-                                extractor.advance()
+                                val sampleSize = extractor.readSampleData(inBuf, 0)
+                                if (sampleSize < 0) {
+                                    decoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    inputDone = true
+                                } else {
+                                    val pts = extractor.sampleTime.coerceAtLeast(0L)
+                                    decoder.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
+                                    extractor.advance()
+                                }
                             }
                         }
                     }
@@ -297,13 +356,15 @@ class VideoAudioMuxer @Inject constructor() {
                         }
                         outIdx >= 0 -> {
                             if (info.size > 0) {
-                                val enc = encoder ?: Jump3rMp3Encoder(sampleRate, channels, targetBitrateKbps).also { encoder = it }
+                                val encChannels = channels.coerceIn(1, 2)
+                                val enc = encoder ?: Jump3rMp3Encoder(sampleRate, encChannels, targetBitrateKbps).also { encoder = it }
                                 val outBuf = decoder.getOutputBuffer(outIdx)!!
                                 outBuf.position(info.offset)
                                 outBuf.limit(info.offset + info.size)
                                 val pcm = ByteArray(info.size)
                                 outBuf.get(pcm)
-                                totalEncodedBytes += enc.encodePcm16Le(pcm, pcm.size, out)
+                                val stereoOrMonoPcm = if (channels > 2) downmixPcm16LeToStereo(pcm, channels) else pcm
+                                totalEncodedBytes += enc.encodePcm16Le(stereoOrMonoPcm, stereoOrMonoPcm.size, out)
                             }
                             decoder.releaseOutputBuffer(outIdx, false)
                             if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -329,6 +390,11 @@ class VideoAudioMuxer @Inject constructor() {
 
     @SuppressLint("WrongConstant")
     private fun extractM4aAndroid(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 128): Boolean {
+        // Fast, standards-compliant Media3 demux + Mp4Muxer path for AAC sources (TS, fMP4, MP4)
+        if (Media3Mp4Remuxer.extractAacM4a(sourceFile, outputFile)) {
+            return true
+        }
+
         var extractor: MediaExtractor? = null
         var muxer: MediaMuxer? = null
         return try {
@@ -351,6 +417,9 @@ class VideoAudioMuxer @Inject constructor() {
             if (audioHasAdts) {
                 runCatching { audioFormat.setInteger(MediaFormat.KEY_IS_ADTS, 0) }
             }
+            val fallbackSampleRate = if (audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                runCatching { audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE) }.getOrDefault(48_000)
+            } else 48_000
             ensureAacCsd0IfNeeded(audioFormat)
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val dstTrack = muxer.addTrack(audioFormat)
@@ -359,24 +428,54 @@ class VideoAudioMuxer @Inject constructor() {
             val buffer = ByteBuffer.allocateDirect(512 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
             val normalizer = RemuxTimelineNormalizer(expectVideo = false, expectAudio = true)
+            var lastWrittenAudioPtsUs = -1L
+            var writtenFrames = 0
 
             fun writeAudioSample(sample: NormalizedRemuxSample, directBuffer: ByteBuffer?, directSize: Int) {
                 val rawBytes = sample.payload ?: ByteArray(directSize).also { arr ->
                     directBuffer!!.position(0)
                     directBuffer.get(arr, 0, directSize)
                 }
-                val adts = if (audioHasAdts) {
-                    RemuxTimelineNormalizer.stripAdtsHeaderIfPresent(rawBytes, 0, rawBytes.size)
-                } else {
-                    AdtsStripResult(false, 0, rawBytes.size)
+                if (audioHasAdts) {
+                    val slices = RemuxTimelineNormalizer.splitAndStripAdtsFrames(
+                        data = rawBytes,
+                        offset = 0,
+                        length = rawBytes.size,
+                        basePtsUs = sample.presentationTimeUs,
+                        fallbackSampleRate = fallbackSampleRate
+                    )
+                    if (slices.isNotEmpty()) {
+                        val stepUs = (1024L * 1_000_000L) / fallbackSampleRate.coerceAtLeast(8_000)
+                        for (slice in slices) {
+                            var pts = slice.presentationTimeUs
+                            if (lastWrittenAudioPtsUs >= 0L && pts <= lastWrittenAudioPtsUs) {
+                                pts = lastWrittenAudioPtsUs + stepUs
+                            }
+                            lastWrittenAudioPtsUs = pts
+                            val outBuf = ByteBuffer.wrap(rawBytes, slice.payloadOffset, slice.payloadLength)
+                            bufferInfo.offset = slice.payloadOffset
+                            bufferInfo.size = slice.payloadLength
+                            bufferInfo.presentationTimeUs = pts
+                            bufferInfo.flags = sample.bufferFlags
+                            muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+                            writtenFrames++
+                        }
+                        return
+                    }
                 }
-                if (adts.payloadLength <= 0) return
-                val outBuf = ByteBuffer.wrap(rawBytes, adts.payloadOffset, adts.payloadLength)
-                bufferInfo.offset = adts.payloadOffset
-                bufferInfo.size = adts.payloadLength
-                bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                if (rawBytes.isEmpty()) return
+                var pts = sample.presentationTimeUs
+                if (lastWrittenAudioPtsUs >= 0L && pts <= lastWrittenAudioPtsUs) {
+                    pts = lastWrittenAudioPtsUs + 21_333L
+                }
+                lastWrittenAudioPtsUs = pts
+                val outBuf = ByteBuffer.wrap(rawBytes)
+                bufferInfo.offset = 0
+                bufferInfo.size = rawBytes.size
+                bufferInfo.presentationTimeUs = pts
                 bufferInfo.flags = sample.bufferFlags
                 muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+                writtenFrames++
             }
 
             while (true) {
@@ -404,7 +503,7 @@ class VideoAudioMuxer @Inject constructor() {
             normalizer.flush { normalized -> writeAudioSample(normalized, null, 0) }
 
             muxer.stop()
-            normalizer.audioSampleCount > 0 && outputFile.exists() && outputFile.length() > 0L
+            writtenFrames > 0 && outputFile.exists() && outputFile.length() > 0L
         } catch (_: Exception) {
             runCatching { outputFile.delete() }
             false
@@ -539,6 +638,13 @@ class VideoAudioMuxer @Inject constructor() {
 
     @SuppressLint("WrongConstant")
     private fun remuxTsToMp4Android(tsFile: File, outputFile: File): Boolean {
+        // Primary path: pure-Java Media3 TsExtractor/Mp4Extractor + Mp4Muxer
+        // Properly splits multi-ADTS PES frames, writes clean stts/ctts for H.264 B-frames, and faststarts moov.
+        if (Media3Mp4Remuxer.remuxToMp4(tsFile, outputFile)) {
+            return true
+        }
+
+        // Fallback path for codecs outside Mp4Muxer's codecSpecificBox set (e.g. MP3 audio in TS)
         var extractor: MediaExtractor? = null
         var muxer: MediaMuxer? = null
         return try {
@@ -549,6 +655,7 @@ class VideoAudioMuxer @Inject constructor() {
 
             var maxInputSize = 2 * 1024 * 1024
             var audioHasAdts = false
+            var audioFallbackSampleRate = 48_000
 
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val dstVideoTrack = if (videoTrack >= 0) {
@@ -573,6 +680,11 @@ class VideoAudioMuxer @Inject constructor() {
                         maxInputSize = maxOf(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
                     }
                 }
+                if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                    runCatching {
+                        audioFallbackSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE).coerceAtLeast(8_000)
+                    }
+                }
                 audioHasAdts = format.containsKey(MediaFormat.KEY_IS_ADTS) &&
                     runCatching { format.getInteger(MediaFormat.KEY_IS_ADTS) == 1 }.getOrDefault(false)
                 if (audioHasAdts) {
@@ -591,6 +703,7 @@ class VideoAudioMuxer @Inject constructor() {
                 expectAudio = dstAudioTrack >= 0
             )
             var audioAdtsScratch = ByteArray(0)
+            var lastWrittenAudioPtsUs = -1L
 
             fun writeSample(sample: NormalizedRemuxSample, directBuffer: ByteBuffer?, directSize: Int) {
                 val dstTrack = if (sample.track == RemuxTrackKind.VIDEO) dstVideoTrack else dstAudioTrack
@@ -607,32 +720,61 @@ class VideoAudioMuxer @Inject constructor() {
                         audioAdtsScratch
                     }
                     val len = payload?.size ?: directSize
-                    val adts = RemuxTimelineNormalizer.stripAdtsHeaderIfPresent(bytes, 0, len)
-                    if (adts.payloadLength <= 0) return
-                    val outBuf = ByteBuffer.wrap(bytes, adts.payloadOffset, adts.payloadLength)
-                    bufferInfo.offset = adts.payloadOffset
-                    bufferInfo.size = adts.payloadLength
-                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
-                    bufferInfo.flags = sample.bufferFlags
-                    muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
-                    return
+                    val slices = RemuxTimelineNormalizer.splitAndStripAdtsFrames(
+                        data = bytes,
+                        offset = 0,
+                        length = len,
+                        basePtsUs = sample.presentationTimeUs,
+                        fallbackSampleRate = audioFallbackSampleRate
+                    )
+                    if (slices.isNotEmpty()) {
+                        val stepUs = (1024L * 1_000_000L) / audioFallbackSampleRate.coerceAtLeast(8_000)
+                        for (slice in slices) {
+                            var pts = slice.presentationTimeUs
+                            if (lastWrittenAudioPtsUs >= 0L && pts <= lastWrittenAudioPtsUs) {
+                                pts = lastWrittenAudioPtsUs + stepUs
+                            }
+                            lastWrittenAudioPtsUs = pts
+                            val outBuf = ByteBuffer.wrap(bytes, slice.payloadOffset, slice.payloadLength)
+                            bufferInfo.offset = slice.payloadOffset
+                            bufferInfo.size = slice.payloadLength
+                            bufferInfo.presentationTimeUs = pts
+                            bufferInfo.flags = sample.bufferFlags
+                            muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+                        }
+                        return
+                    }
                 }
 
                 if (payload != null) {
                     if (payload.isEmpty()) return
+                    val pts = if (sample.track == RemuxTrackKind.AUDIO) {
+                        val safe = if (lastWrittenAudioPtsUs >= 0L && sample.presentationTimeUs <= lastWrittenAudioPtsUs) {
+                            lastWrittenAudioPtsUs + 21_333L
+                        } else sample.presentationTimeUs
+                        lastWrittenAudioPtsUs = safe
+                        safe
+                    } else sample.presentationTimeUs
                     val outBuf = ByteBuffer.wrap(payload)
                     bufferInfo.offset = 0
                     bufferInfo.size = payload.size
-                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                    bufferInfo.presentationTimeUs = pts
                     bufferInfo.flags = sample.bufferFlags
                     muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
                 } else {
                     if (directSize <= 0 || directBuffer == null) return
+                    val pts = if (sample.track == RemuxTrackKind.AUDIO) {
+                        val safe = if (lastWrittenAudioPtsUs >= 0L && sample.presentationTimeUs <= lastWrittenAudioPtsUs) {
+                            lastWrittenAudioPtsUs + 21_333L
+                        } else sample.presentationTimeUs
+                        lastWrittenAudioPtsUs = safe
+                        safe
+                    } else sample.presentationTimeUs
                     directBuffer.position(0)
                     directBuffer.limit(directSize)
                     bufferInfo.offset = 0
                     bufferInfo.size = directSize
-                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                    bufferInfo.presentationTimeUs = pts
                     bufferInfo.flags = sample.bufferFlags
                     muxer.writeSampleData(dstTrack, directBuffer, bufferInfo)
                 }
@@ -873,11 +1015,49 @@ class VideoAudioMuxer @Inject constructor() {
         if (format.containsKey("csd-0")) return
         val sr = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
         val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
-        val freqIdx = AAC_SAMPLE_RATES.indexOf(sr).takeIf { it >= 0 } ?: 4 // default 44100 Hz
-        val profile = 2 // AAC-LC
-        val b0 = ((profile shl 3) or (freqIdx ushr 1)).toByte()
-        val b1 = (((freqIdx and 1) shl 7) or ((ch and 0x0F) shl 3)).toByte()
-        format.setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(b0, b1)))
+        val asc = RemuxTimelineNormalizer.buildAacAudioSpecificConfig(sr, ch)
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(asc))
+    }
+
+    /** Downmixes interleaved >2-channel 16-bit little-endian PCM (e.g. 5.1 AAC) to stereo PCM16LE. */
+    private fun downmixPcm16LeToStereo(pcm: ByteArray, channels: Int): ByteArray {
+        if (channels <= 2) return pcm
+        val bytesPerFrame = channels * 2
+        val frames = pcm.size / bytesPerFrame
+        if (frames <= 0) return ByteArray(0)
+        val out = ByteArray(frames * 4)
+
+        fun readSample(offset: Int): Int {
+            val lo = pcm[offset].toInt() and 0xFF
+            val hi = pcm[offset + 1].toInt()
+            return (hi shl 8) or lo
+        }
+
+        var inPos = 0
+        var outPos = 0
+        for (i in 0 until frames) {
+            val fl = readSample(inPos)
+            val fr = readSample(inPos + 2)
+            val left: Int
+            val right: Int
+            if (channels >= 6) {
+                val fc = readSample(inPos + 4)
+                val bl = readSample(inPos + 8)
+                val br = readSample(inPos + 10)
+                left = (fl + (fc * 7) / 10 + bl / 2).coerceIn(-32768, 32767)
+                right = (fr + (fc * 7) / 10 + br / 2).coerceIn(-32768, 32767)
+            } else {
+                val fc = if (channels >= 3) readSample(inPos + 4) else 0
+                left = (fl + (fc * 7) / 10).coerceIn(-32768, 32767)
+                right = (fr + (fc * 7) / 10).coerceIn(-32768, 32767)
+            }
+            out[outPos++] = (left and 0xFF).toByte()
+            out[outPos++] = ((left ushr 8) and 0xFF).toByte()
+            out[outPos++] = (right and 0xFF).toByte()
+            out[outPos++] = ((right ushr 8) and 0xFF).toByte()
+            inPos += bytesPerFrame
+        }
+        return out
     }
 
     private fun selectTrack(extractor: MediaExtractor, mimePrefix: String): Int {

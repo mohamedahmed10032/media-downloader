@@ -120,4 +120,116 @@ class DownloadManagerTest {
         assertEquals("webm", slot.captured.container)
         assertEquals(false, slot.captured.isHls)
     }
+
+    @Test
+    fun runQueue_hlsDownload_transitionsToFinalizingBeforeRemuxAndNeverFlashesRunning100PercentZeroSpeed() = runTest {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_finalizing_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings()
+            coEvery { settingsRepository.current() } returns settings
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+
+            val statusHistory = mutableListOf<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+            val progressSnapshots = mutableListOf<Triple<com.melmeligy.mediadownloader.domain.model.DownloadStatus, Long, Long>>()
+            var currentItem = DownloadItem(
+                id = 99L,
+                title = "Episode 5",
+                sourceUrl = "https://topcinemaa.one/watch/",
+                remoteUrl = "https://cdn.example/480p.m3u8",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "480p",
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                totalBytes = 100_000L,
+                isHls = true
+            )
+            var claimed = false
+
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                if (!claimed) {
+                    claimed = true
+                    currentItem = currentItem.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    statusHistory += currentItem.status
+                    listOf(currentItem)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                kotlinx.coroutines.flow.flowOf(if (currentItem.isActive) listOf(currentItem) else emptyList())
+            }
+            coEvery { repository.updateStatus(99L, any()) } answers {
+                val st = secondArg<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+                currentItem = currentItem.copy(status = st)
+                statusHistory += st
+            }
+            coEvery { repository.updateProgress(99L, any(), any(), any(), any()) } answers {
+                val dl = arg<Long>(1)
+                val tot = arg<Long>(2)
+                val spd = arg<Long>(3)
+                currentItem = currentItem.copy(downloadedBytes = dl, totalBytes = tot, speedBytesPerSec = spd)
+                progressSnapshots += Triple(currentItem.status, dl, spd)
+            }
+            coEvery { repository.setCompleted(99L, any(), any()) } answers {
+                val tot = arg<Long>(2)
+                currentItem = currentItem.copy(
+                    status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.COMPLETED,
+                    downloadedBytes = tot,
+                    totalBytes = tot,
+                    speedBytesPerSec = 0L
+                )
+                statusHistory += currentItem.status
+            }
+
+            coEvery {
+                hlsDownloader.download(any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                val dest = arg<java.io.File>(2)
+                val onProgress = arg<suspend (DownloadProgress) -> Unit>(5)
+                dest.parentFile?.mkdirs()
+                dest.writeBytes(ByteArray(120_000) { 0x47 })
+                onProgress(DownloadProgress(downloaded = 60_000L, total = 120_000L, speed = 2_000_000L, eta = 1L))
+                // Final callback emitted by HlsSegmentDownloader when all segments finish
+                onProgress(DownloadProgress(downloaded = 120_000L, total = 120_000L, speed = 0L, eta = 0L))
+            }
+
+            var statusDuringRemux: com.melmeligy.mediadownloader.domain.model.DownloadStatus? = null
+            every { videoAudioMuxer.remuxTsToMp4(any(), any()) } answers {
+                statusDuringRemux = currentItem.status
+                val out = secondArg<java.io.File>()
+                out.writeBytes(ByteArray(112_000) { 0x01 })
+                true
+            }
+
+            var statusDuringPublish: com.melmeligy.mediadownloader.domain.model.DownloadStatus? = null
+            coEvery { mediaStoreWriter.publish(any(), any(), any(), any(), any()) } coAnswers {
+                statusDuringPublish = currentItem.status
+                "content://media/external/video/media/99"
+            }
+
+            downloadManager.runQueue { }
+
+            assertEquals(
+                listOf(
+                    com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING,
+                    com.melmeligy.mediadownloader.domain.model.DownloadStatus.FINALIZING,
+                    com.melmeligy.mediadownloader.domain.model.DownloadStatus.COMPLETED
+                ),
+                statusHistory
+            )
+            assertEquals(com.melmeligy.mediadownloader.domain.model.DownloadStatus.FINALIZING, statusDuringRemux)
+            assertEquals(com.melmeligy.mediadownloader.domain.model.DownloadStatus.FINALIZING, statusDuringPublish)
+
+            // Never recorded a RUNNING snapshot with speed == 0 and 100% downloaded
+            val badGlitchSnapshots = progressSnapshots.filter { (st, dl, spd) ->
+                st == com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING && spd == 0L && dl >= 120_000L
+            }
+            assertEquals("Must never emit transient RUNNING 100%/0-speed snapshot", emptyList<Any>(), badGlitchSnapshots)
+            assertEquals(112_000L, currentItem.totalBytes)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

@@ -36,6 +36,13 @@ internal data class AdtsStripResult(
     val audioSpecificConfig: ByteArray? = null
 )
 
+internal data class AdtsFrameSlice(
+    val payloadOffset: Int,
+    val payloadLength: Int,
+    val presentationTimeUs: Long,
+    val audioSpecificConfig: ByteArray
+)
+
 internal class RemuxTimelineNormalizer(
     private val expectVideo: Boolean,
     private val expectAudio: Boolean,
@@ -312,6 +319,93 @@ internal class RemuxTimelineNormalizer(
                 payloadLength = length - headerLen,
                 audioSpecificConfig = byteArrayOf(asc0, asc1)
             )
+        }
+
+        private val AAC_SAMPLE_RATES = intArrayOf(
+            96000, 88200, 64000, 48000, 44100, 32000,
+            24000, 22050, 16000, 12000, 11025, 8000, 7350
+        )
+
+        /** Builds a 2-byte ISO 14496-3 AudioSpecificConfig (`csd-0`) for AAC-LC/Main/SSR. */
+        fun buildAacAudioSpecificConfig(
+            sampleRate: Int,
+            channelCount: Int,
+            objectType: Int = 2
+        ): ByteArray {
+            val freqIdx = AAC_SAMPLE_RATES.indexOf(sampleRate).takeIf { it >= 0 } ?: 4
+            val chCfg = when (channelCount) {
+                8 -> 7
+                in 1..6 -> channelCount
+                else -> 2
+            }
+            val b0 = (((objectType and 0x1F) shl 3) or (freqIdx ushr 1)).toByte()
+            val b1 = (((freqIdx and 0x01) shl 7) or ((chCfg and 0x0F) shl 3)).toByte()
+            return byteArrayOf(b0, b1)
+        }
+
+        /**
+         * Splits a single- or multi-frame ADTS PES buffer (as emitted by Android's `MPEG2TSExtractor`)
+         * into individual raw AAC access units with headers stripped and exact per-frame PTS values.
+         *
+         * Returns an empty list if [data] does not start with a valid ADTS frame (e.g., raw AAC).
+         */
+        fun splitAndStripAdtsFrames(
+            data: ByteArray,
+            offset: Int = 0,
+            length: Int = data.size - offset,
+            basePtsUs: Long = 0L,
+            fallbackSampleRate: Int = 48_000
+        ): List<AdtsFrameSlice> {
+            if (length < 7 || offset < 0 || offset + length > data.size) return emptyList()
+            val end = offset + length
+            var pos = offset
+            var frameIndex = 0L
+            val slices = ArrayList<AdtsFrameSlice>(4)
+
+            while (pos + 7 <= end) {
+                val b0 = data[pos].toInt() and 0xFF
+                val b1 = data[pos + 1].toInt() and 0xFF
+                if (b0 != 0xFF || (b1 and 0xF6) != 0xF0) {
+                    break
+                }
+                val protectionAbsent = (b1 and 0x01) != 0
+                val headerLen = if (protectionAbsent) 7 else 9
+                if (pos + headerLen >= end) break
+
+                val b2 = data[pos + 2].toInt() and 0xFF
+                val b3 = data[pos + 3].toInt() and 0xFF
+                val b4 = data[pos + 4].toInt() and 0xFF
+                val b5 = data[pos + 5].toInt() and 0xFF
+
+                val adtsFrameLength = ((b3 and 0x03) shl 11) or (b4 shl 3) or ((b5 and 0xE0) ushr 5)
+                if (adtsFrameLength <= headerLen || pos + adtsFrameLength > end) {
+                    break
+                }
+
+                val profileObjectType = ((b2 ushr 6) and 0x03) + 1
+                val samplingFreqIndex = (b2 ushr 2) and 0x0F
+                val channelConfig = ((b2 and 0x01) shl 2) or ((b3 ushr 6) and 0x03)
+                if (samplingFreqIndex == 0x0F) break
+
+                val sampleRate = AAC_SAMPLE_RATES.getOrNull(samplingFreqIndex)
+                    ?: fallbackSampleRate.takeIf { it > 0 }
+                    ?: 48_000
+                val asc0 = ((profileObjectType shl 3) or (samplingFreqIndex ushr 1)).toByte()
+                val asc1 = (((samplingFreqIndex and 0x01) shl 7) or ((channelConfig and 0x0F) shl 3)).toByte()
+
+                val framePtsUs = basePtsUs + (frameIndex * 1024L * 1_000_000L) / sampleRate.toLong()
+                slices.add(
+                    AdtsFrameSlice(
+                        payloadOffset = pos + headerLen,
+                        payloadLength = adtsFrameLength - headerLen,
+                        presentationTimeUs = framePtsUs,
+                        audioSpecificConfig = byteArrayOf(asc0, asc1)
+                    )
+                )
+                pos += adtsFrameLength
+                frameIndex++
+            }
+            return slices
         }
     }
 }

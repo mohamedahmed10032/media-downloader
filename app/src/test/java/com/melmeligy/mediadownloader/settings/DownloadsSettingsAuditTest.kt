@@ -694,7 +694,13 @@ class DownloadsSettingsAuditTest {
         override fun observeByType(type: MediaType): Flow<List<DownloadItem>> =
             flowOf(items.values.filter { it.type == type })
         override fun observeActive(): Flow<List<DownloadItem>> =
-            flowOf(items.values.filter { it.status == DownloadStatus.RUNNING || it.status == DownloadStatus.QUEUED })
+            flowOf(
+                items.values.filter {
+                    it.status == DownloadStatus.RUNNING ||
+                        it.status == DownloadStatus.FINALIZING ||
+                        it.status == DownloadStatus.QUEUED
+                }
+            )
         override fun observeCompletedByType(type: MediaType): Flow<List<DownloadItem>> =
             flowOf(items.values.filter { it.type == type && it.status == DownloadStatus.COMPLETED })
 
@@ -759,7 +765,9 @@ class DownloadsSettingsAuditTest {
         override suspend fun resetInterrupted() {
             items.keys.forEach { id ->
                 items.computeIfPresent(id) { _, old ->
-                    if (old.status == DownloadStatus.RUNNING) old.copy(status = DownloadStatus.QUEUED) else old
+                    if (old.status == DownloadStatus.RUNNING || old.status == DownloadStatus.FINALIZING) {
+                        old.copy(status = DownloadStatus.QUEUED)
+                    } else old
                 }
             }
         }

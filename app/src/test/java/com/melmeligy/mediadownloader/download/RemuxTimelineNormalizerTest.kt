@@ -330,6 +330,198 @@ class RemuxTimelineNormalizerTest {
         assertNull(formatDownloadSecondaryStatus(runningHlsItem.copy(status = DownloadStatus.COMPLETED)))
     }
 
+    @Test
+    fun splitAndStripAdtsFrames_splitsMultiFramePesBuffer_withExactMonotonicPtsAndAudioSpecificConfig() {
+        // Construct a realistic 12-frame concatenated ADTS PES super-packet (mirroring Android MPEG2TSExtractor output)
+        // Mix 7-byte (protection_absent=1) and 9-byte CRC (protection_absent=0) ADTS headers at 48 kHz 5.1ch (chCfg=6)
+        val expectedPayloads = mutableListOf<ByteArray>()
+        val concatenated = java.io.ByteArrayOutputStream()
+        for (i in 0 until 12) {
+            val payload = ByteArray(18 + i * 3) { idx -> ((i * 17 + idx + 1) and 0xFF).toByte() }
+            expectedPayloads += payload
+            val hasCrc = (i % 3 == 0)
+            val headerLen = if (hasCrc) 9 else 7
+            val frameLen = headerLen + payload.size
+            val profile = 1 // AAC-LC -> objectType 2
+            val freqIdx = 3 // 48,000 Hz
+            val chCfg = 6 // 5.1ch
+            concatenated.write(0xFF)
+            concatenated.write(if (hasCrc) 0xF0 else 0xF1)
+            concatenated.write((profile shl 6) or (freqIdx shl 2) or (chCfg ushr 2))
+            concatenated.write(((chCfg and 0x03) shl 6) or ((frameLen ushr 11) and 0x03))
+            concatenated.write((frameLen ushr 3) and 0xFF)
+            concatenated.write(((frameLen and 0x07) shl 5) or 0x1F)
+            concatenated.write(0xFC)
+            if (hasCrc) {
+                concatenated.write(0xAA)
+                concatenated.write(0x55)
+            }
+            concatenated.write(payload)
+        }
+        val pesBytes = concatenated.toByteArray()
+
+        // Old single-frame stripper would fail because adtsFrameLength != pesBytes.size
+        assertFalse(RemuxTimelineNormalizer.stripAdtsHeaderIfPresent(pesBytes).stripped)
+
+        val basePtsUs = 1_400_000L
+        val slices = RemuxTimelineNormalizer.splitAndStripAdtsFrames(
+            data = pesBytes,
+            offset = 0,
+            length = pesBytes.size,
+            basePtsUs = basePtsUs,
+            fallbackSampleRate = 48_000
+        )
+
+        assertEquals(12, slices.size)
+        for (i in slices.indices) {
+            val slice = slices[i]
+            val actualPayload = pesBytes.copyOfRange(slice.payloadOffset, slice.payloadOffset + slice.payloadLength)
+            assertArrayEquals("Frame $i payload mismatch", expectedPayloads[i], actualPayload)
+            // AAC-LC (2), 48kHz (3), 5.1ch (6) => 00010 0011 0110 000 => 0x11 0xB0
+            assertArrayEquals(byteArrayOf(0x11, 0xB0.toByte()), slice.audioSpecificConfig)
+            val expectedPts = basePtsUs + (i.toLong() * 1024L * 1_000_000L) / 48_000L
+            assertEquals("Frame $i PTS mismatch", expectedPts, slice.presentationTimeUs)
+            if (i > 0) {
+                assertTrue("Frame $i PTS must be strictly increasing", slice.presentationTimeUs > slices[i - 1].presentationTimeUs)
+            }
+        }
+    }
+
+    @Test
+    fun adversarialMultiAdtsBuffer_withTruncatedTailOrRawAac_handlesGracefully() {
+        val payload = byteArrayOf(0x21, 0x10, 0x05, 0x20, 0x00, 0x1F)
+        val frameLen = 7 + payload.size
+        val validAdts = byteArrayOf(
+            0xFF.toByte(),
+            0xF1.toByte(),
+            ((1 shl 6) or (3 shl 2)).toByte(),
+            ((2 shl 6) or ((frameLen ushr 11) and 0x03)).toByte(),
+            ((frameLen ushr 3) and 0xFF).toByte(),
+            (((frameLen and 0x07) shl 5) or 0x1F).toByte(),
+            0xFC.toByte()
+        ) + payload
+        // Append truncated partial second ADTS header claiming 400 bytes when only 5 bytes remain
+        val truncatedTail = byteArrayOf(0xFF.toByte(), 0xF1.toByte(), 0x4C, 0x80.toByte(), 0x32)
+        val dirty = validAdts + truncatedTail
+
+        val slices = RemuxTimelineNormalizer.splitAndStripAdtsFrames(dirty, basePtsUs = 50_000L)
+        assertEquals("Should salvage complete valid ADTS frames and drop truncated tail", 1, slices.size)
+        assertArrayEquals(payload, dirty.copyOfRange(slices[0].payloadOffset, slices[0].payloadOffset + slices[0].payloadLength))
+
+        // Non-ADTS raw AAC returns empty list cleanly
+        assertTrue(RemuxTimelineNormalizer.splitAndStripAdtsFrames(payload).isEmpty())
+    }
+
+    @Test
+    fun finalizingStateAndZeroSpeedFormatting_neverEmitDoubleDashOrStuck100Percent() {
+        val baseHls = DownloadItem(
+            id = 7L,
+            title = "مسلسل Newlyweds الموسم الاول الحلقة 5 مترجمة",
+            sourceUrl = "https://topcinemaa.one/watch/",
+            remoteUrl = "https://cdn.example/480p.m3u8",
+            type = MediaType.VIDEO,
+            container = "mp4",
+            qualityLabel = "480p",
+            status = DownloadStatus.FINALIZING,
+            downloadedBytes = 76_650_000L,
+            totalBytes = 76_650_000L,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            isHls = true
+        )
+
+        assertTrue("FINALIZING items must remain active in UI", baseHls.isActive)
+        val finPrimary = formatDownloadPrimaryStatus(baseHls)
+        val finSecondary = formatDownloadSecondaryStatus(baseHls)
+        assertFalse("FINALIZING primary must not show stuck 100%: $finPrimary", finPrimary.contains("100%"))
+        assertTrue("FINALIZING primary must keep quality and size: $finPrimary", finPrimary.contains("480p") && finPrimary.contains("MB"))
+        assertEquals("Merging video…", finSecondary)
+
+        // Contextual finalizing labels for adaptive mux, MP3, M4A, and direct save
+        assertEquals(
+            "Merging video & audio…",
+            formatDownloadSecondaryStatus(
+                baseHls.copy(isHls = false, headersJson = """{"X-Internal-Companion-Audio":"https://cdn/a.m4a"}""")
+            )
+        )
+        assertEquals(
+            "Converting to MP3…",
+            formatDownloadSecondaryStatus(
+                baseHls.copy(type = MediaType.AUDIO, container = "mp3", headersJson = """{"X-Internal-Extract-Audio":"true"}""")
+            )
+        )
+        assertEquals(
+            "Finalizing audio…",
+            formatDownloadSecondaryStatus(
+                baseHls.copy(type = MediaType.AUDIO, container = "m4a", isHls = true)
+            )
+        )
+        assertEquals(
+            "Saving file…",
+            formatDownloadSecondaryStatus(
+                baseHls.copy(isHls = false, headersJson = null)
+            )
+        )
+
+        // Defense-in-depth: RUNNING with speed=0 must NEVER render "--"
+        val runningAtZero = baseHls.copy(status = DownloadStatus.RUNNING, downloadedBytes = 0L, totalBytes = 10_000_000L, speedBytesPerSec = 0L)
+        assertEquals("Starting…", formatDownloadSecondaryStatus(runningAtZero))
+
+        val runningMidZeroSpeed = baseHls.copy(status = DownloadStatus.RUNNING, downloadedBytes = 5_000_000L, totalBytes = 10_000_000L, speedBytesPerSec = 0L)
+        assertEquals("Downloading…", formatDownloadSecondaryStatus(runningMidZeroSpeed))
+
+        val runningAtFullZeroSpeed = baseHls.copy(status = DownloadStatus.RUNNING, speedBytesPerSec = 0L)
+        val secFull = formatDownloadSecondaryStatus(runningAtFullZeroSpeed)
+        assertNotNull(secFull)
+        assertFalse("Must never show '--': $secFull", secFull!!.contains("--"))
+        assertEquals("Merging video…", secFull)
+
+        // Foreground notification text must never emit "--" either
+        val (notifFinText, _, notifFinIndet) = DownloadManager.formatForegroundNotificationStatus(listOf(baseHls))
+        assertEquals("Finalizing…", notifFinText)
+        assertTrue(notifFinIndet)
+
+        val (notifZeroSpeedText, notifPct, notifIndet) = DownloadManager.formatForegroundNotificationStatus(listOf(runningMidZeroSpeed))
+        assertFalse("Notification text must never show '--': $notifZeroSpeedText", notifZeroSpeedText.contains("--"))
+        assertEquals(50, notifPct)
+        assertFalse(notifIndet)
+    }
+
+    @Test
+    fun patchCttsFullBoxHeaders_repairsMedia3Version0Flags1ToIsoVersion1Flags0() {
+        // Build minimal nested moov/trak/mdia/minf/stbl/ctts with Media3 1.4.1's buggy 00 00 00 01 header
+        fun box(type: String, payload: ByteArray): ByteArray {
+            val out = java.nio.ByteBuffer.allocate(8 + payload.size)
+            out.putInt(8 + payload.size)
+            out.put(type.toByteArray(Charsets.ISO_8859_1))
+            out.put(payload)
+            return out.array()
+        }
+        val buggyCttsPayload = byteArrayOf(
+            0x00, 0x00, 0x00, 0x01, // Media3 1.4.1 bug: version=0, flags=1
+            0x00, 0x00, 0x00, 0x01, // entry_count = 1
+            0x00, 0x00, 0x00, 0x01, // sample_count = 1
+            0xFF.toByte(), 0xFF.toByte(), 0xE9.toByte(), 0xDB.toByte() // sample_offset = -5669
+        )
+        val mp4 = box("ftyp", "isom\u0000\u0000\u0002\u0000isom".toByteArray(Charsets.ISO_8859_1)) +
+            box("moov", box("trak", box("mdia", box("minf", box("stbl", box("ctts", buggyCttsPayload))))))
+
+        val f = File(tempFolder.root, "buggy_ctts.mp4").apply { writeBytes(mp4) }
+        val patchedCount = Media3Mp4Remuxer.patchCttsFullBoxHeaders(f)
+        assertEquals(1, patchedCount)
+
+        // Second pass must be idempotent (already version=1, flags=0)
+        assertEquals(0, Media3Mp4Remuxer.patchCttsFullBoxHeaders(f))
+
+        val bytes = f.readBytes()
+        val cttsIdx = String(bytes, Charsets.ISO_8859_1).indexOf("ctts")
+        assertTrue(cttsIdx > 0)
+        assertEquals(1, bytes[cttsIdx + 4].toInt() and 0xFF) // version == 1
+        assertEquals(0, bytes[cttsIdx + 5].toInt() and 0xFF) // flags byte 0 == 0
+        assertEquals(0, bytes[cttsIdx + 6].toInt() and 0xFF) // flags byte 1 == 0
+        assertEquals(0, bytes[cttsIdx + 7].toInt() and 0xFF) // flags byte 2 == 0
+    }
+
     private fun hasFfmpegAndFfprobe(): Boolean =
         runCatching { runCmd("ffmpeg", "-version").first == 0 && runCmd("ffprobe", "-version").first == 0 }
             .getOrDefault(false)

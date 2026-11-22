@@ -20,7 +20,7 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads WHERE type = :type ORDER BY createdAt DESC")
     fun observeByType(type: MediaType): Flow<List<DownloadEntity>>
 
-    @Query("SELECT * FROM downloads WHERE status IN ('QUEUED','RUNNING','PAUSED','FAILED') ORDER BY createdAt DESC")
+    @Query("SELECT * FROM downloads WHERE status IN ('QUEUED','RUNNING','FINALIZING','PAUSED','FAILED') ORDER BY createdAt DESC")
     fun observeActive(): Flow<List<DownloadEntity>>
 
     @Query("SELECT * FROM downloads WHERE type = :type AND status = 'COMPLETED' ORDER BY updatedAt DESC")
@@ -67,10 +67,10 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads WHERE status = 'QUEUED' ORDER BY createdAt ASC LIMIT :limit")
     suspend fun nextQueued(limit: Int): List<DownloadEntity>
 
-    @Query("SELECT COUNT(*) FROM downloads WHERE status = 'RUNNING'")
+    @Query("SELECT COUNT(*) FROM downloads WHERE status IN ('RUNNING','FINALIZING')")
     suspend fun runningCount(): Int
 
-    // Recover from process death: any download left RUNNING is returned to the queue.
-    @Query("UPDATE downloads SET status = 'QUEUED' WHERE status = 'RUNNING'")
+    // Recover from process death: any download left RUNNING or FINALIZING is returned to the queue.
+    @Query("UPDATE downloads SET status = 'QUEUED' WHERE status IN ('RUNNING','FINALIZING')")
     suspend fun resetRunningToQueued()
 }

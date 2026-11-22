@@ -83,13 +83,13 @@ fun DownloadRow(
                 }
                 if (item.isActive && item.status != DownloadStatus.QUEUED) {
                     Spacer(Modifier.height(6.dp))
-                    if (item.totalBytes > 0) {
+                    if (item.status == DownloadStatus.FINALIZING || item.totalBytes <= 0) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
                         LinearProgressIndicator(
                             progress = { item.progress },
                             modifier = Modifier.fillMaxWidth()
                         )
-                    } else {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
                 }
             }
@@ -138,6 +138,7 @@ private fun ActionButtons(
     onCancel: (() -> Unit)?,
     onRetry: (() -> Unit)?
 ) {
+    if (item.status == DownloadStatus.FINALIZING) return
     Row(verticalAlignment = Alignment.CenterVertically) {
         when (item.status) {
             DownloadStatus.RUNNING, DownloadStatus.QUEUED -> {
@@ -188,6 +189,10 @@ internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
             }
             "$quality · $size$percent"
         }
+        DownloadStatus.FINALIZING -> {
+            val sizeBytes = maxOf(safeDone, safeTotal)
+            if (sizeBytes > 0L) "$quality · ${FormatUtils.formatBytes(sizeBytes)}" else "$quality · Finalizing"
+        }
         DownloadStatus.PAUSED -> "$quality · Paused (${FormatUtils.formatPercent(item.progress)})"
         DownloadStatus.COMPLETED -> "$quality · ${FormatUtils.formatBytes(item.totalBytes.coerceAtLeast(safeDone))}"
         DownloadStatus.FAILED -> "Failed · tap retry"
@@ -196,12 +201,39 @@ internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
 }
 
 internal fun formatDownloadSecondaryStatus(item: DownloadItem): String? {
-    if (item.status != DownloadStatus.RUNNING) return null
-    val safeDone = item.downloadedBytes.coerceAtLeast(0L)
-    val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
-    val speed = FormatUtils.formatSpeed(item.speedBytesPerSec.coerceAtLeast(0L))
-    val eta = if (item.etaSeconds > 0 && safeTotal > safeDone) {
-        " · ${FormatUtils.formatEta(item.etaSeconds)} left"
-    } else ""
-    return "$speed$eta"
+    return when (item.status) {
+        DownloadStatus.FINALIZING -> formatFinalizingStageLabel(item)
+        DownloadStatus.RUNNING -> {
+            val safeDone = item.downloadedBytes.coerceAtLeast(0L)
+            val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
+            val speedBytes = item.speedBytesPerSec.coerceAtLeast(0L)
+            if (speedBytes <= 0L) {
+                when {
+                    safeTotal > 0L && safeDone >= safeTotal -> formatFinalizingStageLabel(item)
+                    safeDone == 0L -> "Starting…"
+                    else -> "Downloading…"
+                }
+            } else {
+                val speed = FormatUtils.formatSpeed(speedBytes)
+                val eta = if (item.etaSeconds > 0 && safeTotal > safeDone) {
+                    " · ${FormatUtils.formatEta(item.etaSeconds)} left"
+                } else ""
+                "$speed$eta"
+            }
+        }
+        else -> null
+    }
+}
+
+private fun formatFinalizingStageLabel(item: DownloadItem): String {
+    val headers = item.headersJson.orEmpty()
+    val hasCompanionAudio = headers.contains("X-Internal-Companion-Audio")
+    val isExtractAudio = headers.contains("X-Internal-Extract-Audio") || item.type == MediaType.AUDIO
+    return when {
+        isExtractAudio && item.container.equals("mp3", ignoreCase = true) -> "Converting to MP3…"
+        isExtractAudio -> "Finalizing audio…"
+        hasCompanionAudio -> "Merging video & audio…"
+        item.isHls -> "Merging video…"
+        else -> "Saving file…"
+    }
 }

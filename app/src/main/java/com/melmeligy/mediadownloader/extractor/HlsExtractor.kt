@@ -99,19 +99,32 @@ class HlsExtractor @Inject constructor(
             }
 
             // Probe first variant playlist to calculate sanitized duration (excluding injected discontinuity ad blocks)
-            val firstVariantUrl = rawVariants.firstOrNull()?.variantUrl
+            val firstVariant = rawVariants.firstOrNull()
+            val firstVariantUrl = firstVariant?.variantUrl
             val variantText = if (firstVariantUrl != null) {
                 runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
             } else null
 
-            val probedDurationSeconds = if (!variantText.isNullOrBlank() && firstVariantUrl != null) {
+            val sanitizedFirstVariant = if (!variantText.isNullOrBlank() && firstVariantUrl != null) {
                 HlsPlaylistSanitizer.parseAndSanitize(variantText, firstVariantUrl)
-                    .totalDurationSec
-                    .roundToLong()
-            } else 0L
+            } else null
+
+            val probedDurationSeconds = sanitizedFirstVariant?.totalDurationSec?.roundToLong() ?: 0L
 
             val headerDurationSeconds = headers["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
             val totalDurationSeconds = if (probedDurationSeconds > 0L) probedDurationSeconds else headerDurationSeconds
+
+            // Calibrate peak-only BANDWIDTH estimates against actual interior segment byte-rates
+            // (avoiding seg[0] which is frequently inflated by intro/IDR frames, and defaulting to 1.0x BANDWIDTH)
+            val peakBandwidthScale = computePeakBandwidthCalibrationScale(
+                firstVariant = firstVariant,
+                sanitizedFirstVariant = sanitizedFirstVariant,
+                hasPeakOnlyVariants = rawVariants.any {
+                    it.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull() == null &&
+                        it.attrs["BANDWIDTH"]?.toIntOrNull() != null
+                },
+                headers = headers
+            )
 
             val baseStreamHeaders = if (totalDurationSeconds > 0L) {
                 headers + ("X-Internal-Duration-Seconds" to totalDurationSeconds.toString())
@@ -162,7 +175,8 @@ class HlsExtractor @Inject constructor(
                 val videoBytes = when {
                     totalDurationSeconds <= 0L -> null
                     avgBandwidth != null -> (avgBandwidth.toLong() * totalDurationSeconds) / 8L
-                    bandwidth != null -> (bandwidth.toDouble() * 0.85 * totalDurationSeconds / 8.0).roundToLong()
+                    bandwidth != null -> ((bandwidth.toDouble() * peakBandwidthScale * totalDurationSeconds) / 8.0)
+                        .roundToLong()
                         .takeIf { it > 0L }
                     else -> null
                 }
@@ -284,20 +298,28 @@ class HlsExtractor @Inject constructor(
                     ((sizeBytes * 8L) / (totalDurationSeconds * 1000L)).toInt()
                 } else null
 
-                // 2. Otherwise probe first non-ad media segment
-                if (sizeBytes == null) {
-                    val seg0 = mediaSegments.firstOrNull()
-                    val seg0Url = seg0?.url
-                    val seg0Duration = seg0?.durationSec
-
-                    if (seg0Url != null) {
-                        val probe = runCatching { http.probe(seg0Url, headers) }.getOrNull()
-                        val seg0Length = probe?.contentLength?.takeIf { it > 0 }
-                        if (seg0Length != null && seg0Duration != null && seg0Duration > 0.0 && totalDurationSeconds > 0L) {
-                            val byteRate = seg0Length.toDouble() / seg0Duration
-                            sizeBytes = (byteRate * totalDurationSeconds).toLong()
-                            bitrateKbps = ((byteRate * 8) / 1000).toInt()
+                // 2. Otherwise probe representative media segment(s)
+                if (sizeBytes == null && totalDurationSeconds > 0L) {
+                    val sampleSegments = if (mediaSegments.size >= 4) {
+                        val n = mediaSegments.size
+                        listOf(mediaSegments[n / 4], mediaSegments[n / 2], mediaSegments[(n * 3) / 4]).distinctBy { it.url }
+                    } else {
+                        listOfNotNull(mediaSegments.firstOrNull())
+                    }
+                    val byteRate = probeAverageByteRate(
+                        segments = sampleSegments,
+                        headers = headers,
+                        useShortTimeout = mediaSegments.size >= 4
+                    )
+                    if (byteRate != null && byteRate > 0.0) {
+                        val containerFactor = if (mediaSegments.size >= 4 && !hasInitMap(sanitized)) {
+                            TS_TO_MP4_CONTAINER_FACTOR
+                        } else {
+                            1.0
                         }
+                        val effectiveByteRate = byteRate * containerFactor
+                        sizeBytes = (effectiveByteRate * totalDurationSeconds).roundToLong().takeIf { it > 0L }
+                        bitrateKbps = ((effectiveByteRate * 8.0) / 1000.0).toInt().takeIf { it > 0 }
                     }
                 }
 
@@ -361,6 +383,73 @@ class HlsExtractor @Inject constructor(
         return ResolvedMedia(sourceUrl = url, title = title, streams = sorted, extractor = name)
     }
 
+    private fun computePeakBandwidthCalibrationScale(
+        firstVariant: RawVariant?,
+        sanitizedFirstVariant: SanitizedHlsPlaylist?,
+        hasPeakOnlyVariants: Boolean,
+        headers: Map<String, String>
+    ): Double {
+        if (!hasPeakOnlyVariants || firstVariant == null || sanitizedFirstVariant == null) return 1.0
+        val declaredBw = firstVariant.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull()?.takeIf { it > 0 }
+            ?: firstVariant.attrs["BANDWIDTH"]?.toIntOrNull()?.takeIf { it > 0 }
+            ?: return 1.0
+
+        val mediaSegments = sanitizedFirstVariant.segments.filter { !it.isInitMap && it.durationSec > 0.0 }
+        if (mediaSegments.isEmpty()) return 1.0
+
+        val containerFactor = if (hasInitMap(sanitizedFirstVariant)) 1.0 else TS_TO_MP4_CONTAINER_FACTOR
+
+        // If the variant advertises exact #EXT-X-BYTERANGE lengths, calibrate directly without extra HTTP calls
+        if (mediaSegments.all { (it.byteRangeLength ?: 0L) > 0L } && sanitizedFirstVariant.totalDurationSec > 0.0) {
+            val totalBytes = sanitizedFirstVariant.segments.sumOf { it.byteRangeLength ?: 0L }
+            if (totalBytes > 0L) {
+                val measuredBps = (totalBytes.toDouble() * 8.0 / sanitizedFirstVariant.totalDurationSec) * containerFactor
+                return (measuredBps / declaredBw.toDouble()).coerceIn(MIN_CALIBRATION_SCALE, MAX_CALIBRATION_SCALE)
+            }
+        }
+
+        // Probe up to 2 interior segments (skipping seg[0], which is often skewed by intro/keyframe spikes)
+        val n = mediaSegments.size
+        val sampleSegments = if (n >= 4) {
+            listOf(mediaSegments[n / 3], mediaSegments[(n * 2) / 3]).distinctBy { it.url }
+        } else {
+            listOf(mediaSegments[n / 2])
+        }
+
+        val byteRate = probeAverageByteRate(sampleSegments, headers, useShortTimeout = true) ?: return 1.0
+        val measuredBps = byteRate * 8.0 * containerFactor
+        return (measuredBps / declaredBw.toDouble()).coerceIn(MIN_CALIBRATION_SCALE, MAX_CALIBRATION_SCALE)
+    }
+
+    private fun probeAverageByteRate(
+        segments: List<HlsParsedSegment>,
+        headers: Map<String, String>,
+        useShortTimeout: Boolean
+    ): Double? {
+        var totalBytes = 0L
+        var totalDurationSec = 0.0
+        for (seg in segments) {
+            if (seg.durationSec <= 0.0) continue
+            val probe = if (useShortTimeout) {
+                runCatching { http.probe(seg.url, headers, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
+                    ?: runCatching { http.probe(seg.url, headers) }.getOrNull()
+            } else {
+                runCatching { http.probe(seg.url, headers) }.getOrNull()
+            }
+            val len = probe?.contentLength?.takeIf { it > 0L } ?: continue
+            totalBytes += len
+            totalDurationSec += seg.durationSec
+        }
+        return if (totalBytes > 0L && totalDurationSec > 0.0) {
+            totalBytes.toDouble() / totalDurationSec
+        } else {
+            null
+        }
+    }
+
+    private fun hasInitMap(sanitized: SanitizedHlsPlaylist): Boolean =
+        sanitized.segments.any { it.isInitMap }
+
     private fun sumByteRanges(playlistText: String): Long {
         var segCount = 0
         var rangeCount = 0
@@ -399,4 +488,11 @@ class HlsExtractor @Inject constructor(
         val variantUrl: String,
         val attrs: Map<String, String>
     )
+
+    private companion object {
+        const val SEGMENT_PROBE_TIMEOUT_MS = 1_500L
+        const val TS_TO_MP4_CONTAINER_FACTOR = 0.94
+        const val MIN_CALIBRATION_SCALE = 0.85
+        const val MAX_CALIBRATION_SCALE = 1.35
+    }
 }

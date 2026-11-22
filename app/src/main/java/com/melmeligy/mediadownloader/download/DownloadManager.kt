@@ -272,12 +272,14 @@ class DownloadManager @Inject constructor(
         var lastProgressWriteMs = 0L
         var highWaterDownloaded = 0L
         var highWaterTotal = item.totalBytes.coerceAtLeast(0L)
+        var isFinalizing = false
 
         suspend fun reportProgress(
             downloaded: Long,
             total: Long,
             speed: Long,
             eta: Long,
+            capBeforeFinalizing: Boolean = true,
             force: Boolean = false
         ) {
             val safeDownloaded = maxOf(highWaterDownloaded, downloaded.coerceAtLeast(0L))
@@ -291,12 +293,36 @@ class DownloadManager @Inject constructor(
             }
             if (!item.isHls && safeTotal > 0L) highWaterTotal = safeTotal
 
-            val now = System.currentTimeMillis()
             val isComplete = safeTotal > 0L && safeDownloaded >= safeTotal
+            // Avoid flashing a transient RUNNING 100% + speed=0 row right before enterFinalizing() runs
+            if (isComplete && capBeforeFinalizing && speed <= 0L) {
+                return
+            }
+
+            val displayedDownloaded = if (capBeforeFinalizing && safeTotal > 0L && safeDownloaded >= safeTotal) {
+                ((safeTotal * 99L) / 100L).coerceAtMost(safeTotal - 1L).coerceAtLeast(0L)
+            } else {
+                safeDownloaded
+            }
+
+            val now = System.currentTimeMillis()
             if (force || isComplete || now - lastProgressWriteMs >= DB_PROGRESS_MIN_INTERVAL_MS) {
                 lastProgressWriteMs = now
-                repository.updateProgress(item.id, safeDownloaded, safeTotal, speed.coerceAtLeast(0L), eta)
+                repository.updateProgress(item.id, displayedDownloaded, safeTotal, speed.coerceAtLeast(0L), eta)
             }
+        }
+
+        suspend fun enterFinalizing(currentBytes: Long) {
+            if (!isFinalizing) {
+                isFinalizing = true
+                // Switch status BEFORE clearing speed/eta so UI never flashes RUNNING + "--"
+                repository.updateStatus(item.id, DownloadStatus.FINALIZING)
+            }
+            val safeBytes = if (currentBytes > 0L) currentBytes else highWaterDownloaded
+            if (safeBytes > 0L) {
+                repository.updateProgress(item.id, safeBytes, safeBytes, 0L, 0L)
+            }
+            queueSignal.trySend(Unit)
         }
 
         try {
@@ -384,6 +410,7 @@ class DownloadManager @Inject constructor(
                                 }
                             )
                         }
+                        enterFinalizing(videoActual + stagingAudioTs.length())
                         val ok = withContext(dispatchers.io) {
                             val vOk = videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4)
                             val aOk = videoAudioMuxer.extractM4a(stagingAudioTs, stagingAudioM4a)
@@ -391,6 +418,8 @@ class DownloadManager @Inject constructor(
                         }
                         if (!ok) throw MediaException(AppError.GENERIC, "Failed to mux split HLS streams")
                     } else {
+                        val finalizingBytes = if (targetAudioTotal > 0L) targetAudioTotal else stagingTs.length()
+                        enterFinalizing(finalizingBytes)
                         val ok = withContext(dispatchers.io) {
                             if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
                                 videoAudioMuxer.extractAudioOnly(stagingTs, staging, item.container, targetBitrateKbps)
@@ -478,6 +507,7 @@ class DownloadManager @Inject constructor(
                     )
 
                     // 3. Mux video + audio into final container (MP4 or WebM)
+                    enterFinalizing(videoActualBytes + stagingAudio.length())
                     val ok = withContext(dispatchers.io) {
                         videoAudioMuxer.mux(stagingVideo, stagingAudio, staging)
                     }
@@ -519,6 +549,7 @@ class DownloadManager @Inject constructor(
                             }
                         }
                     )
+                    enterFinalizing(targetAudioTotal.takeIf { it > 0L } ?: stagingSource.length())
                     val ok = withContext(dispatchers.io) {
                         videoAudioMuxer.extractAudioOnly(stagingSource, staging, item.container, targetBitrateKbps)
                     }
@@ -545,8 +576,8 @@ class DownloadManager @Inject constructor(
             val bytes = staging.length()
             if (bytes <= 0L) throw MediaException(AppError.GENERIC, "Downloaded file is empty")
 
-            // Persist exact final 100% snapshot at actual output file byte size
-            repository.updateProgress(item.id, bytes, bytes, 0L, 0L)
+            // Persist exact output size under FINALIZING state while publishing to MediaStore
+            enterFinalizing(bytes)
 
             val settings = settingsRepository.current()
             val displayName = fileName(item)
@@ -647,7 +678,11 @@ class DownloadManager @Inject constructor(
     suspend fun currentForegroundInfo(): ForegroundInfo {
         val active = runCatching {
             repository.observeActive().first()
-                .filter { it.status == DownloadStatus.RUNNING || it.status == DownloadStatus.QUEUED }
+                .filter {
+                    it.status == DownloadStatus.RUNNING ||
+                        it.status == DownloadStatus.FINALIZING ||
+                        it.status == DownloadStatus.QUEUED
+                }
         }.getOrDefault(emptyList())
 
         val notification = buildForegroundNotification(active)
@@ -667,19 +702,9 @@ class DownloadManager @Inject constructor(
                 indeterminate = true
             )
         }
-        val totalBytes = active.sumOf { maxOf(it.totalBytes, it.downloadedBytes).coerceAtLeast(0) }
-        val doneBytes = active.sumOf { it.downloadedBytes.coerceAtLeast(0) }
-        val speed = active.sumOf { it.speedBytesPerSec.coerceAtLeast(0) }
-        val indeterminate = active.all { it.totalBytes <= 0L }
-        val percent = if (!indeterminate && totalBytes > 0) {
-            ((doneBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
-        } else 0
         val title = if (active.size == 1) active.first().title
         else context.getString(com.melmeligy.mediadownloader.R.string.notif_downloading) + " ${active.size} files"
-        val text = buildString {
-            if (!indeterminate) append("$percent% · ")
-            append(FormatUtils.formatSpeed(speed))
-        }
+        val (text, percent, indeterminate) = formatForegroundNotificationStatus(active)
         return notifier.buildForeground(title, text, percent, indeterminate)
     }
 
@@ -764,6 +789,30 @@ class DownloadManager @Inject constructor(
             } else {
                 basePrefix
             }
+        }
+
+        internal fun formatForegroundNotificationStatus(active: List<DownloadItem>): Triple<String, Int, Boolean> {
+            if (active.isEmpty()) return Triple("…", 0, true)
+            if (active.all { it.status == DownloadStatus.FINALIZING }) {
+                return Triple("Finalizing…", 0, true)
+            }
+            if (active.all { it.status == DownloadStatus.QUEUED }) {
+                return Triple("Queued…", 0, true)
+            }
+            val totalBytes = active.sumOf { maxOf(it.totalBytes, it.downloadedBytes).coerceAtLeast(0L) }
+            val doneBytes = active.sumOf { it.downloadedBytes.coerceAtLeast(0L) }
+            val speed = active.sumOf { it.speedBytesPerSec.coerceAtLeast(0L) }
+            val indeterminate = active.all { it.totalBytes <= 0L }
+            val percent = if (!indeterminate && totalBytes > 0L) {
+                ((doneBytes * 100L) / totalBytes).toInt().coerceIn(0, 99)
+            } else 0
+            val suffix = when {
+                speed > 0L -> FormatUtils.formatSpeed(speed)
+                active.any { it.status == DownloadStatus.FINALIZING } -> "Finalizing…"
+                else -> "Downloading…"
+            }
+            val text = if (indeterminate) suffix else "$percent% · $suffix"
+            return Triple(text, percent, indeterminate)
         }
     }
 }

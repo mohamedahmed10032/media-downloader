@@ -63,7 +63,7 @@ class BlobImporter @Inject constructor(
                 type = type,
                 container = container,
                 qualityLabel = "Blob media",
-                status = DownloadStatus.RUNNING,
+                status = DownloadStatus.FINALIZING,
                 totalBytes = bytes,
                 downloadedBytes = bytes
             )

@@ -4,7 +4,7 @@ package com.melmeligy.mediadownloader.domain.model
 enum class MediaType { VIDEO, AUDIO, IMAGE }
 
 /** Lifecycle of a download task. */
-enum class DownloadStatus { QUEUED, RUNNING, PAUSED, COMPLETED, FAILED, CANCELED }
+enum class DownloadStatus { QUEUED, RUNNING, FINALIZING, PAUSED, COMPLETED, FAILED, CANCELED }
 
 /**
  * A single resolvable stream/variant of a media source (one quality, one container).
@@ -87,7 +87,10 @@ data class DownloadItem(
         get() = if (totalBytes > 0) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 
     val isActive: Boolean
-        get() = status == DownloadStatus.QUEUED || status == DownloadStatus.RUNNING || status == DownloadStatus.PAUSED
+        get() = status == DownloadStatus.QUEUED ||
+            status == DownloadStatus.RUNNING ||
+            status == DownloadStatus.FINALIZING ||
+            status == DownloadStatus.PAUSED
 }
 
 /** A saved browser bookmark. */
