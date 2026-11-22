@@ -161,9 +161,15 @@ class HeadlessWebExtractor @Inject constructor(
                             view.evaluateJavascript(
                                 "(function(){try{" +
                                     "if(window.__dlScanNow) window.__dlScanNow();" +
-                                    "var ogImg=document.querySelector('meta[property=\"og:image\"]');" +
+                                    "function abs(u){if(!u)return '';try{var r=new URL(u,location.href).href;return /^https?:\\/\\//i.test(r)?r:'';}catch(e){return '';}}" +
+                                    "var sels=['meta[property=\"og:image:secure_url\"]','meta[property=\"og:image\"]','meta[property=\"og:image:url\"]','meta[name=\"twitter:image\"]','meta[property=\"twitter:image\"]','meta[name=\"twitter:image:src\"]'];" +
+                                    "var img='';" +
+                                    "for(var s=0;s<sels.length&&!img;s++){var m=document.querySelector(sels[s]);if(m&&m.content)img=abs(m.content);}" +
+                                    "if(!img){var v=document.querySelector('video[poster],video[data-poster]');if(v)img=abs(v.getAttribute('poster')||v.getAttribute('data-poster'));}" +
+                                    "if(!img){var p=document.querySelector('[data-poster],[data-thumb],[data-thumbnail]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail'));}" +
+                                    "if(!img){var l=document.querySelector('link[rel=\"image_src\"]');if(l&&l.href)img=abs(l.href);}" +
                                     "var ogTitle=document.querySelector('meta[property=\"og:title\"]');" +
-                                    "return JSON.stringify({t:ogTitle?ogTitle.content:'',i:ogImg?ogImg.content:''});" +
+                                    "return JSON.stringify({t:ogTitle?ogTitle.content:'',i:img});" +
                                     "}catch(e){return '';}})();"
                             ) { jsonStr ->
                                 runCatching {

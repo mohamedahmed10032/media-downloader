@@ -207,34 +207,52 @@ private fun LibraryItemRow(
 private fun Thumb(item: DownloadItem, onClick: () -> Unit) {
     val context = LocalContext.current
     val shape = RoundedCornerShape(8.dp)
+    val candidates = remember(item.id, item.thumbnailUrl, item.contentUri, item.type) {
+        com.melmeligy.mediadownloader.ui.common.resolveThumbnailCandidates(item)
+    }
+    val headers = remember(item.headersJson) {
+        com.melmeligy.mediadownloader.core.util.JsonUtils.jsonToMap(item.headersJson)
+    }
+    var candidateIndex by remember(candidates) { mutableStateOf(0) }
+    var loaded by remember(candidates, candidateIndex) { mutableStateOf(false) }
+
     Box(
         modifier = Modifier.size(56.dp).clip(shape).clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = when (item.type) {
-                MediaType.VIDEO -> Icons.Rounded.Movie
-                MediaType.AUDIO -> Icons.Rounded.MusicNote
-                MediaType.IMAGE -> Icons.Rounded.Image
-            },
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary
-        )
-        val remoteThumb = item.thumbnailUrl?.takeIf { it.startsWith("http") }
-        val localUri = item.contentUri?.takeIf { item.type != MediaType.AUDIO && it.isNotBlank() }
-        val imageData: Any? = remoteThumb ?: localUri?.toUri()
-        if (imageData != null) {
-            val request = remember(imageData) {
-                ImageRequest.Builder(context)
-                    .data(imageData)
-                    .size(168, 168)
-                    .crossfade(false)
-                    .build()
+        if (!loaded) {
+            Icon(
+                imageVector = when (item.type) {
+                    MediaType.VIDEO -> Icons.Rounded.Movie
+                    MediaType.AUDIO -> Icons.Rounded.MusicNote
+                    MediaType.IMAGE -> Icons.Rounded.Image
+                },
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+        val activeCandidate = candidates.getOrNull(candidateIndex)
+        if (activeCandidate != null) {
+            val request = remember(activeCandidate, item.sourceUrl, headers) {
+                com.melmeligy.mediadownloader.ui.common.buildThumbnailImageRequest(
+                    context = context,
+                    candidate = activeCandidate,
+                    sourceUrl = item.sourceUrl,
+                    headers = headers,
+                    sizePx = 168
+                )
             }
             AsyncImage(
                 model = request,
                 contentDescription = item.title,
                 contentScale = ContentScale.Crop,
+                onSuccess = { loaded = true },
+                onError = {
+                    loaded = false
+                    if (candidateIndex + 1 < candidates.size) {
+                        candidateIndex++
+                    }
+                },
                 modifier = Modifier.size(56.dp).clip(shape)
             )
         }

@@ -54,6 +54,18 @@ class DownloadRepositoryImpl @Inject constructor(
         dao.updateStatus(id, status.name, now())
     }
 
+    override suspend fun updateThumbnail(id: Long, thumbnailUrl: String) = withContext(dispatchers.io) {
+        dao.updateThumbnail(id, thumbnailUrl, now())
+    }
+
+    override suspend fun requeue(id: Long, resetRetryCount: Boolean) = withContext(dispatchers.io) {
+        if (resetRetryCount) {
+            dao.requeueForRetry(id, now())
+        } else {
+            dao.requeueForResume(id, now())
+        }
+    }
+
     override suspend fun updateProgress(id: Long, downloaded: Long, total: Long, speed: Long, eta: Long) =
         withContext(dispatchers.io) {
             dao.updateProgress(id, downloaded, total, speed, eta, now())

@@ -509,6 +509,12 @@ class StreamingPortalResolver(
             directVideoRegex.findAll(stripped).take(4).forEach { addCandidate(it.value) }
         }
 
+        val resolvedPoster = HtmlThumbnailExtractor.extractThumbnail(
+            doc = embedDoc,
+            pageUrl = embedUrl,
+            preferredThumb = playerCfg.posterUrl
+        )
+
         // Materialize & verify streams found in this embed hop
         if (candidates.isNotEmpty()) {
             progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
@@ -521,7 +527,7 @@ class StreamingPortalResolver(
             if (resolvedStreams.isNotEmpty()) {
                 return@coroutineScope PortalExtractionResult(
                     streams = resolvedStreams,
-                    posterUrl = playerCfg.posterUrl
+                    posterUrl = resolvedPoster
                 )
             }
         }
@@ -556,13 +562,13 @@ class StreamingPortalResolver(
                 )
                 if (deeper.streams.isNotEmpty()) {
                     return@coroutineScope deeper.copy(
-                        posterUrl = deeper.posterUrl ?: playerCfg.posterUrl
+                        posterUrl = deeper.posterUrl ?: resolvedPoster
                     )
                 }
             }
         }
 
-        PortalExtractionResult(emptyList(), playerCfg.posterUrl)
+        PortalExtractionResult(emptyList(), resolvedPoster)
     }
 
     private suspend fun materializeCandidate(

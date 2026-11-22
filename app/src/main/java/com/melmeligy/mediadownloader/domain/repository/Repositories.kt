@@ -29,6 +29,8 @@ interface DownloadRepository {
     suspend fun enqueue(item: DownloadItem): Long
     suspend fun update(item: DownloadItem)
     suspend fun updateStatus(id: Long, status: DownloadStatus)
+    suspend fun updateThumbnail(id: Long, thumbnailUrl: String)
+    suspend fun requeue(id: Long, resetRetryCount: Boolean = false)
     suspend fun updateProgress(id: Long, downloaded: Long, total: Long, speed: Long, eta: Long)
     suspend fun setError(id: Long, error: AppError)
     suspend fun incrementRetry(id: Long)

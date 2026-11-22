@@ -901,11 +901,13 @@ class HtmlMediaExtractor @Inject constructor(
                 val portalNonVideos = portalRes.streams.filter { it.type != MediaType.VIDEO }
                 val finalPortalStreams = collapsedPortalVideos + portalNonVideos
                 if (finalPortalStreams.isNotEmpty()) {
-                    val thumbnail = customThumb
-                        ?: doc.select("meta[property=og:image]").attr("abs:content").ifBlank { null }
-                        ?: doc.select("meta[name=twitter:image]").attr("abs:content").ifBlank { null }
-                        ?: jsonLdThumb
-                        ?: portalRes.posterUrl
+                    val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
+                        doc = doc,
+                        pageUrl = pageUrl,
+                        preferredThumb = customThumb,
+                        jsonLdThumb = jsonLdThumb,
+                        playerPoster = portalRes.posterUrl
+                    )
                     val title = customTitle
                         ?: doc.select("meta[property=og:title]").attr("content").ifBlank { null }
                         ?: jsonLdTitle
@@ -946,9 +948,13 @@ class HtmlMediaExtractor @Inject constructor(
                     val iframeStreamHeaders = buildPageHeaders(iframeUrl, emptyMap())
                     val embedded = parseHtml(iframeUrl, iframeHtml, iframeStreamHeaders, allowEmbedFollow = false)
                     if (embedded != null && embedded.streams.isNotEmpty()) {
-                        val thumbnail = customThumb
-                            ?: doc.select("meta[property=og:image]").attr("abs:content").ifBlank { null }
-                            ?: embedded.thumbnailUrl
+                        val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
+                            doc = doc,
+                            pageUrl = pageUrl,
+                            preferredThumb = customThumb,
+                            jsonLdThumb = jsonLdThumb,
+                            playerPoster = embedded.thumbnailUrl
+                        )
                         val title = customTitle
                             ?: doc.select("meta[property=og:title]").attr("content").ifBlank { null }
                             ?: jsonLdTitle
@@ -977,11 +983,13 @@ class HtmlMediaExtractor @Inject constructor(
 
         if (found.isEmpty()) return@coroutineScope null
 
-        val thumbnail = customThumb
-            ?: doc.select("meta[property=og:image]").attr("abs:content")
-                .ifBlank { doc.select("meta[name=twitter:image]").attr("abs:content") }
-                .ifBlank { jsonLdThumb.orEmpty() }
-                .ifBlank { null }
+        val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
+            doc = doc,
+            pageUrl = pageUrl,
+            preferredThumb = customThumb,
+            jsonLdThumb = jsonLdThumb,
+            playerPoster = directPlayerCfg.posterUrl
+        )
         val title = customTitle
             ?: doc.select("meta[property=og:title]").attr("content")
                 .ifBlank { jsonLdTitle.orEmpty() }

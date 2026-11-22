@@ -59,7 +59,7 @@ import kotlin.math.pow
  * (enqueue / pause / resume / cancel / retry) and by [DownloadQueueWorker] (runQueue).
  */
 @Singleton
-class DownloadManager @Inject constructor(
+class DownloadManager private constructor(
     @ApplicationContext private val context: Context,
     private val repository: DownloadRepository,
     private val settingsRepository: SettingsRepository,
@@ -68,8 +68,60 @@ class DownloadManager @Inject constructor(
     private val videoAudioMuxer: VideoAudioMuxer,
     private val mediaStoreWriter: MediaStoreWriter,
     private val notifier: DownloadNotifier,
-    private val dispatchers: DispatcherProvider
+    private val dispatchers: DispatcherProvider,
+    private val thumbnailCache: DownloadThumbnailCache?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+        repository: DownloadRepository,
+        settingsRepository: SettingsRepository,
+        segmentedDownloader: SegmentedDownloader,
+        hlsDownloader: HlsSegmentDownloader,
+        videoAudioMuxer: VideoAudioMuxer,
+        mediaStoreWriter: MediaStoreWriter,
+        notifier: DownloadNotifier,
+        dispatchers: DispatcherProvider,
+        thumbnailCache: DownloadThumbnailCache
+    ) : this(
+        context = context,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        segmentedDownloader = segmentedDownloader,
+        hlsDownloader = hlsDownloader,
+        videoAudioMuxer = videoAudioMuxer,
+        mediaStoreWriter = mediaStoreWriter,
+        notifier = notifier,
+        dispatchers = dispatchers,
+        thumbnailCache = thumbnailCache,
+        marker = true
+    )
+
+    internal constructor(
+        context: Context,
+        repository: DownloadRepository,
+        settingsRepository: SettingsRepository,
+        segmentedDownloader: SegmentedDownloader,
+        hlsDownloader: HlsSegmentDownloader,
+        videoAudioMuxer: VideoAudioMuxer,
+        mediaStoreWriter: MediaStoreWriter,
+        notifier: DownloadNotifier,
+        dispatchers: DispatcherProvider
+    ) : this(
+        context = context,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        segmentedDownloader = segmentedDownloader,
+        hlsDownloader = hlsDownloader,
+        videoAudioMuxer = videoAudioMuxer,
+        mediaStoreWriter = mediaStoreWriter,
+        notifier = notifier,
+        dispatchers = dispatchers,
+        thumbnailCache = null,
+        marker = false
+    )
 
     private val runningJobs = ConcurrentHashMap<Long, Job>()
     private val retryingJobs = ConcurrentHashMap<Long, Job>()
@@ -170,8 +222,8 @@ class DownloadManager @Inject constructor(
     suspend fun resume(id: Long) {
         intents.remove(id)
         (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
-        val item = repository.getById(id) ?: return
-        repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null))
+        if (repository.getById(id) == null) return
+        repository.requeue(id, resetRetryCount = false)
         queueSignal.trySend(Unit)
         schedule()
     }
@@ -179,8 +231,8 @@ class DownloadManager @Inject constructor(
     suspend fun retry(id: Long) {
         intents.remove(id)
         (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
-        val item = repository.getById(id) ?: return
-        repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null, retryCount = 0))
+        if (repository.getById(id) == null) return
+        repository.requeue(id, resetRetryCount = true)
         queueSignal.trySend(Unit)
         schedule()
     }
@@ -281,6 +333,14 @@ class DownloadManager @Inject constructor(
         var highWaterDownloaded = 0L
         var highWaterTotal = item.totalBytes.coerceAtLeast(0L)
         var isFinalizing = false
+        var midDownloadFrameAttempted = false
+
+        suspend fun persistCachedThumbnail(file: File?) {
+            if (file == null || intents[item.id] == ControlIntent.CANCEL) return
+            if (repository.getById(item.id) != null) {
+                repository.updateThumbnail(item.id, file.absolutePath)
+            }
+        }
 
         suspend fun reportProgress(
             downloaded: Long,
@@ -291,6 +351,23 @@ class DownloadManager @Inject constructor(
             force: Boolean = false
         ) {
             if (intents[item.id] != null || !currentCoroutineContext().isActive) return
+            if (item.type == MediaType.VIDEO &&
+                item.isHls &&
+                thumbnailCache != null &&
+                !midDownloadFrameAttempted &&
+                !thumbnailCache.hasCachedThumbnail(item.id)
+            ) {
+                val firstSeg = File(stagingDir(), "hls_parts_${staging.nameWithoutExtension}/seg_0.part")
+                if (firstSeg.exists() && firstSeg.length() > 0L) {
+                    midDownloadFrameAttempted = true
+                    queueScope.launch(dispatchers.io) {
+                        if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                            val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, firstSeg)
+                            persistCachedThumbnail(extracted)
+                        }
+                    }
+                }
+            }
             val safeDownloaded = maxOf(highWaterDownloaded, downloaded.coerceAtLeast(0L))
             highWaterDownloaded = safeDownloaded
             val safeTotal = if (item.isHls) {
@@ -336,6 +413,18 @@ class DownloadManager @Inject constructor(
 
         try {
             val headers = JsonUtils.jsonToMap(item.headersJson)
+            if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id) && !item.thumbnailUrl.isNullOrBlank()) {
+                // Cache remote thumbnail on queueScope so it finishes even if the user pauses right after starting.
+                queueScope.launch(dispatchers.io) {
+                    val cached = thumbnailCache.cacheRemoteThumbnail(
+                        downloadId = item.id,
+                        thumbnailUrl = item.thumbnailUrl,
+                        sourceUrl = item.sourceUrl,
+                        headers = headers
+                    )
+                    persistCachedThumbnail(cached)
+                }
+            }
             val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
             val isAudioExtraction = headers["X-Internal-Extract-Audio"] == "true" ||
                 (item.type == MediaType.AUDIO && (item.container.equals("mp3", true) || item.container.equals("m4a", true)))
@@ -599,6 +688,11 @@ class DownloadManager @Inject constructor(
             // Persist exact output size under FINALIZING state while publishing to MediaStore
             enterFinalizing(bytes)
 
+            if (item.type == MediaType.VIDEO && thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                val localFrame = thumbnailCache.extractVideoFrameThumbnail(item.id, staging)
+                persistCachedThumbnail(localFrame)
+            }
+
             val settings = settingsRepository.current()
             val displayName = fileName(item)
             val uri = if (settings.isCustomSaveLocation) {
@@ -754,6 +848,7 @@ class DownloadManager @Inject constructor(
                     if (it.isDirectory) it.deleteRecursively() else it.delete()
                 }
             }
+        thumbnailCache?.deleteThumbnail(id)
     }
 
     private fun fileName(item: DownloadItem): String {

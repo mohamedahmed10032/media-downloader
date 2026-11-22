@@ -1,0 +1,315 @@
+package com.melmeligy.mediadownloader.download
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
+import android.webkit.CookieManager
+import com.melmeligy.mediadownloader.core.Constants
+import com.melmeligy.mediadownloader.core.util.JsonUtils
+import com.melmeligy.mediadownloader.core.util.UrlUtils
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.io.FileOutputStream
+import java.net.URI
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+/**
+ * Downloads and caches remote video thumbnails to local app storage using the stream's request
+ * headers (User-Agent, Referer, Origin, Cookie), and falls back to extracting a local JPEG frame
+ * from playable video data when no remote thumbnail is available or fetchable.
+ */
+@Singleton
+class DownloadThumbnailCache internal constructor(
+    private val thumbsDir: File,
+    private val client: OkHttpClient,
+    private val frameExtractor: (File, File) -> Boolean
+) {
+
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+        client: OkHttpClient
+    ) : this(
+        thumbsDir = File(context.filesDir, "thumbnails"),
+        client = client,
+        frameExtractor = ::extractFrameWithRetriever
+    )
+
+    fun thumbnailFile(downloadId: Long): File = File(thumbsDir, "thumb_$downloadId.jpg")
+
+    fun hasCachedThumbnail(downloadId: Long): Boolean {
+        val file = thumbnailFile(downloadId)
+        return file.exists() && file.length() > 0L
+    }
+
+    /**
+     * Ensures [thumbnailUrl] is cached locally on disk for [downloadId].
+     * Returns the local [File] on success, or null if no valid image could be fetched.
+     */
+    suspend fun cacheRemoteThumbnail(
+        downloadId: Long,
+        thumbnailUrl: String?,
+        sourceUrl: String,
+        headers: Map<String, String>
+    ): File? = withContext(Dispatchers.IO) {
+        val existingLocal = resolveExistingLocalFile(thumbnailUrl)
+        if (existingLocal != null) return@withContext existingLocal
+
+        val targetFile = thumbnailFile(downloadId)
+        if (targetFile.exists() && targetFile.length() > 0L) {
+            return@withContext targetFile
+        }
+
+        val remoteUrl = thumbnailUrl?.trim()
+            ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+            ?: return@withContext null
+
+        val requestHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl)
+        val reqBuilder = Request.Builder()
+            .url(UrlUtils.encodeNonAsciiUrl(remoteUrl))
+            .header("X-Internal-Download", "true")
+        requestHeaders.forEach { (k, v) ->
+            if (!k.startsWith("X-Internal-", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) {
+                reqBuilder.header(k, v)
+            }
+        }
+
+        val bytes = runCatching {
+            client.executeCancellable(reqBuilder.build()) { response ->
+                if (!response.isSuccessful) return@executeCancellable null
+                val contentType = response.header("Content-Type").orEmpty().lowercase()
+                if (contentType.startsWith("text/") || contentType.contains("html") || contentType.contains("json")) {
+                    return@executeCancellable null
+                }
+                val body = response.body ?: return@executeCancellable null
+                val contentLen = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                if (contentLen > MAX_THUMBNAIL_BYTES) return@executeCancellable null
+                val data = body.byteStream().use { input -> readBounded(input, MAX_THUMBNAIL_BYTES) }
+                if (data == null || data.isEmpty()) return@executeCancellable null
+                if (!contentType.startsWith("image/") && !looksLikeImageBytes(data)) {
+                    return@executeCancellable null
+                }
+                if (looksLikeHtmlBytes(data)) return@executeCancellable null
+                data
+            }
+        }.getOrNull() ?: return@withContext null
+
+        writeAtomically(targetFile, bytes)
+    }
+
+    /**
+     * Extracts a JPEG frame from [videoFile] into the local thumbnail cache for [downloadId].
+     */
+    suspend fun extractVideoFrameThumbnail(
+        downloadId: Long,
+        videoFile: File
+    ): File? = withContext(Dispatchers.IO) {
+        if (!videoFile.exists() || videoFile.length() <= 0L) return@withContext null
+        val targetFile = thumbnailFile(downloadId)
+        if (targetFile.exists() && targetFile.length() > 0L) return@withContext targetFile
+
+        thumbsDir.mkdirs()
+        val tmpFile = File(thumbsDir, "thumb_${downloadId}.tmp")
+        runCatching { tmpFile.delete() }
+        val ok = runCatching { frameExtractor(videoFile, tmpFile) }.getOrDefault(false)
+        if (!ok || !tmpFile.exists() || tmpFile.length() <= 0L) {
+            runCatching { tmpFile.delete() }
+            return@withContext null
+        }
+        if (!tmpFile.renameTo(targetFile)) {
+            runCatching {
+                tmpFile.copyTo(targetFile, overwrite = true)
+                tmpFile.delete()
+            }.onFailure {
+                runCatching { tmpFile.delete() }
+                return@withContext null
+            }
+        }
+        targetFile.takeIf { it.exists() && it.length() > 0L }
+    }
+
+    fun deleteThumbnail(downloadId: Long) {
+        runCatching { thumbnailFile(downloadId).delete() }
+        runCatching { File(thumbsDir, "thumb_${downloadId}.tmp").delete() }
+    }
+
+    private fun writeAtomically(targetFile: File, bytes: ByteArray): File? {
+        thumbsDir.mkdirs()
+        val tmpFile = File(thumbsDir, "${targetFile.nameWithoutExtension}.tmp")
+        return runCatching {
+            FileOutputStream(tmpFile).use { out ->
+                out.write(bytes)
+                out.flush()
+            }
+            if (!tmpFile.renameTo(targetFile)) {
+                tmpFile.copyTo(targetFile, overwrite = true)
+                tmpFile.delete()
+            }
+            targetFile.takeIf { it.exists() && it.length() > 0L }
+        }.onFailure {
+            runCatching { tmpFile.delete() }
+        }.getOrNull()
+    }
+
+    companion object {
+        private const val MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024 // 8 MB safety cap
+        private const val MAX_FRAME_DIM_PX = 320
+
+        fun resolveExistingLocalFile(pathOrUrl: String?): File? {
+            if (pathOrUrl.isNullOrBlank()) return null
+            val trimmed = pathOrUrl.trim()
+            val file = when {
+                trimmed.startsWith("file://", ignoreCase = true) ->
+                    runCatching { File(URI(trimmed)) }.getOrNull()
+                trimmed.startsWith("/") -> File(trimmed)
+                else -> null
+            } ?: return null
+            return file.takeIf { it.exists() && it.isFile && it.length() > 0L }
+        }
+
+        fun buildThumbnailHeaders(
+            sourceUrl: String,
+            headers: Map<String, String>,
+            thumbnailUrl: String? = null
+        ): Map<String, String> {
+            val out = LinkedHashMap<String, String>()
+            var userAgent: String? = null
+            var referer: String? = null
+            var origin: String? = null
+            var cookie: String? = null
+
+            headers.forEach { (k, v) ->
+                if (k.startsWith("X-Internal-", ignoreCase = true) || v.isBlank()) return@forEach
+                when {
+                    k.equals("User-Agent", ignoreCase = true) -> userAgent = v
+                    k.equals("Referer", ignoreCase = true) -> referer = v
+                    k.equals("Origin", ignoreCase = true) -> origin = v
+                    k.equals("Cookie", ignoreCase = true) -> cookie = v
+                }
+            }
+
+            out["User-Agent"] = userAgent ?: Constants.DEFAULT_USER_AGENT
+            val effectiveReferer = referer?.takeIf { it.startsWith("http", ignoreCase = true) }
+                ?: sourceUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+            if (effectiveReferer != null) {
+                out["Referer"] = effectiveReferer
+                if (origin == null) {
+                    runCatching {
+                        val uri = URI(UrlUtils.encodeNonAsciiUrl(effectiveReferer))
+                        val scheme = uri.scheme
+                        val host = uri.host
+                        if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
+                            origin = if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
+                        }
+                    }
+                }
+            }
+            if (!origin.isNullOrBlank()) {
+                out["Origin"] = origin!!
+            }
+
+            val effectiveCookie = cookie ?: runCatching {
+                val target = thumbnailUrl?.takeIf { it.startsWith("http", ignoreCase = true) }
+                    ?: effectiveReferer
+                if (target != null) CookieManager.getInstance().getCookie(target) else null
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (!effectiveCookie.isNullOrBlank()) {
+                out["Cookie"] = effectiveCookie
+            }
+
+            out["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+            return out
+        }
+
+        fun buildThumbnailHeadersFromJson(
+            sourceUrl: String,
+            headersJson: String?,
+            thumbnailUrl: String? = null
+        ): Map<String, String> =
+            buildThumbnailHeaders(sourceUrl, JsonUtils.jsonToMap(headersJson), thumbnailUrl)
+
+        internal fun looksLikeImageBytes(data: ByteArray): Boolean {
+            if (data.size < 4) return false
+            // JPEG: FF D8 FF
+            if (data[0] == 0xFF.toByte() && data[1] == 0xD8.toByte() && data[2] == 0xFF.toByte()) return true
+            // PNG: 89 50 4E 47
+            if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() && data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()) return true
+            // GIF8
+            if (data[0] == 'G'.code.toByte() && data[1] == 'I'.code.toByte() && data[2] == 'F'.code.toByte() && data[3] == '8'.code.toByte()) return true
+            // RIFF....WEBP
+            if (data.size >= 12 &&
+                data[0] == 'R'.code.toByte() && data[1] == 'I'.code.toByte() &&
+                data[2] == 'F'.code.toByte() && data[3] == 'F'.code.toByte() &&
+                data[8] == 'W'.code.toByte() && data[9] == 'E'.code.toByte() &&
+                data[10] == 'B'.code.toByte() && data[11] == 'P'.code.toByte()
+            ) return true
+            // BMP: BM
+            if (data[0] == 'B'.code.toByte() && data[1] == 'M'.code.toByte()) return true
+            // ISO BMFF (AVIF / HEIC): ....ftyp
+            if (data.size >= 12 &&
+                data[4] == 'f'.code.toByte() && data[5] == 't'.code.toByte() &&
+                data[6] == 'y'.code.toByte() && data[7] == 'p'.code.toByte()
+            ) return true
+            return false
+        }
+
+        private fun looksLikeHtmlBytes(data: ByteArray): Boolean {
+            val prefix = data.take(64).toByteArray().decodeToString().trimStart().lowercase()
+            return prefix.startsWith("<!doctype") || prefix.startsWith("<html") || prefix.startsWith("<head")
+        }
+
+        private fun readBounded(input: java.io.InputStream, maxBytes: Int): ByteArray? {
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(16_384)
+            var total = 0
+            while (true) {
+                val read = input.read(buf)
+                if (read == -1) break
+                total += read
+                if (total > maxBytes) return null
+                out.write(buf, 0, read)
+            }
+            return out.toByteArray()
+        }
+
+        private fun extractFrameWithRetriever(videoFile: File, destJpeg: File): Boolean {
+            val retriever = MediaMetadataRetriever()
+            var bitmap: Bitmap? = null
+            var scaled: Bitmap? = null
+            return try {
+                retriever.setDataSource(videoFile.absolutePath)
+                bitmap = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.frameAtTime
+                val frame = bitmap ?: return false
+                val maxSide = max(frame.width, frame.height)
+                val toSave = if (maxSide > MAX_FRAME_DIM_PX && maxSide > 0) {
+                    val scale = MAX_FRAME_DIM_PX.toFloat() / maxSide.toFloat()
+                    val w = (frame.width * scale).roundToInt().coerceAtLeast(1)
+                    val h = (frame.height * scale).roundToInt().coerceAtLeast(1)
+                    Bitmap.createScaledBitmap(frame, w, h, true).also { scaled = it }
+                } else {
+                    frame
+                }
+                FileOutputStream(destJpeg).use { out ->
+                    toSave.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    out.flush()
+                }
+                destJpeg.exists() && destJpeg.length() > 0L
+            } catch (_: Throwable) {
+                false
+            } finally {
+                runCatching { if (scaled != null && scaled !== bitmap) scaled?.recycle() }
+                runCatching { bitmap?.recycle() }
+                runCatching { retriever.release() }
+            }
+        }
+    }
+}

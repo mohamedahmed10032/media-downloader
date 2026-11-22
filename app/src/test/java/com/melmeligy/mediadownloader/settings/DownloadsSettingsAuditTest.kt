@@ -720,6 +720,20 @@ class DownloadsSettingsAuditTest {
             items.computeIfPresent(id) { _, old -> old.copy(status = status) }
         }
 
+        override suspend fun updateThumbnail(id: Long, thumbnailUrl: String) {
+            items.computeIfPresent(id) { _, old -> old.copy(thumbnailUrl = thumbnailUrl) }
+        }
+
+        override suspend fun requeue(id: Long, resetRetryCount: Boolean) {
+            items.computeIfPresent(id) { _, old ->
+                old.copy(
+                    status = DownloadStatus.QUEUED,
+                    errorType = null,
+                    retryCount = if (resetRetryCount) 0 else old.retryCount
+                )
+            }
+        }
+
         override suspend fun updateProgress(id: Long, downloaded: Long, total: Long, speed: Long, eta: Long) {
             items.computeIfPresent(id) { _, old ->
                 old.copy(downloadedBytes = downloaded, totalBytes = total, speedBytesPerSec = speed, etaSeconds = eta)

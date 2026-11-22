@@ -1,5 +1,6 @@
 package com.melmeligy.mediadownloader.ui.common
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -25,6 +26,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -34,6 +40,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.melmeligy.mediadownloader.core.util.FormatUtils
+import com.melmeligy.mediadownloader.core.util.JsonUtils
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.model.MediaType
@@ -102,29 +109,52 @@ fun DownloadRow(
 private fun Thumbnail(item: DownloadItem) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val shape = RoundedCornerShape(8.dp)
+    val candidates = remember(item.id, item.thumbnailUrl, item.contentUri, item.type) {
+        resolveThumbnailCandidates(item)
+    }
+    val headers = remember(item.headersJson) {
+        JsonUtils.jsonToMap(item.headersJson)
+    }
+    var candidateIndex by remember(candidates) { mutableIntStateOf(0) }
+    var loaded by remember(candidates, candidateIndex) { mutableStateOf(false) }
+
     Box(
-        modifier = Modifier.size(52.dp).clip(shape),
+        modifier = Modifier
+            .size(52.dp)
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
         contentAlignment = Alignment.Center
     ) {
-        if (!item.thumbnailUrl.isNullOrBlank()) {
-            val request = androidx.compose.runtime.remember(item.thumbnailUrl) {
-                coil.request.ImageRequest.Builder(context)
-                    .data(item.thumbnailUrl)
-                    .size(156, 156)
-                    .crossfade(false)
-                    .build()
+        if (!loaded) {
+            Icon(
+                imageVector = iconFor(item.type),
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+        val activeCandidate = candidates.getOrNull(candidateIndex)
+        if (activeCandidate != null) {
+            val request = remember(activeCandidate, item.sourceUrl, headers) {
+                buildThumbnailImageRequest(
+                    context = context,
+                    candidate = activeCandidate,
+                    sourceUrl = item.sourceUrl,
+                    headers = headers,
+                    sizePx = 156
+                )
             }
             AsyncImage(
                 model = request,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
+                onSuccess = { loaded = true },
+                onError = {
+                    loaded = false
+                    if (candidateIndex + 1 < candidates.size) {
+                        candidateIndex++
+                    }
+                },
                 modifier = Modifier.size(52.dp).clip(shape)
-            )
-        } else {
-            Icon(
-                imageVector = iconFor(item.type),
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary
             )
         }
     }

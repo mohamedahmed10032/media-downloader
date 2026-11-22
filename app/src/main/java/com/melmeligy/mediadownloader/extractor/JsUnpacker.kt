@@ -57,7 +57,7 @@ object JsUnpacker {
         RegexOption.IGNORE_CASE
     )
     private val POSTER_REGEX = Regex(
-        """(?:["']?(?:poster|image|thumbnail)["']?\s*:\s*['"](https?://[^'"\s]+)['"])""",
+        """(?:["']?(?:poster|poster_url|posterUrl|image|thumbnail|thumbnail_url|thumbnailUrl|thumb|cover)["']?\s*:\s*['"]((?:https?:)?//[^'"\s]+)['"])""",
         RegexOption.IGNORE_CASE
     )
     private val WIDTH_REGEX = Regex(

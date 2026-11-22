@@ -642,6 +642,7 @@ private fun CompactVideoHeader(resolved: ResolvedMedia) {
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        val context = androidx.compose.ui.platform.LocalContext.current
         Box(
             modifier = Modifier
                 .size(width = 64.dp, height = 44.dp)
@@ -649,22 +650,43 @@ private fun CompactVideoHeader(resolved: ResolvedMedia) {
                 .background(MaterialTheme.colorScheme.surfaceVariant),
             contentAlignment = Alignment.Center
         ) {
-            if (!resolved.thumbnailUrl.isNullOrBlank()) {
-                AsyncImage(
-                    model = resolved.thumbnailUrl,
-                    contentDescription = resolved.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-            } else {
-                val hasImages = resolved.streams.any { it.type == MediaType.IMAGE }
-                val hasVideos = resolved.streams.any { it.type == MediaType.VIDEO }
-                val icon = if (hasImages && !hasVideos) Icons.Rounded.Image else Icons.Rounded.Movie
+            val hasImages = resolved.streams.any { it.type == MediaType.IMAGE }
+            val hasVideos = resolved.streams.any { it.type == MediaType.VIDEO }
+            val icon = if (hasImages && !hasVideos) Icons.Rounded.Image else Icons.Rounded.Movie
+            var thumbLoaded by remember(resolved.thumbnailUrl) { mutableStateOf(false) }
+            if (!thumbLoaded) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(22.dp)
+                )
+            }
+            val thumbUrl = resolved.thumbnailUrl?.takeIf { it.isNotBlank() }
+            if (thumbUrl != null) {
+                val streamHeaders = remember(resolved.streams) {
+                    resolved.streams.firstOrNull { it.headers.isNotEmpty() }?.headers.orEmpty()
+                }
+                val request = remember(thumbUrl, resolved.sourceUrl, streamHeaders) {
+                    val candidate = com.melmeligy.mediadownloader.download.DownloadThumbnailCache
+                        .resolveExistingLocalFile(thumbUrl)
+                        ?.let { com.melmeligy.mediadownloader.ui.common.ThumbnailCandidate.LocalFile(it) }
+                        ?: com.melmeligy.mediadownloader.ui.common.ThumbnailCandidate.RemoteUrl(thumbUrl)
+                    com.melmeligy.mediadownloader.ui.common.buildThumbnailImageRequest(
+                        context = context,
+                        candidate = candidate,
+                        sourceUrl = resolved.sourceUrl,
+                        headers = streamHeaders,
+                        sizePx = 192
+                    )
+                }
+                AsyncImage(
+                    model = request,
+                    contentDescription = resolved.title,
+                    contentScale = ContentScale.Crop,
+                    onSuccess = { thumbLoaded = true },
+                    onError = { thumbLoaded = false },
+                    modifier = Modifier.fillMaxSize()
                 )
             }
         }

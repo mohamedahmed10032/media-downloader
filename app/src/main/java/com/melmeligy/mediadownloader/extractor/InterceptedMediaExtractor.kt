@@ -194,14 +194,18 @@ class InterceptedMediaExtractor : MediaExtractor {
         if (isWebPage && htmlMediaExtractor != null) {
             if (distinctAuthHeights.size >= 2) {
                 if (pageThumb.isNullOrBlank()) {
-                    // Recover og:image / title without re-probing already-resolved streams
+                    // Recover og:image / twitter:image / video poster / title without re-probing already-resolved streams
                     runCatching {
                         val htmlText = http.fetchString(url, bestHeaders)
                         if (htmlText.isNotBlank()) {
                             val doc = Jsoup.parse(htmlText, url)
-                            val ogImg = doc.select("meta[property=og:image]").attr("abs:content")
-                                .ifBlank { doc.select("meta[name=twitter:image]").attr("abs:content") }
-                            if (ogImg.startsWith("http")) pageThumb = ogImg
+                            val playerPoster = JsUnpacker.extractPlayerConfigs(htmlText).posterUrl
+                            val extractedThumb = HtmlThumbnailExtractor.extractThumbnail(
+                                doc = doc,
+                                pageUrl = url,
+                                playerPoster = playerPoster
+                            )
+                            if (!extractedThumb.isNullOrBlank()) pageThumb = extractedThumb
                             if (pageTitle.isNullOrBlank()) {
                                 val ogTitle = doc.select("meta[property=og:title]").attr("content")
                                     .ifBlank { doc.title() }

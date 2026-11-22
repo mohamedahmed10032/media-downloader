@@ -38,6 +38,15 @@ interface DownloadDao {
     @Query("UPDATE downloads SET status = :status, updatedAt = :now WHERE id = :id")
     suspend fun updateStatus(id: Long, status: String, now: Long)
 
+    @Query("UPDATE downloads SET thumbnailUrl = :thumbnailUrl, updatedAt = :now WHERE id = :id")
+    suspend fun updateThumbnail(id: Long, thumbnailUrl: String, now: Long)
+
+    @Query("UPDATE downloads SET status = 'QUEUED', errorType = NULL, updatedAt = :now WHERE id = :id")
+    suspend fun requeueForResume(id: Long, now: Long)
+
+    @Query("UPDATE downloads SET status = 'QUEUED', errorType = NULL, retryCount = 0, updatedAt = :now WHERE id = :id")
+    suspend fun requeueForRetry(id: Long, now: Long)
+
     @Query(
         "UPDATE downloads SET downloadedBytes = :downloaded, " +
             "totalBytes = CASE WHEN :total > 0 THEN MAX(:total, :downloaded) " +
