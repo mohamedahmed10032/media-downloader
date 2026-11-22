@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/antigravity/mohamedahmed10032/media-downloader/.agents/hooks/protect_policy.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/antigravity/mohamedahmed10032/media-downloader/.agents/hooks/run_policy_gate.py",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
