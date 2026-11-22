@@ -71,13 +71,25 @@ class BlobImporter @Inject constructor(
 
         try {
             val settings = settingsRepository.current()
-            val uri = mediaStoreWriter.publish(
-                stagingFile = file,
-                displayName = "$title.$container",
-                type = type,
-                container = container,
-                subfolder = settings.saveSubfolder
-            )
+            val uri = if (settings.isCustomSaveLocation) {
+                mediaStoreWriter.publish(
+                    stagingFile = file,
+                    displayName = "$title.$container",
+                    type = type,
+                    container = container,
+                    subfolder = settings.saveSubfolder,
+                    customTreeUri = settings.customSaveTreeUri,
+                    organizeByType = settings.customSaveOrganizeByType
+                )
+            } else {
+                mediaStoreWriter.publish(
+                    stagingFile = file,
+                    displayName = "$title.$container",
+                    type = type,
+                    container = container,
+                    subfolder = settings.saveSubfolder
+                )
+            }
             repository.setCompleted(id, uri, bytes)
         } catch (e: Exception) {
             repository.setError(id, (e as? MediaException)?.error ?: AppError.GENERIC)

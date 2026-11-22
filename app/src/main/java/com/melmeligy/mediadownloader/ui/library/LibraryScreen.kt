@@ -270,7 +270,7 @@ private fun RenameDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text(stringResource(R.string.perm_not_now)) }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.downloads_cancel)) }
         }
     )
 }

@@ -152,9 +152,10 @@ dependencies {
     // WorkManager
     implementation(libs.androidx.work.runtime.ktx)
 
-    // DataStore + security
+    // DataStore + security + Storage Access Framework
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.security.crypto)
+    implementation(libs.androidx.documentfile)
 
     // Media3 / ExoPlayer
     implementation(libs.androidx.media3.exoplayer)

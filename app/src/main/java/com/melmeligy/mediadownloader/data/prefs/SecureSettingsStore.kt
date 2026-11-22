@@ -35,10 +35,17 @@ import javax.inject.Singleton
  * hard crashes), it is deleted and recreated rather than propagating the exception.
  */
 @Singleton
-class SecureSettingsStore @Inject constructor(
-    @ApplicationContext private val context: Context,
-    private val dispatchers: DispatcherProvider
+class SecureSettingsStore internal constructor(
+    private val context: Context,
+    private val dispatchers: DispatcherProvider,
+    private val prefsFactory: (() -> SharedPreferences)? = null
 ) : SettingsRepository {
+
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+        dispatchers: DispatcherProvider
+    ) : this(context, dispatchers, prefsFactory = null)
 
     private val prefsMutex = Mutex()
     private val stateMutex = Mutex()
@@ -82,11 +89,24 @@ class SecureSettingsStore @Inject constructor(
         putString(KEY_SAVE_SUBFOLDER, cleaned)
     }
 
+    override suspend fun setCustomSaveTreeUri(treeUri: String?) = write {
+        val cleaned = treeUri?.trim()?.takeIf { it.isNotEmpty() }
+        if (cleaned == null) {
+            remove(KEY_CUSTOM_SAVE_TREE_URI)
+        } else {
+            putString(KEY_CUSTOM_SAVE_TREE_URI, cleaned)
+        }
+    }
+
+    override suspend fun setCustomSaveOrganizeByType(organize: Boolean) = write {
+        putBoolean(KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE, organize)
+    }
+
     private suspend fun getPrefs(): SharedPreferences {
         cachedPrefs?.let { return it }
         return prefsMutex.withLock {
             cachedPrefs ?: withContext(dispatchers.io) {
-                createPrefs().also { cachedPrefs = it }
+                (prefsFactory?.invoke() ?: createPrefs()).also { cachedPrefs = it }
             }
         }
     }
@@ -126,7 +146,9 @@ class SecureSettingsStore @Inject constructor(
             .coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES),
         saveSubfolder = AppSettings.sanitizeSubfolder(
             prefs.getString(KEY_SAVE_SUBFOLDER, Constants.SHARED_SUBFOLDER) ?: Constants.SHARED_SUBFOLDER
-        )
+        ),
+        customSaveTreeUri = prefs.getString(KEY_CUSTOM_SAVE_TREE_URI, null)?.trim()?.takeIf { it.isNotEmpty() },
+        customSaveOrganizeByType = prefs.getBoolean(KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE, false)
     )
 
     private fun createPrefs(): SharedPreferences = try {
@@ -157,5 +179,7 @@ class SecureSettingsStore @Inject constructor(
         const val KEY_MAX_CONCURRENT = "max_concurrent"
         const val KEY_RETRY_COUNT = "retry_count"
         const val KEY_SAVE_SUBFOLDER = "save_subfolder"
+        const val KEY_CUSTOM_SAVE_TREE_URI = "custom_save_tree_uri"
+        const val KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE = "custom_save_organize_by_type"
     }
 }

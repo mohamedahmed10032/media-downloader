@@ -191,7 +191,141 @@ class MediaStoreWriter @Inject constructor(
         MediaType.IMAGE -> Environment.DIRECTORY_PICTURES ?: "Pictures"
     }
 
-    private companion object {
-        const val DEFAULT_BUFFER_SIZE = 64 * 1024
+    /**
+     * Publishes [stagingFile] to a user-selected SAF custom folder ([customTreeUri]) when configured
+     * and writable, or falls back gracefully to standard MediaStore publishing ([subfolder]) if the
+     * custom folder was deleted, unmounted, or its persistable permission was revoked.
+     */
+    suspend fun publish(
+        stagingFile: File,
+        displayName: String,
+        type: MediaType,
+        container: String,
+        subfolder: String,
+        customTreeUri: String?,
+        organizeByType: Boolean
+    ): String {
+        val tree = customTreeUri?.trim()?.takeIf { it.isNotEmpty() }
+        if (tree != null) {
+            val safUri = withContext(dispatchers.io) {
+                publishToCustomTree(
+                    stagingFile = stagingFile,
+                    displayName = displayName,
+                    type = type,
+                    container = container,
+                    customTreeUri = tree,
+                    organizeByType = organizeByType
+                )
+            }
+            if (safUri != null) {
+                return safUri
+            }
+        }
+        return publish(stagingFile, displayName, type, container, subfolder)
+    }
+
+    /**
+     * Checks whether [customTreeUri] still points to an existing, writable SAF directory.
+     */
+    fun isCustomTreeWritable(customTreeUri: String?): Boolean {
+        val raw = customTreeUri?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        return runCatching {
+            val uri = Uri.parse(raw) ?: return false
+            val root = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)
+            root != null && root.exists() && root.isDirectory && root.canWrite()
+        }.getOrDefault(false)
+    }
+
+    private fun publishToCustomTree(
+        stagingFile: File,
+        displayName: String,
+        type: MediaType,
+        container: String,
+        customTreeUri: String,
+        organizeByType: Boolean
+    ): String? {
+        if (!stagingFile.exists() || stagingFile.length() <= 0L) {
+            throw MediaException(AppError.GENERIC, "Staging file missing or empty")
+        }
+
+        val root = runCatching {
+            val treeUri = Uri.parse(customTreeUri) ?: return null
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+        }.getOrNull() ?: return null
+
+        if (!runCatching { root.exists() && root.isDirectory && root.canWrite() }.getOrDefault(false)) {
+            return null
+        }
+
+        val targetDir = if (organizeByType) {
+            val childName = customTypeFolderName(type)
+            val existing = runCatching {
+                root.findFile(childName)?.takeIf { it.isDirectory }
+            }.getOrNull()
+            existing ?: runCatching { root.createDirectory(childName) }.getOrNull()
+        } else {
+            root
+        } ?: return null
+
+        if (!runCatching { targetDir.exists() && targetDir.canWrite() }.getOrDefault(false)) {
+            return null
+        }
+
+        val existingNames = runCatching {
+            targetDir.listFiles().mapNotNull { it.name }.toSet()
+        }.getOrDefault(emptySet())
+        val uniqueName = resolveUniqueFileName(displayName, existingNames)
+        val mime = MimeTypes.forContainer(container, type)
+
+        val docFile = runCatching { targetDir.createFile(mime, uniqueName) }.getOrNull() ?: return null
+        return try {
+            context.contentResolver.openOutputStream(docFile.uri)?.use { output ->
+                stagingFile.inputStream().use { input ->
+                    input.copyTo(output, DEFAULT_BUFFER_SIZE)
+                }
+            } ?: throw IllegalStateException("Unable to open SAF output stream")
+
+            runCatching { stagingFile.delete() }
+            docFile.uri.toString()
+        } catch (_: Exception) {
+            runCatching { docFile.delete() }
+            null
+        }
+    }
+
+    companion object {
+        private const val DEFAULT_BUFFER_SIZE = 64 * 1024
+
+        /** Subfolder name created inside a custom SAF folder when "Organize by type" is enabled. */
+        internal fun customTypeFolderName(type: MediaType): String = when (type) {
+            MediaType.VIDEO -> "Videos"
+            MediaType.AUDIO -> "Audio"
+            MediaType.IMAGE -> "Images"
+        }
+
+        /**
+         * Resolves duplicate filenames cleanly inside a directory (`video.mp4` -> `video (1).mp4`,
+         * `video (2).mp4`, ...) using case-insensitive collision detection.
+         */
+        internal fun resolveUniqueFileName(
+            desiredName: String,
+            existingNames: Set<String>
+        ): String {
+            val trimmed = desiredName.trim().ifEmpty { "download" }
+            val existingLower = existingNames.mapTo(HashSet(existingNames.size)) { it.lowercase() }
+            if (trimmed.lowercase() !in existingLower) return trimmed
+
+            val dotIdx = trimmed.lastIndexOf('.')
+            val hasExt = dotIdx > 0 && dotIdx < trimmed.lastIndex
+            val base = if (hasExt) trimmed.substring(0, dotIdx) else trimmed
+            val ext = if (hasExt) trimmed.substring(dotIdx) else ""
+
+            var counter = 1
+            while (true) {
+                val candidate = "$base ($counter)$ext"
+                if (candidate.lowercase() !in existingLower) return candidate
+                counter++
+            }
+        }
     }
 }

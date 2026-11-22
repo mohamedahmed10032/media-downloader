@@ -39,8 +39,9 @@ class LibraryViewModel @Inject constructor(
     }
 
     fun rename(item: DownloadItem, newName: String) = viewModelScope.launch {
-        if (mediaActions.rename(item, newName)) {
-            downloadRepository.update(item.copy(title = newName))
+        val updatedUri = mediaActions.renameAndResolveUri(item, newName)
+        if (updatedUri != null) {
+            downloadRepository.update(item.copy(title = newName, contentUri = updatedUri))
         }
     }
 }

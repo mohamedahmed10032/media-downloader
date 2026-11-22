@@ -57,4 +57,6 @@ interface SettingsRepository {
     suspend fun setMaxConcurrent(count: Int)
     suspend fun setRetryCount(count: Int)
     suspend fun setSaveSubfolder(name: String)
+    suspend fun setCustomSaveTreeUri(treeUri: String?)
+    suspend fun setCustomSaveOrganizeByType(organize: Boolean)
 }

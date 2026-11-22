@@ -542,7 +542,19 @@ class DownloadManager @Inject constructor(
 
             val settings = settingsRepository.current()
             val displayName = fileName(item)
-            val uri = mediaStoreWriter.publish(staging, displayName, item.type, item.container, settings.saveSubfolder)
+            val uri = if (settings.isCustomSaveLocation) {
+                mediaStoreWriter.publish(
+                    stagingFile = staging,
+                    displayName = displayName,
+                    type = item.type,
+                    container = item.container,
+                    subfolder = settings.saveSubfolder,
+                    customTreeUri = settings.customSaveTreeUri,
+                    organizeByType = settings.customSaveOrganizeByType
+                )
+            } else {
+                mediaStoreWriter.publish(staging, displayName, item.type, item.container, settings.saveSubfolder)
+            }
             repository.setCompleted(item.id, uri, bytes)
             notifier.notifyComplete(item.id, item.title)
         } catch (ce: CancellationException) {

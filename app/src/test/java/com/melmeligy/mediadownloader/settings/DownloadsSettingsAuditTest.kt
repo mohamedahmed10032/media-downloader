@@ -675,6 +675,12 @@ class DownloadsSettingsAuditTest {
         override suspend fun setSaveSubfolder(name: String) {
             state.value = state.value.copy(saveSubfolder = AppSettings.sanitizeSubfolder(name))
         }
+        override suspend fun setCustomSaveTreeUri(treeUri: String?) {
+            state.value = state.value.copy(customSaveTreeUri = treeUri?.trim()?.takeIf { it.isNotEmpty() })
+        }
+        override suspend fun setCustomSaveOrganizeByType(organize: Boolean) {
+            state.value = state.value.copy(customSaveOrganizeByType = organize)
+        }
     }
 
     private class InMemoryDownloadRepository : DownloadRepository {
