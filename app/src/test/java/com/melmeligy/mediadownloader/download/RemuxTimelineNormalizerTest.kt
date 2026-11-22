@@ -296,7 +296,7 @@ class RemuxTimelineNormalizerTest {
             isHls = true,
             headers = mapOf("X-Internal-Size-Estimated" to "true")
         )
-        assertEquals("~60.0 MB", formatStreamSize(estimatedHls))
+        assertEquals("60.0 MB", formatStreamSize(estimatedHls))
 
         val exactByteRangeHls = estimatedHls.copy(headers = emptyMap())
         assertEquals("60.0 MB", formatStreamSize(exactByteRangeHls))

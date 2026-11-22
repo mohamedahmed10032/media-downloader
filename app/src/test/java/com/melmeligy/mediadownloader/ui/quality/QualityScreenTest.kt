@@ -39,7 +39,7 @@ class QualityScreenTest {
             sizeBytes = null,
             bitrateKbps = 1500
         )
-        assertEquals("~1500 kbps", formatStreamSize(hlsWithBitrate))
+        assertEquals("1500 kbps", formatStreamSize(hlsWithBitrate))
 
         val hlsWithSize = MediaStream(
             id = "3",
@@ -51,6 +51,23 @@ class QualityScreenTest {
             sizeBytes = 15_000_000L
         )
         assertEquals("14.3 MB", formatStreamSize(hlsWithSize))
+
+        val estimatedVideo = hlsWithSize.copy(headers = mapOf("X-Internal-Size-Estimated" to "true"))
+        assertEquals("14.3 MB", formatStreamSize(estimatedVideo))
+        assertFalse(formatStreamSize(estimatedVideo).startsWith("~"))
+
+        val estimatedMusic = MediaStream(
+            id = "4",
+            url = "https://example.com/hls.m3u8",
+            type = MediaType.AUDIO,
+            container = "m4a",
+            label = "Fast",
+            isHls = true,
+            sizeBytes = 20_552_089L,
+            headers = mapOf("X-Internal-Size-Estimated" to "true")
+        )
+        assertEquals("19.6 MB", formatStreamSize(estimatedMusic))
+        assertFalse(formatStreamSize(estimatedMusic).startsWith("~"))
     }
 
     @Test
