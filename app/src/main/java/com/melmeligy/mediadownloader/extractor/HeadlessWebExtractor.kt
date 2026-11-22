@@ -154,7 +154,15 @@ class HeadlessWebExtractor @Inject constructor(
                             currentPageUrl = url
                             tempEngine.onPageChanged(url)
                         }
-                        if (!view.title.isNullOrBlank()) capturedTitle = view.title
+                        val pageViewTitle = view.title?.trim()
+                        if (!pageViewTitle.isNullOrBlank() &&
+                            !pageViewTitle.startsWith("http") &&
+                            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageViewTitle, targetUrl)
+                        ) {
+                            capturedTitle = pageViewTitle
+                            tempEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
+                            sharedEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
+                        }
                         runCatching {
                             view.evaluateJavascript(BlobBridge.SCRIPT, null)
                             view.evaluateJavascript(STREAMING_TRIGGER_JS, null)
@@ -162,22 +170,37 @@ class HeadlessWebExtractor @Inject constructor(
                                 "(function(){try{" +
                                     "if(window.__dlScanNow) window.__dlScanNow();" +
                                     "function abs(u){if(!u)return '';try{var r=new URL(u,location.href).href;return /^https?:\\/\\//i.test(r)?r:'';}catch(e){return '';}}" +
-                                    "var sels=['meta[property=\"og:image:secure_url\"]','meta[property=\"og:image\"]','meta[property=\"og:image:url\"]','meta[name=\"twitter:image\"]','meta[property=\"twitter:image\"]','meta[name=\"twitter:image:src\"]'];" +
+                                    "var sels=['meta[property=\"og:image:secure_url\"]','meta[property=\"og:image\"]','meta[property=\"og:image:url\"]','meta[name=\"og:image\"]','meta[name=\"twitter:image\"]','meta[property=\"twitter:image\"]','meta[name=\"twitter:image:src\"]','meta[itemprop=\"thumbnailUrl\"]','meta[itemprop=\"image\"]','meta[name=\"thumbnail\"]'];" +
                                     "var img='';" +
                                     "for(var s=0;s<sels.length&&!img;s++){var m=document.querySelector(sels[s]);if(m&&m.content)img=abs(m.content);}" +
-                                    "if(!img){var v=document.querySelector('video[poster],video[data-poster]');if(v)img=abs(v.getAttribute('poster')||v.getAttribute('data-poster'));}" +
-                                    "if(!img){var p=document.querySelector('[data-poster],[data-thumb],[data-thumbnail]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail'));}" +
                                     "if(!img){var l=document.querySelector('link[rel=\"image_src\"]');if(l&&l.href)img=abs(l.href);}" +
-                                    "var ogTitle=document.querySelector('meta[property=\"og:title\"]');" +
-                                    "return JSON.stringify({t:ogTitle?ogTitle.content:'',i:img});" +
+                                    "if(!img){var v=document.querySelector('video[poster],video[data-poster]');if(v)img=abs(v.getAttribute('poster')||v.getAttribute('data-poster'));}" +
+                                    "if(!img){var p=document.querySelector('[data-poster],[data-thumb],[data-thumbnail],[data-bg],[data-background]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail')||p.getAttribute('data-bg')||p.getAttribute('data-background'));}" +
+                                    "if(!img){try{var lds=document.querySelectorAll('script[type=\"application/ld+json\"]');for(var i=0;i<lds.length&&!img;i++){var d=JSON.parse(lds[i].textContent||'{}');var arr=Array.isArray(d)?d:(d['@graph']?[d].concat(d['@graph']):[d]);for(var j=0;j<arr.length&&!img;j++){var it=arr[j]||{};var c=it.thumbnailUrl||it.image||it.primaryImageOfPage||it.thumbnail;if(Array.isArray(c))c=c[0];if(c&&typeof c==='object')c=c.contentUrl||c.url||c['@id'];if(typeof c==='string'&&c)img=abs(c);}}}catch(e){}}" +
+                                    "if(!img){var cn=document.querySelectorAll('.BG--Mycima-Single,.wecima,.mycima,.Poster,.poster,.Single--Poster,.jw-preview,.vjs-poster,.plyr__poster,[data-lazy-style],[style*=\"--image\"],[style*=\"background-image\"]');for(var k=0;k<cn.length&&!img;k++){var st=(cn[k].getAttribute('data-lazy-style')||'')+' '+(cn[k].getAttribute('style')||'');var cm=st.match(/url\\(\\s*['\"]?([^'\")\\s]+)['\"]?\\s*\\)/i);if(cm&&cm[1])img=abs(cm[1]);}}" +
+                                    "if(!img){var ims=document.querySelectorAll('.Poster img,.poster img,.Single--Poster img,.thumb img,.thumbnail img,img.wp-post-image,img[class*=\"poster\" i],img[class*=\"thumb\" i],img[class*=\"cover\" i]');for(var n=0;n<ims.length&&!img;n++){var ci=ims[n].getAttribute('data-lazy-src')||ims[n].getAttribute('data-src')||ims[n].getAttribute('data-original')||ims[n].currentSrc||ims[n].src;if(ci&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(ci))img=abs(ci);}}" +
+                                    "var ogTitle=document.querySelector('meta[property=\"og:title\"],meta[name=\"twitter:title\"]');" +
+                                    "var h1=document.querySelector('h1');" +
+                                    "var bestTitle=(ogTitle&&ogTitle.content)||(h1&&h1.innerText)||document.title||'';" +
+                                    "return JSON.stringify({t:bestTitle,i:img});" +
                                     "}catch(e){return '';}})();"
                             ) { jsonStr ->
                                 runCatching {
-                                    val unquoted = jsonStr?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"")
+                                    val unquoted = (org.json.JSONTokener(jsonStr ?: "").nextValue() as? String)
+                                        ?: jsonStr?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"")
                                     if (!unquoted.isNullOrBlank() && unquoted.startsWith("{")) {
                                         val obj = org.json.JSONObject(unquoted)
-                                        obj.optString("t").takeIf { it.isNotBlank() }?.let { capturedTitle = it }
-                                        obj.optString("i").takeIf { it.startsWith("http") }?.let { capturedThumb = it }
+                                        obj.optString("t").trim().takeIf {
+                                            it.isNotBlank() && !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl)
+                                        }?.let { capturedTitle = it }
+                                        HtmlThumbnailExtractor.resolveValidImageCandidate(
+                                            obj.optString("i").trim(),
+                                            url ?: targetUrl
+                                        )?.let { capturedThumb = it }
+                                        if (!capturedTitle.isNullOrBlank() || !capturedThumb.isNullOrBlank()) {
+                                            tempEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
+                                            sharedEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
+                                        }
                                     }
                                 }
                             }
@@ -224,11 +247,18 @@ class HeadlessWebExtractor @Inject constructor(
         if (localCaptured.isEmpty()) return@coroutineScope null
         progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
 
-        if (capturedTitle.isNullOrBlank()) {
-            capturedTitle = localCaptured.firstNotNullOfOrNull { it.pageTitle?.takeIf { t -> t.isNotBlank() } }
+        if (capturedTitle.isNullOrBlank() || HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(capturedTitle, targetUrl)) {
+            capturedTitle = localCaptured.firstNotNullOfOrNull {
+                it.pageTitle?.takeIf { t -> !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(t, targetUrl) }
+            } ?: HtmlThumbnailExtractor.humanReadableTitleFromUrl(targetUrl) ?: capturedTitle
         }
         if (capturedThumb.isNullOrBlank()) {
-            capturedThumb = localCaptured.firstNotNullOfOrNull { it.thumbnailUrl?.takeIf { t -> t.startsWith("http") } }
+            capturedThumb = localCaptured.firstNotNullOfOrNull {
+                HtmlThumbnailExtractor.resolveValidImageCandidate(it.thumbnailUrl, targetUrl)
+            }
+        }
+        if (!capturedTitle.isNullOrBlank() || !capturedThumb.isNullOrBlank()) {
+            sharedEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
         }
 
         val distinctPayloads = localCaptured
@@ -371,9 +401,16 @@ class HeadlessWebExtractor @Inject constructor(
         val finalStreams = videos + audios
         if (finalStreams.isEmpty()) return@coroutineScope null
 
+        val finalTitle = capturedTitle?.takeIf {
+            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl)
+        } ?: HtmlThumbnailExtractor.humanReadableTitleFromUrl(targetUrl)
+            ?: capturedTitle?.takeIf { it.isNotBlank() }
+            ?: UrlUtils.host(targetUrl)?.replaceFirstChar { it.uppercase() }
+            ?: "Media"
+
         ResolvedMedia(
             sourceUrl = targetUrl,
-            title = capturedTitle?.takeIf { it.isNotBlank() } ?: UrlUtils.host(targetUrl) ?: "Media",
+            title = finalTitle,
             thumbnailUrl = capturedThumb,
             streams = finalStreams,
             extractor = "Smart Extractor"

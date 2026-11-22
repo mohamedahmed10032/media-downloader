@@ -333,7 +333,7 @@ class DownloadManager private constructor(
         var highWaterDownloaded = 0L
         var highWaterTotal = item.totalBytes.coerceAtLeast(0L)
         var isFinalizing = false
-        var midDownloadFrameAttempted = false
+        var midDownloadFrameStage = 0
 
         suspend fun persistCachedThumbnail(file: File?) {
             if (file == null || intents[item.id] == ControlIntent.CANCEL) return
@@ -352,18 +352,47 @@ class DownloadManager private constructor(
         ) {
             if (intents[item.id] != null || !currentCoroutineContext().isActive) return
             if (item.type == MediaType.VIDEO &&
-                item.isHls &&
                 thumbnailCache != null &&
-                !midDownloadFrameAttempted &&
                 !thumbnailCache.hasCachedThumbnail(item.id)
             ) {
-                val firstSeg = File(stagingDir(), "hls_parts_${staging.nameWithoutExtension}/seg_0.part")
-                if (firstSeg.exists() && firstSeg.length() > 0L) {
-                    midDownloadFrameAttempted = true
-                    queueScope.launch(dispatchers.io) {
-                        if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
-                            val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, firstSeg)
-                            persistCachedThumbnail(extracted)
+                if (item.isHls && midDownloadFrameStage < 1) {
+                    val rawTsSeg0 = File(stagingDir(), "hls_parts_dl_${item.id}_raw.ts/seg_0.part")
+                    val legacySeg0 = File(stagingDir(), "hls_parts_${staging.nameWithoutExtension}/seg_0.part")
+                    val firstSeg = when {
+                        rawTsSeg0.exists() && rawTsSeg0.length() > 0L -> rawTsSeg0
+                        legacySeg0.exists() && legacySeg0.length() > 0L -> legacySeg0
+                        else -> null
+                    }
+                    if (firstSeg != null) {
+                        midDownloadFrameStage = 1
+                        queueScope.launch(dispatchers.io) {
+                            if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                                val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, firstSeg)
+                                persistCachedThumbnail(extracted)
+                            }
+                        }
+                    }
+                } else if (!item.isHls) {
+                    val nextStage = when {
+                        midDownloadFrameStage < 1 && (downloaded >= 64 * 1024L || (total > 0L && downloaded >= total)) -> 1
+                        midDownloadFrameStage == 1 && (downloaded >= 2 * 1024 * 1024L || (total > 0L && downloaded >= total)) -> 2
+                        else -> 0
+                    }
+                    if (nextStage > midDownloadFrameStage) {
+                        val adaptiveVideo = File(stagingDir(), "dl_${item.id}_video.mp4.part")
+                        val candidate = when {
+                            adaptiveVideo.exists() && adaptiveVideo.length() > 0L -> adaptiveVideo
+                            staging.exists() && staging.length() > 0L -> staging
+                            else -> null
+                        }
+                        if (candidate != null) {
+                            midDownloadFrameStage = nextStage
+                            queueScope.launch(dispatchers.io) {
+                                if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                                    val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, candidate)
+                                    persistCachedThumbnail(extracted)
+                                }
+                            }
                         }
                     }
                 }
@@ -413,15 +442,32 @@ class DownloadManager private constructor(
 
         try {
             val headers = JsonUtils.jsonToMap(item.headersJson)
-            if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id) && !item.thumbnailUrl.isNullOrBlank()) {
-                // Cache remote thumbnail on queueScope so it finishes even if the user pauses right after starting.
+            if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                // Cache remote thumbnail (or extract a remote video frame if no poster URL exists / fetch fails)
+                // on queueScope so it finishes even if the user pauses right after starting.
                 queueScope.launch(dispatchers.io) {
-                    val cached = thumbnailCache.cacheRemoteThumbnail(
-                        downloadId = item.id,
-                        thumbnailUrl = item.thumbnailUrl,
-                        sourceUrl = item.sourceUrl,
-                        headers = headers
-                    )
+                    var cached = if (!item.thumbnailUrl.isNullOrBlank()) {
+                        thumbnailCache.cacheRemoteThumbnail(
+                            downloadId = item.id,
+                            thumbnailUrl = item.thumbnailUrl,
+                            sourceUrl = item.sourceUrl,
+                            headers = headers
+                        )
+                    } else {
+                        null
+                    }
+                    if (cached == null &&
+                        item.type == MediaType.VIDEO &&
+                        !item.isHls &&
+                        !thumbnailCache.hasCachedThumbnail(item.id)
+                    ) {
+                        cached = thumbnailCache.extractRemoteVideoFrameThumbnail(
+                            downloadId = item.id,
+                            videoUrl = item.remoteUrl,
+                            sourceUrl = item.sourceUrl,
+                            headers = headers
+                        )
+                    }
                     persistCachedThumbnail(cached)
                 }
             }

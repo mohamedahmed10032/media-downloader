@@ -29,8 +29,20 @@ import kotlin.math.roundToInt
 class DownloadThumbnailCache internal constructor(
     private val thumbsDir: File,
     private val client: OkHttpClient,
-    private val frameExtractor: (File, File) -> Boolean
+    private val frameExtractor: (File, File) -> Boolean,
+    private val remoteFrameExtractor: (String, Map<String, String>, File) -> Boolean
 ) {
+
+    internal constructor(
+        thumbsDir: File,
+        client: OkHttpClient,
+        frameExtractor: (File, File) -> Boolean
+    ) : this(
+        thumbsDir = thumbsDir,
+        client = client,
+        frameExtractor = frameExtractor,
+        remoteFrameExtractor = ::extractRemoteFrameWithRetriever
+    )
 
     @Inject
     constructor(
@@ -39,7 +51,8 @@ class DownloadThumbnailCache internal constructor(
     ) : this(
         thumbsDir = File(context.filesDir, "thumbnails"),
         client = client,
-        frameExtractor = ::extractFrameWithRetriever
+        frameExtractor = ::extractFrameWithRetriever,
+        remoteFrameExtractor = ::extractRemoteFrameWithRetriever
     )
 
     fun thumbnailFile(downloadId: Long): File = File(thumbsDir, "thumb_$downloadId.jpg")
@@ -71,7 +84,41 @@ class DownloadThumbnailCache internal constructor(
             ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
             ?: return@withContext null
 
-        val requestHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl)
+        val primaryHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl)
+        var bytes = fetchThumbnailBytes(remoteUrl, primaryHeaders)
+        if (bytes == null) {
+            // Some image CDNs block a cross-domain Referer; retry once with the image host's own origin as Referer
+            val thumbOrigin = extractOrigin(remoteUrl)
+            val sourceOrigin = extractOrigin(sourceUrl)
+            if (!thumbOrigin.isNullOrBlank() && !thumbOrigin.equals(sourceOrigin, ignoreCase = true)) {
+                val fallbackHeaders = LinkedHashMap(primaryHeaders).apply {
+                    put("Referer", "$thumbOrigin/")
+                    put("Origin", thumbOrigin)
+                }
+                bytes = fetchThumbnailBytes(remoteUrl, fallbackHeaders)
+            }
+        }
+        val validBytes = bytes ?: return@withContext null
+
+        writeAtomically(targetFile, validBytes)
+    }
+
+    private fun extractOrigin(rawUrl: String?): String? {
+        if (rawUrl.isNullOrBlank()) return null
+        return runCatching {
+            val uri = URI(UrlUtils.encodeNonAsciiUrl(rawUrl))
+            val scheme = uri.scheme
+            val host = uri.host
+            if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
+                if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
+            } else null
+        }.getOrNull()
+    }
+
+    private suspend fun fetchThumbnailBytes(
+        remoteUrl: String,
+        requestHeaders: Map<String, String>
+    ): ByteArray? {
         val reqBuilder = Request.Builder()
             .url(UrlUtils.encodeNonAsciiUrl(remoteUrl))
             .header("X-Internal-Download", "true")
@@ -81,7 +128,7 @@ class DownloadThumbnailCache internal constructor(
             }
         }
 
-        val bytes = runCatching {
+        return runCatching {
             client.executeCancellable(reqBuilder.build()) { response ->
                 if (!response.isSuccessful) return@executeCancellable null
                 val contentType = response.header("Content-Type").orEmpty().lowercase()
@@ -99,9 +146,48 @@ class DownloadThumbnailCache internal constructor(
                 if (looksLikeHtmlBytes(data)) return@executeCancellable null
                 data
             }
-        }.getOrNull() ?: return@withContext null
+        }.getOrNull()
+    }
 
-        writeAtomically(targetFile, bytes)
+    /**
+     * Extracts a JPEG frame from a remote video stream URL using [remoteFrameExtractor]
+     * (backed by `MediaMetadataRetriever.setDataSource(url, headers)`) when no remote poster image is available.
+     */
+    suspend fun extractRemoteVideoFrameThumbnail(
+        downloadId: Long,
+        videoUrl: String?,
+        sourceUrl: String,
+        headers: Map<String, String>
+    ): File? = withContext(Dispatchers.IO) {
+        val remoteUrl = videoUrl?.trim()
+            ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+            ?: return@withContext null
+        val targetFile = thumbnailFile(downloadId)
+        if (targetFile.exists() && targetFile.length() > 0L) return@withContext targetFile
+
+        val requestHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl).toMutableMap().apply {
+            remove("Accept")
+        }
+        thumbsDir.mkdirs()
+        val tmpFile = File(thumbsDir, "thumb_${downloadId}_remote.tmp")
+        runCatching { tmpFile.delete() }
+        val ok = runCatching {
+            remoteFrameExtractor(UrlUtils.encodeNonAsciiUrl(remoteUrl), requestHeaders, tmpFile)
+        }.getOrDefault(false)
+        if (!ok || !tmpFile.exists() || tmpFile.length() <= 0L) {
+            runCatching { tmpFile.delete() }
+            return@withContext null
+        }
+        if (!tmpFile.renameTo(targetFile)) {
+            runCatching {
+                tmpFile.copyTo(targetFile, overwrite = true)
+                tmpFile.delete()
+            }.onFailure {
+                runCatching { tmpFile.delete() }
+                return@withContext null
+            }
+        }
+        targetFile.takeIf { it.exists() && it.length() > 0L }
     }
 
     /**
@@ -138,6 +224,7 @@ class DownloadThumbnailCache internal constructor(
     fun deleteThumbnail(downloadId: Long) {
         runCatching { thumbnailFile(downloadId).delete() }
         runCatching { File(thumbsDir, "thumb_${downloadId}.tmp").delete() }
+        runCatching { File(thumbsDir, "thumb_${downloadId}_remote.tmp").delete() }
     }
 
     private fun writeAtomically(targetFile: File, bytes: ByteArray): File? {
@@ -280,11 +367,30 @@ class DownloadThumbnailCache internal constructor(
         }
 
         private fun extractFrameWithRetriever(videoFile: File, destJpeg: File): Boolean {
+            return extractWithRetriever(destJpeg) { retriever ->
+                retriever.setDataSource(videoFile.absolutePath)
+            }
+        }
+
+        private fun extractRemoteFrameWithRetriever(
+            videoUrl: String,
+            headers: Map<String, String>,
+            destJpeg: File
+        ): Boolean {
+            return extractWithRetriever(destJpeg) { retriever ->
+                retriever.setDataSource(videoUrl, headers)
+            }
+        }
+
+        private inline fun extractWithRetriever(
+            destJpeg: File,
+            configureDataSource: (MediaMetadataRetriever) -> Unit
+        ): Boolean {
             val retriever = MediaMetadataRetriever()
             var bitmap: Bitmap? = null
             var scaled: Bitmap? = null
             return try {
-                retriever.setDataSource(videoFile.absolutePath)
+                configureDataSource(retriever)
                 bitmap = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: retriever.frameAtTime

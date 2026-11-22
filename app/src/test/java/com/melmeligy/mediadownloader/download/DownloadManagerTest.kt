@@ -819,4 +819,115 @@ class DownloadManagerTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun thumbnailLifecycle_extractsMidDownloadVideoFrameForProgressiveMp4BeforeCompletionOrOnPause() = kotlinx.coroutines.runBlocking {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_prog_mid_frame_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings(maxConcurrentDownloads = 1)
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+            coEvery { settingsRepository.current() } returns settings
+
+            val thumbsDir = java.io.File(tempDir, "thumbnails")
+            val midFrameExtracted = kotlinx.coroutines.CompletableDeferred<String>()
+            val thumbCache = DownloadThumbnailCache(
+                thumbsDir = thumbsDir,
+                client = okhttp3.OkHttpClient(),
+                frameExtractor = { srcVideo, outJpeg ->
+                    if (srcVideo.exists() && srcVideo.length() >= 64 * 1024L) {
+                        outJpeg.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+                        true
+                    } else {
+                        false
+                    }
+                },
+                remoteFrameExtractor = { _, _, _ -> false }
+            )
+            val dm = DownloadManager(
+                context = context,
+                repository = repository,
+                settingsRepository = settingsRepository,
+                segmentedDownloader = segmentedDownloader,
+                hlsDownloader = hlsDownloader,
+                videoAudioMuxer = videoAudioMuxer,
+                mediaStoreWriter = mediaStoreWriter,
+                notifier = notifier,
+                dispatchers = dispatchers,
+                thumbnailCache = thumbCache
+            )
+
+            var currentItem: DownloadItem? = DownloadItem(
+                id = 206L,
+                title = "Progressive 720p Episode",
+                sourceUrl = "https://wecima.here/watch/ep5",
+                remoteUrl = "https://cdn.wecima.here/ep5-720p.mp4",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "High quality (720p)",
+                thumbnailUrl = null,
+                isHls = false,
+                totalBytes = 1070386381L,
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+            var claimed = false
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                val item = currentItem
+                if (!claimed && item != null) {
+                    claimed = true
+                    val running = item.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    currentItem = running
+                    listOf(running)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                val item = currentItem
+                kotlinx.coroutines.flow.flowOf(if (item != null && item.isActive) listOf(item) else emptyList())
+            }
+            coEvery { repository.getById(206L) } answers { currentItem }
+            coEvery { repository.updateStatus(206L, any()) } answers {
+                currentItem = currentItem?.copy(status = secondArg())
+            }
+            coEvery { repository.updateProgress(206L, any(), any(), any(), any()) } answers {
+                currentItem = currentItem?.copy(
+                    downloadedBytes = arg(1),
+                    totalBytes = arg(2),
+                    speedBytesPerSec = arg(3),
+                    etaSeconds = arg(4)
+                )
+            }
+            coEvery { repository.updateThumbnail(206L, any()) } answers {
+                val path = secondArg<String>()
+                currentItem = currentItem?.copy(thumbnailUrl = path)
+                midFrameExtracted.complete(path)
+            }
+            coEvery {
+                segmentedDownloader.download(any(), any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                val dest = arg<java.io.File>(2)
+                val onProgress = arg<suspend (DownloadProgress) -> Unit>(6)
+                dest.parentFile?.mkdirs()
+                dest.writeBytes(ByteArray(128 * 1024) { 0x11 })
+                onProgress(DownloadProgress(downloaded = 128 * 1024L, total = 1070386381L, speed = 512_000L, eta = 2000L))
+                // Wait until mid-download frame thumbnail is persisted while download is still active
+                kotlinx.coroutines.withTimeout(2000L) { midFrameExtracted.await() }
+            }
+            coEvery { mediaStoreWriter.publish(any(), any(), any(), any(), any()) } returns "content://media/video/206"
+            coEvery { repository.setCompleted(206L, any(), any()) } answers {
+                currentItem = currentItem?.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.COMPLETED)
+            }
+
+            dm.runQueue { }
+
+            val persistedPath = kotlinx.coroutines.withTimeout(2000L) { midFrameExtracted.await() }
+            org.junit.Assert.assertTrue(java.io.File(persistedPath).exists())
+            org.junit.Assert.assertEquals(persistedPath, currentItem?.thumbnailUrl)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

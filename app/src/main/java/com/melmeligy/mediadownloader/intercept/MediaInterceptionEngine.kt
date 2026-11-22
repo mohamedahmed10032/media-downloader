@@ -72,10 +72,50 @@ class MediaInterceptionEngine @Inject constructor() {
         if (!title.isNullOrBlank()) currentPageTitle = title
     }
 
-    fun updatePageMetadata(title: String?, thumbnailUrl: String?) {
-        if (!title.isNullOrBlank()) currentPageTitle = title
-        if (!thumbnailUrl.isNullOrBlank() && thumbnailUrl.startsWith("http")) {
-            currentPageThumbnail = thumbnailUrl
+    fun updatePageMetadata(
+        title: String?,
+        thumbnailUrl: String?,
+        pageUrl: String? = currentPageUrl
+    ) {
+        val cleanTitle = title?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanThumb = thumbnailUrl?.trim()?.takeIf { it.isNotEmpty() && it.startsWith("http") }
+        if (cleanTitle != null) currentPageTitle = cleanTitle
+        if (cleanThumb != null) currentPageThumbnail = cleanThumb
+        if (cleanTitle == null && cleanThumb == null) return
+
+        val targetPageKey = pageUrl?.takeIf { it.isNotBlank() }?.let(::normalizePageKey)
+        val currentList = _detections.value
+        var changed = false
+        val updatedList = currentList.map { payload ->
+            val matchesPage = targetPageKey == null ||
+                payload.pageUrl.isNullOrBlank() ||
+                normalizePageKey(payload.pageUrl) == targetPageKey ||
+                com.melmeligy.mediadownloader.core.util.UrlUtils.host(payload.pageUrl) ==
+                com.melmeligy.mediadownloader.core.util.UrlUtils.host(pageUrl ?: "")
+            if (!matchesPage) {
+                payload
+            } else {
+                val shouldUpdateTitle = cleanTitle != null &&
+                    com.melmeligy.mediadownloader.extractor.HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(
+                        payload.pageTitle,
+                        payload.pageUrl ?: pageUrl
+                    )
+                val shouldUpdateThumb = cleanThumb != null && payload.thumbnailUrl.isNullOrBlank()
+                if (shouldUpdateTitle || shouldUpdateThumb) {
+                    changed = true
+                    val updated = payload.copy(
+                        pageTitle = if (shouldUpdateTitle) cleanTitle else payload.pageTitle,
+                        thumbnailUrl = if (shouldUpdateThumb) cleanThumb else payload.thumbnailUrl
+                    )
+                    registry[updated.url] = updated
+                    updated
+                } else {
+                    payload
+                }
+            }
+        }
+        if (changed) {
+            _detections.value = updatedList
         }
     }
 
@@ -108,9 +148,8 @@ class MediaInterceptionEngine @Inject constructor() {
             return false
         }
 
-        if (!payload.pageTitle.isNullOrBlank()) currentPageTitle = payload.pageTitle
-        if (!payload.thumbnailUrl.isNullOrBlank() && payload.thumbnailUrl.startsWith("http")) {
-            currentPageThumbnail = payload.thumbnailUrl
+        if (!payload.pageTitle.isNullOrBlank() || (!payload.thumbnailUrl.isNullOrBlank() && payload.thumbnailUrl.startsWith("http"))) {
+            updatePageMetadata(payload.pageTitle, payload.thumbnailUrl, payload.pageUrl ?: currentPageUrl)
         }
 
         val sanitizedQuality = payload.qualityHint?.takeIf { it > 0 }

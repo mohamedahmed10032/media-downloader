@@ -139,6 +139,12 @@ class HtmlMediaExtractor @Inject constructor(
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
+            val fallbackTitle = parsed?.title?.takeIf {
+                !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
+            } ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractTitle(it, url) }
+            val fallbackThumb = parsed?.thumbnailUrl?.takeIf { it.isNotBlank() }
+                ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractThumbnail(it, url, html) }
             val headless = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -147,10 +153,44 @@ class HtmlMediaExtractor @Inject constructor(
                 null
             }
             if (headless != null && headless.streams.isNotEmpty()) {
-                return@coroutineScope headless
+                val mergedTitle = if (
+                    HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(headless.title, url) &&
+                    !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(fallbackTitle, url)
+                ) {
+                    fallbackTitle!!
+                } else {
+                    headless.title
+                }
+                val mergedThumb = headless.thumbnailUrl?.takeIf { it.isNotBlank() } ?: fallbackThumb
+                return@coroutineScope headless.copy(
+                    title = mergedTitle,
+                    thumbnailUrl = mergedThumb
+                )
             }
         }
         parsed?.takeIf { it.streams.isNotEmpty() }
+    }
+
+    internal suspend fun extractPageMetadataOnly(
+        url: String,
+        customHeaders: Map<String, String> = emptyMap()
+    ): Pair<String?, String?> = coroutineScope {
+        val pageHeaders = buildPageHeaders(url, customHeaders)
+        val html = try {
+            http.fetchString(url, pageHeaders)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            ""
+        }
+        if (html.isBlank()) {
+            return@coroutineScope Pair(HtmlThumbnailExtractor.humanReadableTitleFromUrl(url), null)
+        }
+        val doc = runCatching { Jsoup.parse(html, url) }.getOrNull()
+            ?: return@coroutineScope Pair(HtmlThumbnailExtractor.humanReadableTitleFromUrl(url), null)
+        val title = HtmlThumbnailExtractor.extractTitle(doc, url)
+        val thumb = HtmlThumbnailExtractor.extractThumbnail(doc, url, html)
+        Pair(title, thumb)
     }
 
     private fun looksLikeStreamingOrEmbedPage(html: String): Boolean {
@@ -973,11 +1013,19 @@ class HtmlMediaExtractor @Inject constructor(
                             jsonLdThumb = jsonLdThumb,
                             playerPoster = embedded.thumbnailUrl
                         )
-                        val title = customTitle
-                            ?: doc.select("meta[property=og:title]").attr("content").ifBlank { null }
-                            ?: jsonLdTitle
-                            ?: doc.title().ifBlank { null }
-                            ?: embedded.title
+                        val title = HtmlThumbnailExtractor.extractTitle(
+                            doc = doc,
+                            pageUrl = pageUrl,
+                            preferredTitle = customTitle ?: jsonLdTitle
+                        ).let { extracted ->
+                            if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extracted, pageUrl) &&
+                                !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(embedded.title, pageUrl)
+                            ) {
+                                embedded.title
+                            } else {
+                                extracted
+                            }
+                        }
                         return@coroutineScope embedded.copy(
                             sourceUrl = pageUrl,
                             title = title,
@@ -1004,15 +1052,16 @@ class HtmlMediaExtractor @Inject constructor(
         val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
             doc = doc,
             pageUrl = pageUrl,
+            rawHtml = html,
             preferredThumb = customThumb,
             jsonLdThumb = jsonLdThumb,
             playerPoster = directPlayerCfg.posterUrl
         )
-        val title = customTitle
-            ?: doc.select("meta[property=og:title]").attr("content")
-                .ifBlank { jsonLdTitle.orEmpty() }
-                .ifBlank { doc.title() }
-                .ifBlank { UrlUtils.host(pageUrl) ?: "Media" }
+        val title = HtmlThumbnailExtractor.extractTitle(
+            doc = doc,
+            pageUrl = pageUrl,
+            preferredTitle = customTitle ?: jsonLdTitle
+        )
 
         // ---- 11. Probe direct streams concurrently for exact sizeBytes & reject dead/HTML/image/tiny bumpers ----
         val rawStreams = found.values.toList()

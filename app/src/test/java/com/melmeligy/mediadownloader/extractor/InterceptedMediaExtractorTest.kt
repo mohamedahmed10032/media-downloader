@@ -105,4 +105,63 @@ class InterceptedMediaExtractorTest {
         assertEquals(720, videoStreams[0].height)
         assertEquals(360, videoStreams[1].height)
     }
+
+    @Test
+    fun recoversWecimaTitleAndThumbnailWhenStreamWasInterceptedBeforePageMetadataFinished() = runTest {
+        val engine = MediaInterceptionEngine()
+        val http = mockk<ExtractorHttp>()
+        val hlsExtractor = mockk<HlsExtractor>()
+        val dashExtractor = mockk<DashExtractor>()
+
+        val watchUrl = "https://wecima.here/watch/%d9%85%d8%b3%d9%84%d8%b3%d9%84-newlyweds-%d8%a7%d9%84%d9%85%d9%88%d8%b3%d9%85-%d8%a7%d9%84%d8%a7%d9%88%d9%84-%d8%a7%d9%84%d8%ad%d9%84%d9%82%d8%a9-5-%d9%85%d8%aa%d8%b1%d8%ac%d9%85%d8%a9/"
+        val mp4Url = "https://cdn.wecima.here/files/newlyweds-ep5-720p.mp4"
+
+        engine.onPageChanged(watchUrl)
+        // Stream intercepted in shouldInterceptRequest BEFORE onPageFinished captures title or thumbnail
+        engine.submit(
+            CapturedPayload(
+                url = mp4Url,
+                streamType = StreamType.PROGRESSIVE,
+                pageUrl = watchUrl,
+                pageTitle = null,
+                thumbnailUrl = null,
+                qualityHint = 720,
+                sizeBytes = 1070386381L,
+                isAuthoritativePlayer = true
+            )
+        )
+
+        // Watch page HTML has no direct <video> stream (uses JS embed), but has WeCima CSS poster
+        val watchHtml = """
+            <html>
+              <head><title>Wecima.here</title></head>
+              <body>
+                <div class="Poster">
+                  <div class="BG--Mycima-Single" data-lazy-style="--image:url(https://wecima.here/wp-content/uploads/2026/03/newlyweds-poster.jpg);"></div>
+                </div>
+              </body>
+            </html>
+        """.trimIndent()
+        coEvery { http.fetchString(watchUrl, any()) } returns watchHtml
+        coEvery { http.probe(mp4Url, any()) } returns HeadInfo(
+            code = 200,
+            contentType = "video/mp4",
+            contentLength = 1070386381L,
+            acceptsRanges = true,
+            finalUrl = mp4Url
+        )
+
+        val extractor = InterceptedMediaExtractor(engine, http, hlsExtractor, dashExtractor)
+        val result = extractor.extract(watchUrl)
+
+        assertNotNull(result)
+        requireNotNull(result)
+        assertEquals("مسلسل newlyweds الموسم الاول الحلقة 5 مترجمة", result.title)
+        assertEquals("https://wecima.here/wp-content/uploads/2026/03/newlyweds-poster.jpg", result.thumbnailUrl)
+
+        // Verify MediaInterceptionEngine payload was also backfilled so subsequent resolves keep the real metadata
+        val backfilled = engine.payloadsFor(watchUrl).first()
+        assertEquals("مسلسل newlyweds الموسم الاول الحلقة 5 مترجمة", backfilled.pageTitle)
+        assertEquals("https://wecima.here/wp-content/uploads/2026/03/newlyweds-poster.jpg", backfilled.thumbnailUrl)
+    }
 }

@@ -91,10 +91,17 @@ class InterceptedMediaExtractor : MediaExtractor {
 
         if (rawCandidates.isEmpty()) return@coroutineScope null
 
-        var pageTitle: String? = rawCandidates.firstNotNullOfOrNull { it.pageTitle?.takeIf { t -> t.isNotBlank() } }
-            ?: runCatching { engine.currentPageTitle }.getOrNull()?.takeIf { it.isNotBlank() }
-        var pageThumb: String? = rawCandidates.firstNotNullOfOrNull { it.thumbnailUrl?.takeIf { t -> t.startsWith("http") } }
-            ?: runCatching { engine.currentPageThumbnail }.getOrNull()?.takeIf { it.startsWith("http") }
+        var pageTitle: String? = rawCandidates.firstNotNullOfOrNull {
+            it.pageTitle?.takeIf { t -> !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(t, url) }
+        } ?: runCatching { engine.currentPageTitle }.getOrNull()?.takeIf {
+            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
+        }
+        var pageThumb: String? = rawCandidates.firstNotNullOfOrNull {
+            HtmlThumbnailExtractor.resolveValidImageCandidate(it.thumbnailUrl, url)
+        } ?: HtmlThumbnailExtractor.resolveValidImageCandidate(
+            runCatching { engine.currentPageThumbnail }.getOrNull(),
+            url
+        )
         val pageDurationSec: Long? = rawCandidates.firstNotNullOfOrNull { it.durationSeconds?.takeIf { d -> d > 0L } }
 
         val bestHeaders = LinkedHashMap<String, String>().apply {
@@ -191,41 +198,54 @@ class InterceptedMediaExtractor : MediaExtractor {
             (ext !in UrlUtils.VIDEO_EXTENSIONS && ext !in UrlUtils.AUDIO_EXTENSIONS && ext != "m3u8" && ext != "mpd")
 
         var htmlResolved: ResolvedMedia? = null
-        if (isWebPage && htmlMediaExtractor != null) {
-            if (distinctAuthHeights.size >= 2) {
-                if (pageThumb.isNullOrBlank()) {
-                    // Recover og:image / twitter:image / video poster / title without re-probing already-resolved streams
-                    runCatching {
-                        val htmlText = http.fetchString(url, bestHeaders)
-                        if (htmlText.isNotBlank()) {
-                            val doc = Jsoup.parse(htmlText, url)
-                            val playerPoster = JsUnpacker.extractPlayerConfigs(htmlText).posterUrl
-                            val extractedThumb = HtmlThumbnailExtractor.extractThumbnail(
-                                doc = doc,
-                                pageUrl = url,
-                                playerPoster = playerPoster
-                            )
-                            if (!extractedThumb.isNullOrBlank()) pageThumb = extractedThumb
-                            if (pageTitle.isNullOrBlank()) {
-                                val ogTitle = doc.select("meta[property=og:title]").attr("content")
-                                    .ifBlank { doc.title() }
-                                if (ogTitle.isNotBlank()) pageTitle = ogTitle
-                            }
-                        }
-                    }
-                }
-            } else {
-                htmlResolved = runCatching {
-                    htmlMediaExtractor.extractWithHeaders(url, bestHeaders, allowHeadlessFallback = false)
-                }.getOrNull()
-            }
+        if (isWebPage && htmlMediaExtractor != null && distinctAuthHeights.size < 2) {
+            htmlResolved = runCatching {
+                htmlMediaExtractor.extractWithHeaders(url, bestHeaders, allowHeadlessFallback = false)
+            }.getOrNull()
         }
 
-        if (pageTitle.isNullOrBlank() && !htmlResolved?.title.isNullOrBlank()) {
+        if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url) &&
+            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(htmlResolved?.title, url)
+        ) {
             pageTitle = htmlResolved?.title
         }
         if (pageThumb.isNullOrBlank() && !htmlResolved?.thumbnailUrl.isNullOrBlank()) {
             pageThumb = htmlResolved?.thumbnailUrl
+        }
+
+        if (isWebPage &&
+            (pageThumb.isNullOrBlank() || HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url))
+        ) {
+            // Recover artwork & title directly from page HTML even when static HTML had zero direct video streams
+            runCatching {
+                val htmlText = http.fetchString(url, bestHeaders)
+                if (htmlText.isNotBlank()) {
+                    val doc = Jsoup.parse(htmlText, url)
+                    if (pageThumb.isNullOrBlank()) {
+                        val playerPoster = JsUnpacker.extractPlayerConfigs(htmlText).posterUrl
+                        val extractedThumb = HtmlThumbnailExtractor.extractThumbnail(
+                            doc = doc,
+                            pageUrl = url,
+                            rawHtml = htmlText,
+                            playerPoster = playerPoster
+                        )
+                        if (!extractedThumb.isNullOrBlank()) pageThumb = extractedThumb
+                    }
+                    if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url)) {
+                        val extractedTitle = HtmlThumbnailExtractor.extractTitle(doc, url)
+                        if (!HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extractedTitle, url)) {
+                            pageTitle = extractedTitle
+                        }
+                    }
+                }
+            }
+        }
+
+        if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url)) {
+            HtmlThumbnailExtractor.humanReadableTitleFromUrl(url)?.let { pageTitle = it }
+        }
+        if (!pageTitle.isNullOrBlank() || !pageThumb.isNullOrBlank()) {
+            runCatching { engine.updatePageMetadata(pageTitle, pageThumb, url) }
         }
 
         val combinedRaw = buildList {
@@ -375,7 +395,10 @@ class InterceptedMediaExtractor : MediaExtractor {
         val finalStreams = videos + audios
         if (finalStreams.isEmpty()) return@coroutineScope null
 
-        val title = pageTitle?.takeIf { it.isNotBlank() }
+        val title = pageTitle?.takeIf {
+            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
+        } ?: HtmlThumbnailExtractor.humanReadableTitleFromUrl(url)
+            ?: pageTitle?.takeIf { it.isNotBlank() }
             ?: UrlUtils.host(url)?.replaceFirstChar { it.uppercase() }
             ?: UrlUtils.fileNameFromUrl(url)
 
