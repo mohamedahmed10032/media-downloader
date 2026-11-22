@@ -162,7 +162,7 @@ class HlsExtractor @Inject constructor(
                 val videoBytes = when {
                     totalDurationSeconds <= 0L -> null
                     avgBandwidth != null -> (avgBandwidth.toLong() * totalDurationSeconds) / 8L
-                    bandwidth != null -> (bandwidth.toDouble() * 0.72 * totalDurationSeconds / 8.0).roundToLong()
+                    bandwidth != null -> (bandwidth.toDouble() * 0.85 * totalDurationSeconds / 8.0).roundToLong()
                         .takeIf { it > 0L }
                     else -> null
                 }
@@ -170,6 +170,7 @@ class HlsExtractor @Inject constructor(
                 val variantHeaders = LinkedHashMap<String, String>(baseStreamHeaders).apply {
                     if (videoBytes != null && videoBytes > 0L) {
                         put("X-Internal-Expected-Bytes", videoBytes.toString())
+                        put("X-Internal-Size-Estimated", "true")
                     }
                     if (companionAudio != null && companionAudio.first != v.variantUrl) {
                         put("X-Internal-Companion-Audio", companionAudio.first)
@@ -238,7 +239,10 @@ class HlsExtractor @Inject constructor(
                     } else null
 
                     val audioHeaders = if (audioSizeBytes != null && audioSizeBytes > 0L) {
-                        baseStreamHeaders + ("X-Internal-Expected-Bytes" to audioSizeBytes.toString())
+                        baseStreamHeaders + mapOf(
+                            "X-Internal-Expected-Bytes" to audioSizeBytes.toString(),
+                            "X-Internal-Size-Estimated" to "true"
+                        )
                     } else {
                         baseStreamHeaders
                     }
@@ -312,12 +316,16 @@ class HlsExtractor @Inject constructor(
                     sizeBytes = (estBitrate * 1000L * totalDurationSeconds) / 8L
                 }
 
+                val isEstimatedSize = byteRangeTotal <= 0L && sizeBytes != null && sizeBytes > 0L
                 val streamHeaders = LinkedHashMap<String, String>(headers).apply {
                     if (totalDurationSeconds > 0L) {
                         put("X-Internal-Duration-Seconds", totalDurationSeconds.toString())
                     }
                     if (sizeBytes != null && sizeBytes > 0L) {
                         put("X-Internal-Expected-Bytes", sizeBytes.toString())
+                        if (isEstimatedSize) {
+                            put("X-Internal-Size-Estimated", "true")
+                        }
                     }
                 }
 

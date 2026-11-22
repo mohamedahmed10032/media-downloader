@@ -42,16 +42,19 @@ internal class MpegTsTimestampNormalizer {
         val maxAudioPts: Long,
         val minAudioDts: Long,
         val maxAudioDts: Long,
+        val minPcr: Long,
         val videoStep: Long,
         val audioStep: Long
     )
 
     fun writeSegment(partFile: File, discontinuityBlock: Int, output: OutputStream) {
-        val bytes = partFile.readBytes()
-        if (!isMpegTsBuffer(bytes)) {
-            output.write(bytes)
+        val rawBytes = partFile.readBytes()
+        val syncOffset = findTsSyncOffset(rawBytes)
+        if (syncOffset < 0) {
+            output.write(rawBytes)
             return
         }
+        val bytes = if (syncOffset == 0) rawBytes else rawBytes.copyOfRange(syncOffset, rawBytes.size)
 
         val timing = scanTiming(bytes)
         val hasVideo = timing.minVideoDts >= 0L
@@ -65,7 +68,16 @@ internal class MpegTsTimestampNormalizer {
         if (timing.audioStep in 500L..10_000L) lastAudioStep90k = timing.audioStep
 
         if (!hasNormalizedAnyTs) {
-            currentDelta90k = 0L
+            val anchorCandidates = ArrayList<Long>(3)
+            if (hasVideo) anchorCandidates.add(timing.minVideoDts)
+            if (hasAudio) anchorCandidates.add(timing.minAudioDts)
+            if (timing.minPcr >= 0L) anchorCandidates.add(timing.minPcr)
+            val minAnchor = anchorCandidates.minOrNull() ?: 0L
+            currentDelta90k = if (minAnchor > INITIAL_REBASE_THRESHOLD_90K) {
+                INITIAL_BASE_90K - minAnchor
+            } else {
+                0L
+            }
             hasNormalizedAnyTs = true
         } else {
             val blockChanged = discontinuityBlock != prevBlock
@@ -121,10 +133,28 @@ internal class MpegTsTimestampNormalizer {
         }
     }
 
-    private fun isMpegTsBuffer(bytes: ByteArray): Boolean {
-        if (bytes.size < TS_PACKET_SIZE) return false
-        if ((bytes[0].toInt() and 0xFF) != TS_SYNC_BYTE) return false
-        return bytes.size < TS_PACKET_SIZE * 2 || (bytes[TS_PACKET_SIZE].toInt() and 0xFF) == TS_SYNC_BYTE
+    internal fun findTsSyncOffset(bytes: ByteArray): Int {
+        if (bytes.size < TS_PACKET_SIZE) return -1
+        // Do not misidentify ISO-BMFF fMP4 segments (ftyp / styp / moof) as MPEG-TS
+        if (bytes.size >= 8) {
+            val box = String(bytes, 4, 4, Charsets.ISO_8859_1)
+            if (box == "ftyp" || box == "styp" || box == "moof") return -1
+        }
+        if (isTsSyncAt(bytes, 0)) return 0
+        val maxProbe = minOf(MAX_LEADING_PREFIX_SCAN, bytes.size - TS_PACKET_SIZE)
+        for (i in 1..maxProbe) {
+            if (isTsSyncAt(bytes, i)) return i
+        }
+        return -1
+    }
+
+    private fun isTsSyncAt(bytes: ByteArray, offset: Int): Boolean {
+        if ((bytes[offset].toInt() and 0xFF) != TS_SYNC_BYTE) return false
+        val hasPkt1 = offset + TS_PACKET_SIZE < bytes.size
+        if (hasPkt1 && (bytes[offset + TS_PACKET_SIZE].toInt() and 0xFF) != TS_SYNC_BYTE) return false
+        val hasPkt2 = offset + TS_PACKET_SIZE * 2 < bytes.size
+        if (hasPkt2 && (bytes[offset + TS_PACKET_SIZE * 2].toInt() and 0xFF) != TS_SYNC_BYTE) return false
+        return true
     }
 
     private fun scanTiming(bytes: ByteArray): SegmentTiming {
@@ -136,6 +166,7 @@ internal class MpegTsTimestampNormalizer {
         var maxAPts = -1L
         var minADts = Long.MAX_VALUE
         var maxADts = -1L
+        var minPcr = Long.MAX_VALUE
 
         val videoDtsSamples = ArrayList<Long>(64)
         val audioDtsSamples = ArrayList<Long>(64)
@@ -145,6 +176,17 @@ internal class MpegTsTimestampNormalizer {
             if ((bytes[offset].toInt() and 0xFF) != TS_SYNC_BYTE) {
                 offset++
                 continue
+            }
+            val afc = (bytes[offset + 3].toInt() and 0x30) ushr 4
+            if ((afc and 0x02) != 0) {
+                val afLen = bytes[offset + 4].toInt() and 0xFF
+                if (afLen >= 7 && offset + 12 <= bytes.size) {
+                    val flags = bytes[offset + 5].toInt() and 0xFF
+                    if ((flags and 0x10) != 0) {
+                        val pcrBase = readPcrBase(bytes, offset + 6)
+                        if (pcrBase < minPcr) minPcr = pcrBase
+                    }
+                }
             }
             val pusi = (bytes[offset + 1].toInt() and 0x40) != 0
             if (pusi) {
@@ -197,6 +239,7 @@ internal class MpegTsTimestampNormalizer {
             maxAudioPts = maxAPts,
             minAudioDts = if (minADts == Long.MAX_VALUE) -1L else minADts,
             maxAudioDts = maxADts,
+            minPcr = if (minPcr == Long.MAX_VALUE) -1L else minPcr,
             videoStep = medianPositiveStep(videoDtsSamples, DEFAULT_VIDEO_STEP_90K),
             audioStep = medianPositiveStep(audioDtsSamples, DEFAULT_AUDIO_STEP_90K)
         )
@@ -231,16 +274,21 @@ internal class MpegTsTimestampNormalizer {
             val hasAdaptation = (afc and 0x02) != 0
             val hasPayload = (afc and 0x01) != 0
 
-            // 1. Rewrite 4-bit continuity counter cleanly for payload packets
-            if (pid != NULL_PID && hasPayload) {
+            // 1. Rewrite 4-bit continuity counter cleanly (payload increments; adaptation-only repeats previous CC)
+            if (pid != NULL_PID) {
                 val expectedCc = nextCcByPid[pid]
-                val nextCc = if (expectedCc < 0) {
-                    bytes[offset + 3].toInt() and 0x0F
-                } else {
-                    expectedCc
+                if (hasPayload) {
+                    val nextCc = if (expectedCc < 0) {
+                        bytes[offset + 3].toInt() and 0x0F
+                    } else {
+                        expectedCc
+                    }
+                    bytes[offset + 3] = ((bytes[offset + 3].toInt() and 0xF0) or nextCc).toByte()
+                    nextCcByPid[pid] = (nextCc + 1) and 0x0F
+                } else if (expectedCc >= 0) {
+                    val repeatedCc = (expectedCc - 1) and 0x0F
+                    bytes[offset + 3] = ((bytes[offset + 3].toInt() and 0xF0) or repeatedCc).toByte()
                 }
-                bytes[offset + 3] = ((bytes[offset + 3].toInt() and 0xF0) or nextCc).toByte()
-                nextCcByPid[pid] = (nextCc + 1) and 0x0F
             }
 
             if (delta90k != 0L) {
@@ -360,6 +408,9 @@ internal class MpegTsTimestampNormalizer {
         const val TS_SYNC_BYTE = 0x47
         const val NULL_PID = 0x1FFF
         const val TS_33BIT_MASK = 0x1FFFFFFFFL
+        const val MAX_LEADING_PREFIX_SCAN = 4096
+        const val INITIAL_BASE_90K = 9_000L // 0.1s safety margin prevents negative PCR/PTS clamping
+        const val INITIAL_REBASE_THRESHOLD_90K = 450_000L // rebase initial PTS when stream starts > 5s
         const val DEFAULT_VIDEO_STEP_90K = 3_750L // 24 fps
         const val DEFAULT_AUDIO_STEP_90K = 1_920L // 48 kHz AAC (1024 samples)
         const val DISCONTINUITY_JUMP_90K = 90_000L // 1.0 second

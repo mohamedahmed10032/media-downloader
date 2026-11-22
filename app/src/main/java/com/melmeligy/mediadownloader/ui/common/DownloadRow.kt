@@ -62,7 +62,7 @@ fun DownloadRow(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = statusLine(item),
+                    text = formatDownloadPrimaryStatus(item),
                     style = MaterialTheme.typography.bodySmall,
                     color = if (item.status == DownloadStatus.FAILED) MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -70,6 +70,17 @@ fun DownloadRow(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 2.dp)
                 )
+                val secondary = formatDownloadSecondaryStatus(item)
+                if (secondary != null) {
+                    Text(
+                        text = secondary,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 1.dp)
+                    )
+                }
                 if (item.isActive && item.status != DownloadStatus.QUEUED) {
                     Spacer(Modifier.height(6.dp))
                     if (item.totalBytes > 0) {
@@ -127,27 +138,27 @@ private fun ActionButtons(
     onCancel: (() -> Unit)?,
     onRetry: (() -> Unit)?
 ) {
-    Row {
+    Row(verticalAlignment = Alignment.CenterVertically) {
         when (item.status) {
             DownloadStatus.RUNNING, DownloadStatus.QUEUED -> {
-                if (onPause != null) IconButton(onClick = onPause) {
+                if (onPause != null) IconButton(onClick = onPause, modifier = Modifier.size(40.dp)) {
                     Icon(Icons.Rounded.Pause, contentDescription = "Pause")
                 }
             }
             DownloadStatus.PAUSED -> {
-                if (onResume != null) IconButton(onClick = onResume) {
+                if (onResume != null) IconButton(onClick = onResume, modifier = Modifier.size(40.dp)) {
                     Icon(Icons.Rounded.PlayArrow, contentDescription = "Resume")
                 }
             }
             DownloadStatus.FAILED -> {
-                if (onRetry != null) IconButton(onClick = onRetry) {
+                if (onRetry != null) IconButton(onClick = onRetry, modifier = Modifier.size(40.dp)) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Retry")
                 }
             }
             else -> {}
         }
         if (onCancel != null && item.status != DownloadStatus.COMPLETED) {
-            IconButton(onClick = onCancel) {
+            IconButton(onClick = onCancel, modifier = Modifier.size(40.dp)) {
                 Icon(Icons.Rounded.Close, contentDescription = "Cancel")
             }
         }
@@ -160,27 +171,37 @@ private fun iconFor(type: MediaType): ImageVector = when (type) {
     MediaType.IMAGE -> Icons.Rounded.Image
 }
 
-private fun statusLine(item: DownloadItem): String {
+internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
     val quality = item.qualityLabel.ifBlank { item.container.uppercase() }
     val safeDone = item.downloadedBytes.coerceAtLeast(0L)
     val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
     return when (item.status) {
         DownloadStatus.QUEUED -> "$quality · Queued"
         DownloadStatus.RUNNING -> {
-            val size = if (safeTotal > 0L) {
+            val percent = if (safeTotal > 0L) " · ${FormatUtils.formatPercent(item.progress)}" else ""
+            val size = if (item.isHls) {
+                FormatUtils.formatBytes(safeDone)
+            } else if (safeTotal > 0L) {
                 "${FormatUtils.formatBytes(safeDone)} / ${FormatUtils.formatBytes(safeTotal)}"
             } else {
                 FormatUtils.formatBytes(safeDone)
             }
-            val speed = FormatUtils.formatSpeed(item.speedBytesPerSec.coerceAtLeast(0L))
-            val eta = if (item.etaSeconds > 0 && safeTotal > safeDone) {
-                " · ${FormatUtils.formatEta(item.etaSeconds)} left"
-            } else ""
-            "$quality · $size · $speed$eta"
+            "$quality · $size$percent"
         }
         DownloadStatus.PAUSED -> "$quality · Paused (${FormatUtils.formatPercent(item.progress)})"
         DownloadStatus.COMPLETED -> "$quality · ${FormatUtils.formatBytes(item.totalBytes.coerceAtLeast(safeDone))}"
         DownloadStatus.FAILED -> "Failed · tap retry"
         DownloadStatus.CANCELED -> "Canceled"
     }
+}
+
+internal fun formatDownloadSecondaryStatus(item: DownloadItem): String? {
+    if (item.status != DownloadStatus.RUNNING) return null
+    val safeDone = item.downloadedBytes.coerceAtLeast(0L)
+    val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
+    val speed = FormatUtils.formatSpeed(item.speedBytesPerSec.coerceAtLeast(0L))
+    val eta = if (item.etaSeconds > 0 && safeTotal > safeDone) {
+        " · ${FormatUtils.formatEta(item.etaSeconds)} left"
+    } else ""
+    return "$speed$eta"
 }

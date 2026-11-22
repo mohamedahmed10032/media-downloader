@@ -23,6 +23,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.net.toUri
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -64,11 +66,18 @@ fun PlayerScreen(
         }
 
         val exoPlayer = remember(uriString) {
-            ExoPlayer.Builder(context).build().apply {
-                setMediaItem(MediaItem.fromUri(uriString.toUri()))
-                prepare()
-                playWhenReady = true
-            }
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build()
+            ExoPlayer.Builder(context)
+                .setAudioAttributes(audioAttrs, false)
+                .build()
+                .apply {
+                    setMediaItem(MediaItem.fromUri(uriString.toUri()))
+                    prepare()
+                    playWhenReady = true
+                }
         }
 
         DisposableEffect(uriString) {
@@ -87,6 +96,11 @@ fun PlayerScreen(
                         setShowNextButton(false)
                         setShowPreviousButton(false)
                         setBackgroundColor(android.graphics.Color.BLACK)
+                    }
+                },
+                update = { view ->
+                    if (view.player !== exoPlayer) {
+                        view.player = exoPlayer
                     }
                 }
             )

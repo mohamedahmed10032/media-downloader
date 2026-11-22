@@ -256,7 +256,8 @@ class V220VerificationTest {
         val peakOnly = res.streams.first { it.url.endsWith("peakonly.m3u8") }
         assertEquals(1080, peakOnly.height)
         assertTrue((peakOnly.width ?: 0) > 0)
-        assertEquals(9_000_000L, peakOnly.sizeBytes) // 1,000,000 * 0.72 * 100 / 8
+        assertEquals(10_625_000L, peakOnly.sizeBytes) // 1,000,000 * 0.85 * 100 / 8
+        assertEquals("true", peakOnly.headers["X-Internal-Size-Estimated"])
 
         // Confirmed HTML short-circuit
         ExtractorRegistry.markConfirmedHtml("https://site.test/page.m3u8")

@@ -130,65 +130,37 @@ class HlsSegmentDownloader @Inject constructor(
         ).apply { mkdirs() }
 
         val written = AtomicLong(0L)
-        val initMapBytes = AtomicLong(0L)
         val completedMediaSegments = AtomicInteger(0)
-        val completedMediaBytes = AtomicLong(0L)
-        val completedMediaDurationMs = AtomicLong(0L)
-        val smoothedEstimate = AtomicLong(hintedTotal.coerceAtLeast(0L))
         val tracker = SpeedTracker(0L)
 
-        fun computeEstimatedTotal(currentWritten: Long): Long {
+        fun computeSegmentDrivenTotal(currentWritten: Long): Long {
             if (exactByteRangeTotal > 0L) {
                 return maxOf(exactByteRangeTotal, currentWritten)
             }
             val doneSegs = completedMediaSegments.get()
-            val doneBytes = completedMediaBytes.get()
-            val doneDurMs = completedMediaDurationMs.get()
-            val mapBytes = initMapBytes.get()
-
-            val rawEstimate = when {
-                doneSegs > 0 && doneDurMs > 0L && totalDurationMs > 0L ->
-                    mapBytes + (doneBytes * totalDurationMs) / doneDurMs
-                doneSegs > 0 && totalMediaSegments > 0 ->
-                    mapBytes + (doneBytes * totalMediaSegments) / doneSegs
-                hintedTotal > 0L ->
-                    hintedTotal
-                else ->
-                    -1L
+            if (totalMediaSegments <= 0) {
+                return if (hintedTotal > 0L) maxOf(hintedTotal, currentWritten) else -1L
             }
-
-            if (rawEstimate <= 0L) return -1L
-
-            val blended = if (hintedTotal > 0L && doneSegs in 1..3 && totalMediaSegments > 4) {
-                (rawEstimate * doneSegs + hintedTotal * (4 - doneSegs)) / 4L
-            } else {
-                rawEstimate
+            if (doneSegs <= 0) {
+                return if (hintedTotal > 0L) maxOf(hintedTotal, currentWritten + 1L) else -1L
             }
-
-            // Smooth VBR oscillations using EMA and clamp >= currentWritten so progress never exceeds 100%
-            val prev = smoothedEstimate.get()
-            val next = if (prev <= 0L) {
-                blended
-            } else {
-                ((prev * 7L) + (blended * 3L)) / 10L
+            if (doneSegs >= totalMediaSegments) {
+                return currentWritten
             }
-            val remainingSegs = (totalMediaSegments - doneSegs).coerceAtLeast(0)
-            val floorWithRemaining = if (remainingSegs > 0 && doneSegs > 0) {
-                maxOf(currentWritten + 1L, next)
-            } else {
-                maxOf(currentWritten, next)
-            }
-            smoothedEstimate.set(floorWithRemaining)
-            return floorWithRemaining
+            // Drive progress bar and percentage strictly from completedSegments / totalSegments
+            val impliedTotal = kotlin.math.round(
+                (currentWritten.toDouble() * totalMediaSegments.toDouble()) / doneSegs.toDouble()
+            ).toLong()
+            return maxOf(currentWritten + 1L, impliedTotal)
         }
 
         val progressJob = launch {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
                 val bytes = written.get()
-                val estTotal = computeEstimatedTotal(bytes)
+                val estTotal = computeSegmentDrivenTotal(bytes)
                 val speed = tracker.sample(bytes)
-                val eta = if (speed > 0 && estTotal > 0) ((estTotal - bytes) / speed).coerceAtLeast(0) else -1L
+                val eta = if (speed > 0 && estTotal > bytes) ((estTotal - bytes) / speed).coerceAtLeast(0) else -1L
                 onProgress(DownloadProgress(bytes, estTotal, speed, eta))
             }
         }
@@ -206,7 +178,7 @@ class HlsSegmentDownloader @Inject constructor(
                     val keyBytes = if (segment.keySpec.method == HlsEncryptionMethod.AES_128 && !segment.isInitMap) {
                         segment.keySpec.uri?.let { aesKeys[it] }
                     } else null
-                    val segBytes = downloadSegmentToPart(
+                    downloadSegmentToPart(
                         segment = segment,
                         headers = headers,
                         keyBytes = keyBytes,
@@ -214,13 +186,7 @@ class HlsSegmentDownloader @Inject constructor(
                         partFile = partFile,
                         written = written
                     )
-                    if (segment.isInitMap) {
-                        initMapBytes.addAndGet(segBytes)
-                    } else {
-                        completedMediaBytes.addAndGet(segBytes)
-                        if (segment.durationSec > 0.0) {
-                            completedMediaDurationMs.addAndGet((segment.durationSec * 1000.0).toLong())
-                        }
+                    if (!segment.isInitMap) {
                         completedMediaSegments.incrementAndGet()
                     }
                     partFile

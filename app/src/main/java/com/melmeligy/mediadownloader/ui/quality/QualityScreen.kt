@@ -780,7 +780,10 @@ private fun SnaptubeTagBadge(text: String) {
 }
 
 internal fun formatStreamSize(stream: MediaStream): String = when {
-    stream.sizeBytes != null && stream.sizeBytes > 0 -> FormatUtils.formatBytes(stream.sizeBytes)
+    stream.sizeBytes != null && stream.sizeBytes > 0 -> {
+        val formatted = FormatUtils.formatBytes(stream.sizeBytes)
+        if (stream.headers["X-Internal-Size-Estimated"] == "true") "~$formatted" else formatted
+    }
     stream.bitrateKbps != null && stream.bitrateKbps > 0 -> "~${stream.bitrateKbps} kbps"
     stream.isHls -> "Stream"
     stream.type == MediaType.IMAGE -> stream.container.uppercase()

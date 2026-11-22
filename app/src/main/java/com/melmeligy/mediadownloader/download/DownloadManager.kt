@@ -282,12 +282,14 @@ class DownloadManager @Inject constructor(
         ) {
             val safeDownloaded = maxOf(highWaterDownloaded, downloaded.coerceAtLeast(0L))
             highWaterDownloaded = safeDownloaded
-            val safeTotal = if (total > 0L) {
+            val safeTotal = if (item.isHls) {
+                if (total > 0L) maxOf(total, safeDownloaded) else total
+            } else if (total > 0L) {
                 maxOf(highWaterTotal, total, safeDownloaded)
             } else {
                 highWaterTotal.takeIf { it > 0L }?.let { maxOf(it, safeDownloaded) } ?: total
             }
-            if (safeTotal > 0L) highWaterTotal = safeTotal
+            if (!item.isHls && safeTotal > 0L) highWaterTotal = safeTotal
 
             val now = System.currentTimeMillis()
             val isComplete = safeTotal > 0L && safeDownloaded >= safeTotal

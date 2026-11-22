@@ -202,7 +202,7 @@ class VideoAudioMuxer @Inject constructor() {
                 bufferInfo.offset = 0
                 bufferInfo.size = sampleSize
                 bufferInfo.presentationTimeUs = pts
-                bufferInfo.flags = videoExtractor.sampleFlags
+                bufferInfo.flags = RemuxTimelineNormalizer.mapSampleFlagsToBufferFlags(videoExtractor.sampleFlags)
                 muxer.writeSampleData(muxVideoTrack, buffer, bufferInfo)
                 videoCount++
                 videoExtractor.advance()
@@ -222,7 +222,7 @@ class VideoAudioMuxer @Inject constructor() {
                 bufferInfo.offset = 0
                 bufferInfo.size = sampleSize
                 bufferInfo.presentationTimeUs = pts
-                bufferInfo.flags = audioExtractor.sampleFlags
+                bufferInfo.flags = RemuxTimelineNormalizer.mapSampleFlagsToBufferFlags(audioExtractor.sampleFlags)
                 muxer.writeSampleData(muxAudioTrack, buffer, bufferInfo)
                 audioCount++
                 audioExtractor.advance()
@@ -346,6 +346,11 @@ class VideoAudioMuxer @Inject constructor() {
                 return transcodeToAacM4aAndroid(sourceFile, outputFile, targetBitrateKbps)
             }
 
+            val audioHasAdts = audioFormat.containsKey(MediaFormat.KEY_IS_ADTS) &&
+                runCatching { audioFormat.getInteger(MediaFormat.KEY_IS_ADTS) == 1 }.getOrDefault(false)
+            if (audioHasAdts) {
+                runCatching { audioFormat.setInteger(MediaFormat.KEY_IS_ADTS, 0) }
+            }
             ensureAacCsd0IfNeeded(audioFormat)
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val dstTrack = muxer.addTrack(audioFormat)
@@ -353,37 +358,53 @@ class VideoAudioMuxer @Inject constructor() {
 
             val buffer = ByteBuffer.allocateDirect(512 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
-            var firstPtsUs = -1L
-            var lastRawPtsUs = -1L
-            var offsetUs = 0L
-            var sampleCount = 0
+            val normalizer = RemuxTimelineNormalizer(expectVideo = false, expectAudio = true)
+
+            fun writeAudioSample(sample: NormalizedRemuxSample, directBuffer: ByteBuffer?, directSize: Int) {
+                val rawBytes = sample.payload ?: ByteArray(directSize).also { arr ->
+                    directBuffer!!.position(0)
+                    directBuffer.get(arr, 0, directSize)
+                }
+                val adts = if (audioHasAdts) {
+                    RemuxTimelineNormalizer.stripAdtsHeaderIfPresent(rawBytes, 0, rawBytes.size)
+                } else {
+                    AdtsStripResult(false, 0, rawBytes.size)
+                }
+                if (adts.payloadLength <= 0) return
+                val outBuf = ByteBuffer.wrap(rawBytes, adts.payloadOffset, adts.payloadLength)
+                bufferInfo.offset = adts.payloadOffset
+                bufferInfo.size = adts.payloadLength
+                bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                bufferInfo.flags = sample.bufferFlags
+                muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+            }
 
             while (true) {
                 val sampleSize = extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
                 val rawPts = extractor.sampleTime
-                if (rawPts < 0) {
-                    extractor.advance()
-                    continue
+                if (rawPts >= 0) {
+                    val flags = extractor.sampleFlags
+                    normalizer.onSample(
+                        track = RemuxTrackKind.AUDIO,
+                        rawPtsUs = rawPts,
+                        extractorFlags = flags,
+                        payloadCopy = {
+                            ByteArray(sampleSize).also { arr ->
+                                buffer.position(0)
+                                buffer.get(arr, 0, sampleSize)
+                            }
+                        }
+                    ) { normalized ->
+                        writeAudioSample(normalized, buffer, sampleSize)
+                    }
                 }
-                if (firstPtsUs < 0L) firstPtsUs = rawPts
-                if (lastRawPtsUs >= 0L && abs(rawPts - lastRawPtsUs) > DISCONTINUITY_THRESHOLD_US) {
-                    offsetUs += (lastRawPtsUs + 23_220L) - rawPts
-                }
-                lastRawPtsUs = rawPts
-                val pts = (rawPts - firstPtsUs + offsetUs).coerceAtLeast(0L)
-
-                bufferInfo.offset = 0
-                bufferInfo.size = sampleSize
-                bufferInfo.presentationTimeUs = pts
-                bufferInfo.flags = extractor.sampleFlags
-                muxer.writeSampleData(dstTrack, buffer, bufferInfo)
-                sampleCount++
                 extractor.advance()
             }
+            normalizer.flush { normalized -> writeAudioSample(normalized, null, 0) }
 
             muxer.stop()
-            sampleCount > 0 && outputFile.exists() && outputFile.length() > 0L
+            normalizer.audioSampleCount > 0 && outputFile.exists() && outputFile.length() > 0L
         } catch (_: Exception) {
             runCatching { outputFile.delete() }
             false
@@ -526,10 +547,18 @@ class VideoAudioMuxer @Inject constructor() {
             val audioTrack = selectTrack(extractor, "audio/")
             if (videoTrack < 0 && audioTrack < 0) return false
 
+            var maxInputSize = 2 * 1024 * 1024
+            var audioHasAdts = false
+
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val dstVideoTrack = if (videoTrack >= 0) {
                 extractor.selectTrack(videoTrack)
                 val format = extractor.getTrackFormat(videoTrack)
+                if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                    runCatching {
+                        maxInputSize = maxOf(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    }
+                }
                 if (format.containsKey(MediaFormat.KEY_ROTATION)) {
                     runCatching { muxer.setOrientationHint(format.getInteger(MediaFormat.KEY_ROTATION)) }
                 }
@@ -539,71 +568,113 @@ class VideoAudioMuxer @Inject constructor() {
             val dstAudioTrack = if (audioTrack >= 0) {
                 extractor.selectTrack(audioTrack)
                 val format = extractor.getTrackFormat(audioTrack)
+                if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                    runCatching {
+                        maxInputSize = maxOf(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    }
+                }
+                audioHasAdts = format.containsKey(MediaFormat.KEY_IS_ADTS) &&
+                    runCatching { format.getInteger(MediaFormat.KEY_IS_ADTS) == 1 }.getOrDefault(false)
+                if (audioHasAdts) {
+                    runCatching { format.setInteger(MediaFormat.KEY_IS_ADTS, 0) }
+                }
                 ensureAacCsd0IfNeeded(format)
                 muxer.addTrack(format)
             } else -1
 
             muxer.start()
 
-            val buffer = ByteBuffer.allocateDirect(1024 * 1024)
+            val buffer = ByteBuffer.allocateDirect(maxInputSize.coerceAtMost(16 * 1024 * 1024))
             val bufferInfo = MediaCodec.BufferInfo()
-            var basePtsUs = -1L
-            var maxVideoRawPtsUs = -1L
-            var lastVideoRawPtsUs = -1L
-            var maxAudioRawPtsUs = -1L
-            var lastAudioRawPtsUs = -1L
-            var videoOffsetUs = 0L
-            var audioOffsetUs = 0L
-            var writtenSamples = 0
+            val normalizer = RemuxTimelineNormalizer(
+                expectVideo = dstVideoTrack >= 0,
+                expectAudio = dstAudioTrack >= 0
+            )
+            var audioAdtsScratch = ByteArray(0)
+
+            fun writeSample(sample: NormalizedRemuxSample, directBuffer: ByteBuffer?, directSize: Int) {
+                val dstTrack = if (sample.track == RemuxTrackKind.VIDEO) dstVideoTrack else dstAudioTrack
+                if (dstTrack < 0) return
+
+                val payload = sample.payload
+                if (sample.track == RemuxTrackKind.AUDIO && audioHasAdts) {
+                    val bytes = payload ?: run {
+                        if (audioAdtsScratch.size < directSize) {
+                            audioAdtsScratch = ByteArray(directSize)
+                        }
+                        directBuffer!!.position(0)
+                        directBuffer.get(audioAdtsScratch, 0, directSize)
+                        audioAdtsScratch
+                    }
+                    val len = payload?.size ?: directSize
+                    val adts = RemuxTimelineNormalizer.stripAdtsHeaderIfPresent(bytes, 0, len)
+                    if (adts.payloadLength <= 0) return
+                    val outBuf = ByteBuffer.wrap(bytes, adts.payloadOffset, adts.payloadLength)
+                    bufferInfo.offset = adts.payloadOffset
+                    bufferInfo.size = adts.payloadLength
+                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                    bufferInfo.flags = sample.bufferFlags
+                    muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+                    return
+                }
+
+                if (payload != null) {
+                    if (payload.isEmpty()) return
+                    val outBuf = ByteBuffer.wrap(payload)
+                    bufferInfo.offset = 0
+                    bufferInfo.size = payload.size
+                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                    bufferInfo.flags = sample.bufferFlags
+                    muxer.writeSampleData(dstTrack, outBuf, bufferInfo)
+                } else {
+                    if (directSize <= 0 || directBuffer == null) return
+                    directBuffer.position(0)
+                    directBuffer.limit(directSize)
+                    bufferInfo.offset = 0
+                    bufferInfo.size = directSize
+                    bufferInfo.presentationTimeUs = sample.presentationTimeUs
+                    bufferInfo.flags = sample.bufferFlags
+                    muxer.writeSampleData(dstTrack, directBuffer, bufferInfo)
+                }
+            }
 
             while (true) {
+                buffer.clear()
                 val sampleSize = extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
                 val trackIndex = extractor.sampleTrackIndex
-                val dstTrack = when (trackIndex) {
-                    videoTrack -> dstVideoTrack
-                    audioTrack -> dstAudioTrack
-                    else -> -1
+                val kind = when (trackIndex) {
+                    videoTrack -> RemuxTrackKind.VIDEO
+                    audioTrack -> RemuxTrackKind.AUDIO
+                    else -> null
                 }
-                if (dstTrack >= 0) {
+                if (kind != null) {
                     val rawPts = extractor.sampleTime
-                    if (rawPts >= 0) {
-                        if (basePtsUs < 0L) basePtsUs = rawPts
-                        val pts = if (trackIndex == videoTrack) {
-                            if (lastVideoRawPtsUs >= 0L && abs(rawPts - lastVideoRawPtsUs) > DISCONTINUITY_THRESHOLD_US) {
-                                // Rebase against maxVideoRawPtsUs (not last B-frame PTS) so B-frames never collide across a splice
-                                val anchorUs = maxOf(maxVideoRawPtsUs, lastVideoRawPtsUs)
-                                videoOffsetUs += (anchorUs + 41_667L) - rawPts
-                                maxVideoRawPtsUs = rawPts
-                            } else if (rawPts > maxVideoRawPtsUs) {
-                                maxVideoRawPtsUs = rawPts
+                    if (rawPts >= 0L) {
+                        val rawFlags = extractor.sampleFlags
+                        normalizer.onSample(
+                            track = kind,
+                            rawPtsUs = rawPts,
+                            extractorFlags = rawFlags,
+                            payloadCopy = {
+                                ByteArray(sampleSize).also { copy ->
+                                    buffer.position(0)
+                                    buffer.get(copy, 0, sampleSize)
+                                }
                             }
-                            lastVideoRawPtsUs = rawPts
-                            (rawPts - basePtsUs + videoOffsetUs).coerceAtLeast(0L)
-                        } else {
-                            if (lastAudioRawPtsUs >= 0L && abs(rawPts - lastAudioRawPtsUs) > DISCONTINUITY_THRESHOLD_US) {
-                                val anchorUs = maxOf(maxAudioRawPtsUs, lastAudioRawPtsUs)
-                                audioOffsetUs += (anchorUs + 21_333L) - rawPts
-                                maxAudioRawPtsUs = rawPts
-                            } else if (rawPts > maxAudioRawPtsUs) {
-                                maxAudioRawPtsUs = rawPts
-                            }
-                            lastAudioRawPtsUs = rawPts
-                            (rawPts - basePtsUs + audioOffsetUs).coerceAtLeast(0L)
+                        ) { normalized ->
+                            writeSample(normalized, buffer, sampleSize)
                         }
-                        bufferInfo.offset = 0
-                        bufferInfo.size = sampleSize
-                        bufferInfo.presentationTimeUs = pts
-                        bufferInfo.flags = extractor.sampleFlags
-                        muxer.writeSampleData(dstTrack, buffer, bufferInfo)
-                        writtenSamples++
                     }
                 }
                 extractor.advance()
             }
+            normalizer.flush { normalized -> writeSample(normalized, null, 0) }
 
             muxer.stop()
-            writtenSamples > 0 && outputFile.exists() && outputFile.length() > 0L
+            val hasRequiredVideo = dstVideoTrack < 0 || normalizer.videoSampleCount > 0
+            val totalWritten = normalizer.videoSampleCount + normalizer.audioSampleCount
+            hasRequiredVideo && totalWritten > 0 && outputFile.exists() && outputFile.length() > 0L
         } catch (_: Exception) {
             runCatching { outputFile.delete() }
             false
