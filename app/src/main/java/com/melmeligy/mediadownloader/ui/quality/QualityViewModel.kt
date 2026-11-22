@@ -6,18 +6,22 @@ import androidx.lifecycle.viewModelScope
 import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.Resource
+import com.melmeligy.mediadownloader.domain.model.AppSettings
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.domain.repository.MediaRepository
+import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
 import com.melmeligy.mediadownloader.download.DownloadManager
 import com.melmeligy.mediadownloader.ui.navigation.Routes
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -25,10 +29,14 @@ import javax.inject.Inject
 class QualityViewModel @Inject constructor(
     private val mediaRepository: MediaRepository,
     private val downloadManager: DownloadManager,
+    private val settingsRepository: SettingsRepository,
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
     private var currentUrl: String = savedStateHandle.get<String>(Routes.ARG_URL).orEmpty()
+
+    val settings: StateFlow<AppSettings> = settingsRepository.settings
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     private val _state = MutableStateFlow<Resource<ResolvedMedia>>(Resource.Loading)
     val state: StateFlow<Resource<ResolvedMedia>> = _state.asStateFlow()
@@ -40,6 +48,9 @@ class QualityViewModel @Inject constructor(
     val queuedCount = _queuedCount.receiveAsFlow()
 
     init {
+        viewModelScope.launch {
+            runCatching { settingsRepository.current() }
+        }
         if (currentUrl.isNotBlank()) {
             resolve(currentUrl)
         }
@@ -50,6 +61,7 @@ class QualityViewModel @Inject constructor(
         currentUrl = targetUrl
         viewModelScope.launch {
             _state.value = Resource.Loading
+            runCatching { settingsRepository.current() }
             _state.value = try {
                 Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: MediaException) {

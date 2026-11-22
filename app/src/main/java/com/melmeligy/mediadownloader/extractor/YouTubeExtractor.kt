@@ -311,6 +311,12 @@ class YouTubeExtractor @Inject constructor(
                 sourceSizeBytes = highAudioSource.contentLength.takeIf { it > 0L } ?: baseAudioSize,
                 sourceBitrateKbps = highKbps
             ) ?: baseAudioSize
+            val mp3192Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = 192,
+                durationSeconds = validDuration,
+                sourceSizeBytes = highAudioSource.contentLength.takeIf { it > 0L } ?: baseAudioSize,
+                sourceBitrateKbps = highKbps
+            ) ?: baseAudioSize
             val mp3320Size = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
                 targetBitrateKbps = 320,
                 durationSeconds = validDuration,
@@ -387,7 +393,23 @@ class YouTubeExtractor @Inject constructor(
                 )
             )
 
-            // 5. Classic MP3 (320K) [Slow] - Shown in More formats
+            // 5. Classic MP3 (192K) - Shown in More formats (or Quick when user selects 192 kbps default)
+            musicStreams += MediaStream(
+                id = "yt-audio-mp3-192k",
+                url = highAudioSource.url,
+                type = MediaType.AUDIO,
+                container = "mp3",
+                label = "Classic MP3 (192K)",
+                bitrateKbps = 192,
+                sizeBytes = mp3192Size,
+                isHls = false,
+                headers = baseHeaders + durationHeader + mapOf(
+                    "X-Internal-Subtitle" to "MP3 (192K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                    "X-Internal-Video-Bytes" to highAudioSource.contentLength.toString()
+                )
+            )
+
+            // 6. Classic MP3 (320K) [Slow] - Shown in More formats
             musicStreams += MediaStream(
                 id = "yt-audio-mp3-320k",
                 url = highAudioSource.url,

@@ -64,7 +64,7 @@ class VideoAudioMuxer @Inject constructor() {
     ): Boolean {
         return when (targetContainer.lowercase()) {
             "mp3" -> extractMp3(sourceFile, outputFile, targetBitrateKbps)
-            else -> extractM4a(sourceFile, outputFile)
+            else -> extractM4a(sourceFile, outputFile, targetBitrateKbps)
         }
     }
 
@@ -93,7 +93,7 @@ class VideoAudioMuxer @Inject constructor() {
         return true
     }
 
-    fun extractM4a(sourceFile: File, outputFile: File): Boolean {
+    fun extractM4a(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 128): Boolean {
         if (!isValidInputFile(sourceFile)) {
             outputFile.delete()
             return false
@@ -102,9 +102,9 @@ class VideoAudioMuxer @Inject constructor() {
         if (outputFile.exists()) outputFile.delete()
 
         val ok = if (isAndroidRuntime) {
-            extractM4aAndroid(sourceFile, outputFile)
+            extractM4aAndroid(sourceFile, outputFile, targetBitrateKbps)
         } else {
-            extractM4aJvmFfmpeg(sourceFile, outputFile)
+            extractM4aJvmFfmpeg(sourceFile, outputFile, targetBitrateKbps)
         }
         if (!ok || !outputFile.exists() || outputFile.length() <= 0L || !startsWithIsoBmffFtyp(outputFile) || isRawDashBrand(outputFile)) {
             runCatching { outputFile.delete() }
@@ -328,7 +328,7 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    private fun extractM4aAndroid(sourceFile: File, outputFile: File): Boolean {
+    private fun extractM4aAndroid(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 128): Boolean {
         var extractor: MediaExtractor? = null
         var muxer: MediaMuxer? = null
         return try {
@@ -343,7 +343,7 @@ class VideoAudioMuxer @Inject constructor() {
                 // Opus/Vorbis/MP3 -> decode PCM & encode AAC-LC into clean M4A
                 extractor.release()
                 extractor = null
-                return transcodeToAacM4aAndroid(sourceFile, outputFile)
+                return transcodeToAacM4aAndroid(sourceFile, outputFile, targetBitrateKbps)
             }
 
             ensureAacCsd0IfNeeded(audioFormat)
@@ -394,7 +394,11 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    private fun transcodeToAacM4aAndroid(sourceFile: File, outputFile: File): Boolean {
+    private fun transcodeToAacM4aAndroid(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int = 128
+    ): Boolean {
         var extractor: MediaExtractor? = null
         var decoder: MediaCodec? = null
         var encoder: MediaCodec? = null
@@ -414,9 +418,10 @@ class VideoAudioMuxer @Inject constructor() {
             decoder.configure(inFmt, null, null, 0)
             decoder.start()
 
+            val effectiveAacBitrateBps = targetBitrateKbps.coerceIn(64, 320) * 1000
             val encFmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channels).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+                setInteger(MediaFormat.KEY_BIT_RATE, effectiveAacBitrateBps)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
             }
             encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
@@ -730,7 +735,11 @@ class VideoAudioMuxer @Inject constructor() {
         }
     }
 
-    private fun extractM4aJvmFfmpeg(sourceFile: File, outputFile: File): Boolean {
+    private fun extractM4aJvmFfmpeg(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int = 128
+    ): Boolean {
         val streams = probeStreamsJvm(sourceFile)
         val audio = streams.firstOrNull { it.codecType == "audio" } ?: return false
         val isAac = audio.codecName == "aac"
@@ -743,7 +752,8 @@ class VideoAudioMuxer @Inject constructor() {
                 args += listOf("-bsf:a", "aac_adtstoasc")
             }
         } else {
-            args += listOf("-c:a", "aac", "-b:a", "128k")
+            val clampedKbps = targetBitrateKbps.coerceIn(64, 320)
+            args += listOf("-c:a", "aac", "-b:a", "${clampedKbps}k")
         }
         args += listOf("-movflags", "+faststart", "-f", "ipod", outputFile.absolutePath)
         return runFfmpeg(args)

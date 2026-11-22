@@ -49,6 +49,12 @@ class MediaStoreWriter @Inject constructor(
         val directory = baseDirectory(type)
         val cleanSub = subfolder.trim().trim('/')
         val relativePath = if (cleanSub.isEmpty()) "$directory/" else "$directory/$cleanSub/"
+        val safeSub = com.melmeligy.mediadownloader.domain.model.AppSettings.sanitizeSubfolderOrEmpty(cleanSub)
+        val effectiveRelativePath = when {
+            safeSub == cleanSub -> relativePath
+            safeSub.isEmpty() -> "$directory/"
+            else -> "$directory/$safeSub/"
+        }
         val title = displayName.substringBeforeLast('.', displayName)
 
         fun createValues(name: String, destDir: String, relPath: String): ContentValues =
@@ -64,30 +70,34 @@ class MediaStoreWriter @Inject constructor(
                     put(MediaStore.MediaColumns.RELATIVE_PATH, relPath)
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 } else {
-                    val parentDir = if (cleanSub.isEmpty()) {
+                    val parentDir = if (safeSub.isEmpty()) {
                         Environment.getExternalStoragePublicDirectory(destDir)
                     } else {
-                        File(Environment.getExternalStoragePublicDirectory(destDir), cleanSub)
+                        File(Environment.getExternalStoragePublicDirectory(destDir), safeSub)
                     }
                     if (!parentDir.exists()) parentDir.mkdirs()
                     put(MediaStore.MediaColumns.DATA, File(parentDir, name).absolutePath)
                 }
             }
 
+        var actualDisplayName = displayName
+
         // Try primary collection, fallback to external URI, fallback to unique name, fallback to Downloads
-        val itemUri: Uri = tryInsert(resolver, createValues(displayName, directory, relativePath), type)
+        val itemUri: Uri = tryInsert(resolver, createValues(displayName, directory, effectiveRelativePath), type)
             ?: run {
                 val base = displayName.substringBeforeLast('.')
                 val ext = displayName.substringAfterLast('.', "")
                 val uniqueName = if (ext.isNotEmpty()) "$base (${System.currentTimeMillis() % 10000}).$ext"
                 else "$base (${System.currentTimeMillis() % 10000})"
-                tryInsert(resolver, createValues(uniqueName, directory, relativePath), type)
+                tryInsert(resolver, createValues(uniqueName, directory, effectiveRelativePath), type)?.also {
+                    actualDisplayName = uniqueName
+                }
             }
             ?: run {
                 // Nuclear fallback to MediaStore.Downloads for strict Scoped Storage compatibility
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val dlDir = Environment.DIRECTORY_DOWNLOADS
-                    val dlRel = if (cleanSub.isEmpty()) "$dlDir/" else "$dlDir/$cleanSub/"
+                    val dlRel = if (safeSub.isEmpty()) "$dlDir/" else "$dlDir/$safeSub/"
                     val dlValues = createValues(displayName, dlDir, dlRel)
                     val primaryDl = runCatching {
                         resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), dlValues)
@@ -103,7 +113,9 @@ class MediaStoreWriter @Inject constructor(
                     runCatching {
                         resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), dlUniqueValues)
                             ?: resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, dlUniqueValues)
-                    }.getOrNull()
+                    }.getOrNull()?.also {
+                        actualDisplayName = uniqueName
+                    }
                 } else null
             }
             ?: throw MediaException(AppError.GENERIC, "MediaStore insert failed")
@@ -120,12 +132,12 @@ class MediaStoreWriter @Inject constructor(
                     resolver.update(itemUri, done, null, null)
                 }
             } else {
-                val parentDir = if (cleanSub.isEmpty()) {
+                val parentDir = if (safeSub.isEmpty()) {
                     Environment.getExternalStoragePublicDirectory(directory)
                 } else {
-                    File(Environment.getExternalStoragePublicDirectory(directory), cleanSub)
+                    File(Environment.getExternalStoragePublicDirectory(directory), safeSub)
                 }
-                writtenFile = File(parentDir, displayName)
+                writtenFile = File(parentDir, actualDisplayName)
             }
         } catch (e: Exception) {
             runCatching { resolver.delete(itemUri, null, null) }
@@ -167,10 +179,16 @@ class MediaStoreWriter @Inject constructor(
         return null
     }
 
-    private fun baseDirectory(type: MediaType): String = when (type) {
-        MediaType.VIDEO -> Environment.DIRECTORY_MOVIES
-        MediaType.AUDIO -> Environment.DIRECTORY_MUSIC
-        MediaType.IMAGE -> Environment.DIRECTORY_PICTURES
+    internal fun resolveRelativePath(type: MediaType, subfolder: String): String {
+        val directory = baseDirectory(type)
+        val safeSub = com.melmeligy.mediadownloader.domain.model.AppSettings.sanitizeSubfolderOrEmpty(subfolder)
+        return if (safeSub.isEmpty()) "$directory/" else "$directory/$safeSub/"
+    }
+
+    internal fun baseDirectory(type: MediaType): String = when (type) {
+        MediaType.VIDEO -> Environment.DIRECTORY_MOVIES ?: "Movies"
+        MediaType.AUDIO -> Environment.DIRECTORY_MUSIC ?: "Music"
+        MediaType.IMAGE -> Environment.DIRECTORY_PICTURES ?: "Pictures"
     }
 
     private companion object {

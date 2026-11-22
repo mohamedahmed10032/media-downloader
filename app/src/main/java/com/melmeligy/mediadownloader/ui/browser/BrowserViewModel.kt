@@ -3,8 +3,10 @@ package com.melmeligy.mediadownloader.ui.browser
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.melmeligy.mediadownloader.core.Constants
+import com.melmeligy.mediadownloader.domain.model.AppSettings
 import com.melmeligy.mediadownloader.domain.model.Bookmark
 import com.melmeligy.mediadownloader.domain.repository.BookmarkRepository
+import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
 import com.melmeligy.mediadownloader.intercept.BlobImporter
 import com.melmeligy.mediadownloader.intercept.MediaInterceptionEngine
 import com.melmeligy.mediadownloader.intercept.MediaStreamPayload
@@ -27,10 +29,14 @@ class BrowserViewModel @Inject constructor(
     private val interceptionEngine: MediaInterceptionEngine,
     private val blobImporter: BlobImporter,
     private val mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository,
-    private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager
+    private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager,
+    private val settingsRepository: SettingsRepository
 ) : ViewModel() {
 
     private var nextId = 2L
+
+    val settings: StateFlow<AppSettings> = settingsRepository.settings
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     /** Everything the interception layer found on the page currently being viewed. */
     val detections: StateFlow<List<MediaStreamPayload>> = interceptionEngine.detections
@@ -46,6 +52,12 @@ class BrowserViewModel @Inject constructor(
 
     private var resolveJob: kotlinx.coroutines.Job? = null
 
+    init {
+        viewModelScope.launch {
+            runCatching { settingsRepository.current() }
+        }
+    }
+
     /** Shared engine instance handed to the WebView client and the JS bridge. */
     fun engine(): MediaInterceptionEngine = interceptionEngine
 
@@ -58,6 +70,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         resolveJob = viewModelScope.launch {
             _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
+            runCatching { settingsRepository.current() }
             _formatState.value = try {
                 com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: kotlinx.coroutines.CancellationException) {

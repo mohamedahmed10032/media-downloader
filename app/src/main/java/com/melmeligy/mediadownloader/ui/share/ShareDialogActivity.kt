@@ -135,6 +135,7 @@ private fun ShareOverlaySheet(
     viewModel: QualityViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
 
@@ -168,6 +169,8 @@ private fun ShareOverlaySheet(
                 state = state,
                 url = url,
                 useShimmerLoading = true,
+                defaultVideoQuality = settings.defaultVideoQuality,
+                defaultAudioBitrate = settings.defaultAudioBitrate,
                 onRetry = { viewModel.resolve(url) },
                 onOpenInBrowser = onOpenInBrowser,
                 onDownload = viewModel::download,

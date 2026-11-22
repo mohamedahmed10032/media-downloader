@@ -90,6 +90,7 @@ fun SettingsScreen(
             title = stringResource(R.string.settings_retry_count),
             value = settings.retryCount,
             range = AppSettings.MIN_RETRIES..AppSettings.MAX_RETRIES,
+            valueLabel = { count -> if (count == 0) "Off (0)" else count.toString() },
             onChange = { viewModel.setRetryCount(it) }
         )
         ClickableSetting(
@@ -142,26 +143,54 @@ fun SettingsScreen(
     }
 
     if (editingFolder) {
-        var folder by remember { mutableStateOf(settings.saveSubfolder) }
+        var folder by remember(settings.saveSubfolder) { mutableStateOf(settings.saveSubfolder) }
+        val previewSubfolder = AppSettings.sanitizeSubfolder(folder)
         AlertDialog(
             onDismissRequest = { editingFolder = false },
             title = { Text(stringResource(R.string.settings_save_location)) },
             text = {
-                OutlinedTextField(
-                    value = folder,
-                    onValueChange = { folder = it },
-                    singleLine = true,
-                    label = { Text("Subfolder name") }
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = folder,
+                        onValueChange = { folder = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Subfolder name") },
+                        placeholder = { Text(AppSettings.DEFAULT_SUBFOLDER) }
+                    )
+                    Text(
+                        text = "Videos: Movies/$previewSubfolder/\n" +
+                            "Audio: Music/$previewSubfolder/\n" +
+                            "Images: Pictures/$previewSubfolder/",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (previewSubfolder != AppSettings.DEFAULT_SUBFOLDER) {
+                        TextButton(
+                            onClick = { folder = AppSettings.DEFAULT_SUBFOLDER },
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Text("Reset to ${AppSettings.DEFAULT_SUBFOLDER}")
+                        }
+                    }
+                }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.setSaveSubfolder(folder)
+                    val sanitized = AppSettings.sanitizeSubfolder(folder)
+                    viewModel.setSaveSubfolder(sanitized)
                     editingFolder = false
+                    Toast.makeText(
+                        context,
+                        "Save location updated to $sanitized",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }) { Text("Save") }
             },
             dismissButton = {
-                TextButton(onClick = { editingFolder = false }) { Text(stringResource(R.string.perm_not_now)) }
+                TextButton(onClick = { editingFolder = false }) {
+                    Text(stringResource(R.string.downloads_cancel))
+                }
             }
         )
     }
@@ -214,18 +243,49 @@ private fun <T> DropdownSetting(
 }
 
 @Composable
-private fun SliderSetting(title: String, value: Int, range: IntRange, onChange: (Int) -> Unit) {
+private fun SliderSetting(
+    title: String,
+    value: Int,
+    range: IntRange,
+    valueLabel: (Int) -> String = { it.toString() },
+    onChange: (Int) -> Unit
+) {
+    val clamped = value.coerceIn(range.first, range.last)
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(title, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-            Text(value.toString(), style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = valueLabel(clamped),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
         }
         Slider(
-            value = value.toFloat(),
-            onValueChange = { onChange(it.roundToInt()) },
+            value = clamped.toFloat(),
+            onValueChange = { raw ->
+                val snapped = raw.roundToInt().coerceIn(range.first, range.last)
+                if (snapped != clamped) {
+                    onChange(snapped)
+                }
+            },
             valueRange = range.first.toFloat()..range.last.toFloat(),
             steps = (range.last - range.first - 1).coerceAtLeast(0)
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = range.first.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = range.last.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 

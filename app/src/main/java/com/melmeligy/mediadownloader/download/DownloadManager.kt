@@ -18,6 +18,7 @@ import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.core.util.JsonUtils
 import com.melmeligy.mediadownloader.core.util.UrlUtils
+import com.melmeligy.mediadownloader.domain.model.AppSettings
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
 import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
@@ -28,15 +29,22 @@ import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -62,7 +70,9 @@ class DownloadManager @Inject constructor(
 ) {
 
     private val runningJobs = ConcurrentHashMap<Long, Job>()
+    private val retryingJobs = ConcurrentHashMap<Long, Job>()
     private val intents = ConcurrentHashMap<Long, ControlIntent>()
+    private val queueSignal = Channel<Unit>(Channel.CONFLATED)
 
     // ---- Public API used by the UI ----
 
@@ -73,8 +83,10 @@ class DownloadManager @Inject constructor(
             else -> stream.container
         }
         val headers = LinkedHashMap<String, String>(stream.headers).apply {
-            if (stream.type == MediaType.AUDIO && stream.bitrateKbps != null && stream.bitrateKbps > 0) {
-                put("X-Internal-Target-Bitrate-Kbps", stream.bitrateKbps.toString())
+            if (stream.type == MediaType.AUDIO) {
+                val effectiveBitrate = stream.bitrateKbps?.takeIf { it > 0 }
+                    ?: settingsRepository.current().defaultAudioBitrate.kbps
+                put("X-Internal-Target-Bitrate-Kbps", effectiveBitrate.toString())
             }
         }
         val item = DownloadItem(
@@ -91,6 +103,7 @@ class DownloadManager @Inject constructor(
             isHls = stream.isHls
         )
         val id = repository.enqueue(item)
+        queueSignal.trySend(Unit)
         schedule()
         return id
     }
@@ -133,6 +146,7 @@ class DownloadManager @Inject constructor(
         }
 
         if (ids.isNotEmpty()) {
+            queueSignal.trySend(Unit)
             schedule()
         }
         return ids
@@ -140,9 +154,9 @@ class DownloadManager @Inject constructor(
 
     suspend fun pause(id: Long) {
         intents[id] = ControlIntent.PAUSE
-        val job = runningJobs[id]
-        if (job != null) {
-            job.cancel()
+        val activeJob = runningJobs[id] ?: retryingJobs[id]
+        if (activeJob != null) {
+            activeJob.cancel()
         } else {
             repository.updateStatus(id, DownloadStatus.PAUSED)
             intents.remove(id)
@@ -153,6 +167,7 @@ class DownloadManager @Inject constructor(
         intents.remove(id)
         val item = repository.getById(id) ?: return
         repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null))
+        queueSignal.trySend(Unit)
         schedule()
     }
 
@@ -160,14 +175,15 @@ class DownloadManager @Inject constructor(
         intents.remove(id)
         val item = repository.getById(id) ?: return
         repository.update(item.copy(status = DownloadStatus.QUEUED, errorType = null, retryCount = 0))
+        queueSignal.trySend(Unit)
         schedule()
     }
 
     suspend fun cancel(id: Long) {
         intents[id] = ControlIntent.CANCEL
-        val job = runningJobs[id]
-        if (job != null) {
-            job.cancel()
+        val activeJob = runningJobs[id] ?: retryingJobs[id]
+        if (activeJob != null) {
+            activeJob.cancel()
         } else {
             cleanupStaging(id)
             repository.delete(id)
@@ -198,31 +214,60 @@ class DownloadManager @Inject constructor(
         repository.resetInterrupted()
         runCatching { updateForeground(currentForegroundInfo()) }
 
-        while (isActive) {
-            val settings = settingsRepository.current()
-            while (runningJobs.size < settings.maxConcurrentDownloads) {
-                val next = repository.claimNextQueued(1).firstOrNull() ?: break
-                val job = launch { runOne(next) }
-                runningJobs[next.id] = job
-                job.invokeOnCompletion { runningJobs.remove(next.id) }
+        // Wake the scheduler immediately whenever the user changes Max concurrent downloads in Settings.
+        val settingsObserver = launch {
+            runCatching {
+                settingsRepository.settings
+                    .map { it.maxConcurrentDownloads }
+                    .distinctUntilChanged()
+                    .drop(1)
+                    .collect { queueSignal.trySend(Unit) }
             }
-            if (runningJobs.isEmpty()) {
-                // Drain window check: re-check queue once right before exiting so newly enqueued items aren't missed
-                val trailing = repository.claimNextQueued(1).firstOrNull()
-                if (trailing != null) {
-                    val job = launch { runOne(trailing) }
-                    runningJobs[trailing.id] = job
-                    job.invokeOnCompletion { runningJobs.remove(trailing.id) }
-                } else {
-                    break
+        }
+
+        fun launchQueuedItem(item: DownloadItem) {
+            val job = launch(start = CoroutineStart.LAZY) {
+                runOne(item, this@coroutineScope)
+            }
+            runningJobs[item.id] = job
+            job.invokeOnCompletion {
+                runningJobs.remove(item.id, job)
+                queueSignal.trySend(Unit)
+            }
+            job.start()
+        }
+
+        try {
+            while (isActive) {
+                val maxConcurrent = settingsRepository.current()
+                    .maxConcurrentDownloads
+                    .coerceIn(AppSettings.MIN_CONCURRENT, AppSettings.MAX_CONCURRENT)
+
+                while (runningJobs.size < maxConcurrent) {
+                    val next = repository.claimNextQueued(1).firstOrNull() ?: break
+                    launchQueuedItem(next)
+                }
+
+                if (runningJobs.isEmpty() && retryingJobs.isEmpty()) {
+                    // Drain window check: re-check queue once right before exiting so newly enqueued items aren't missed
+                    val trailing = repository.claimNextQueued(1).firstOrNull()
+                    if (trailing != null) {
+                        launchQueuedItem(trailing)
+                    } else {
+                        break
+                    }
+                }
+                runCatching { updateForeground(currentForegroundInfo()) }
+                withTimeoutOrNull(FOREGROUND_REFRESH_MS) {
+                    queueSignal.receive()
                 }
             }
-            runCatching { updateForeground(currentForegroundInfo()) }
-            delay(FOREGROUND_REFRESH_MS)
+        } finally {
+            settingsObserver.cancel()
         }
     }
 
-    private suspend fun runOne(item: DownloadItem) {
+    private suspend fun runOne(item: DownloadItem, queueScope: CoroutineScope) {
         val staging = stagingFile(item)
         var lastProgressWriteMs = 0L
         var highWaterDownloaded = 0L
@@ -257,10 +302,10 @@ class DownloadManager @Inject constructor(
             val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
             val isAudioExtraction = headers["X-Internal-Extract-Audio"] == "true" ||
                 (item.type == MediaType.AUDIO && (item.container.equals("mp3", true) || item.container.equals("m4a", true)))
-            val targetBitrateKbps = headers["X-Internal-Target-Bitrate-Kbps"]?.toIntOrNull()
+            val targetBitrateKbps = headers["X-Internal-Target-Bitrate-Kbps"]?.toIntOrNull()?.takeIf { it > 0 }
                 ?: Regex("""\((\d{2,3})K\)""", RegexOption.IGNORE_CASE)
                     .find(item.qualityLabel)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: 160
+                ?: settingsRepository.current().defaultAudioBitrate.kbps
 
             if (item.isHls) {
                 val stagingTs = File(stagingDir(), "dl_${item.id}_raw.ts.part")
@@ -504,7 +549,13 @@ class DownloadManager @Inject constructor(
             withContext(NonCancellable) { handleCancellation(item, staging) }
             throw ce
         } catch (e: Exception) {
-            withContext(NonCancellable) { handleFailure(item, e) }
+            // If the user cancelled or paused (which can surface as IOException on closed sockets),
+            // never treat it as a failure or auto-retry.
+            if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
+                withContext(NonCancellable) { handleCancellation(item, staging) }
+                return
+            }
+            handleFailure(item, staging, e, queueScope)
         }
     }
 
@@ -520,19 +571,54 @@ class DownloadManager @Inject constructor(
         }
     }
 
-    private suspend fun handleFailure(item: DownloadItem, e: Exception) {
+    private suspend fun handleFailure(
+        item: DownloadItem,
+        staging: File,
+        e: Exception,
+        queueScope: CoroutineScope
+    ) {
         val error = (e as? MediaException)?.error ?: AppError.GENERIC
         val settings = settingsRepository.current()
+        val maxRetries = settings.retryCount.coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES)
         val transient = error == AppError.NO_INTERNET || error == AppError.GENERIC
-        if (transient && item.retryCount < settings.retryCount) {
-            repository.incrementRetry(item.id)
-            val backoffMs = min(30_000.0, 2.0.pow(item.retryCount) * 1000).toLong()
-            delay(backoffMs)
-            repository.updateStatus(item.id, DownloadStatus.QUEUED)
+        if (transient && maxRetries > 0 && item.retryCount < maxRetries && intents[item.id] == null) {
+            val backoffMs = computeRetryBackoffMs(item.retryCount)
+            withContext(NonCancellable) {
+                repository.incrementRetry(item.id)
+            }
+            // Schedule retry backoff in retryingJobs so this item releases its concurrency slot
+            // immediately while staying cleanly cancellable if the user cancels/pauses during backoff.
+            val retryJob = queueScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    delay(backoffMs)
+                    if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
+                        withContext(NonCancellable) { handleCancellation(item, staging) }
+                        return@launch
+                    }
+                    if (repository.getById(item.id) == null) return@launch
+                    repository.updateStatus(item.id, DownloadStatus.QUEUED)
+                    queueSignal.trySend(Unit)
+                } catch (ce: CancellationException) {
+                    withContext(NonCancellable) { handleCancellation(item, staging) }
+                    throw ce
+                }
+            }
+            retryingJobs[item.id] = retryJob
+            retryJob.invokeOnCompletion {
+                retryingJobs.remove(item.id, retryJob)
+                queueSignal.trySend(Unit)
+            }
+            retryJob.start()
         } else {
-            cleanupStaging(item.id)
-            repository.setError(item.id, error)
-            notifier.notifyFailed(item.id, item.title, friendly(error))
+            withContext(NonCancellable) {
+                if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
+                    handleCancellation(item, staging)
+                } else {
+                    cleanupStaging(item.id)
+                    repository.setError(item.id, error)
+                    notifier.notifyFailed(item.id, item.title, friendly(error))
+                }
+            }
         }
     }
 
@@ -619,6 +705,10 @@ class DownloadManager @Inject constructor(
     companion object {
         private const val FOREGROUND_REFRESH_MS = 1000L
         private const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
+
+        /** Exponential retry backoff capped at 30 seconds (1s, 2s, 4s, 8s, 16s, 30s). */
+        internal fun computeRetryBackoffMs(retryAttempt: Int): Long =
+            min(30_000.0, 2.0.pow(retryAttempt.coerceAtLeast(0)) * 1000.0).toLong()
 
         /**
          * Builds a deterministic, filesystem-safe base title (without extension) for a gallery slide.

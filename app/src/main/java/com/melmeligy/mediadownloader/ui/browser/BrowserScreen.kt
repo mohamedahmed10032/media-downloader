@@ -105,6 +105,7 @@ fun BrowserScreen(
     val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
     val detections by viewModel.detections.collectAsStateWithLifecycle()
     val formatState by viewModel.formatState.collectAsStateWithLifecycle()
+    val appSettings by viewModel.settings.collectAsStateWithLifecycle()
     val engine = remember { viewModel.engine() }
 
     var addressText by remember { mutableStateOf(initialUrl ?: Constants.DEFAULT_HOME_URL) }
@@ -440,6 +441,8 @@ fun BrowserScreen(
                     state = formatState,
                     url = currentUrl,
                     useShimmerLoading = true,
+                    defaultVideoQuality = appSettings.defaultVideoQuality,
+                    defaultAudioBitrate = appSettings.defaultAudioBitrate,
                     onRetry = { openChooseFormatSheet() },
                     onOpenInBrowser = null,
                     onDownload = { stream ->

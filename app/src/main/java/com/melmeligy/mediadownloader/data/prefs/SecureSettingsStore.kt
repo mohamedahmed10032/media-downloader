@@ -41,6 +41,7 @@ class SecureSettingsStore @Inject constructor(
 ) : SettingsRepository {
 
     private val prefsMutex = Mutex()
+    private val stateMutex = Mutex()
     @Volatile
     private var cachedPrefs: SharedPreferences? = null
     @Volatile
@@ -77,7 +78,7 @@ class SecureSettingsStore @Inject constructor(
     }
 
     override suspend fun setSaveSubfolder(name: String) = write {
-        val cleaned = name.trim().ifBlank { Constants.SHARED_SUBFOLDER }
+        val cleaned = AppSettings.sanitizeSubfolder(name)
         putString(KEY_SAVE_SUBFOLDER, cleaned)
     }
 
@@ -90,24 +91,26 @@ class SecureSettingsStore @Inject constructor(
         }
     }
 
-    private suspend fun ensureLoaded(): AppSettings = withContext(dispatchers.io) {
-        val p = getPrefs()
-        val loaded = readAll(p)
-        if (!initialized) {
-            state.value = loaded
-            initialized = true
+    private suspend fun ensureLoaded(): AppSettings = stateMutex.withLock {
+        if (initialized) return@withLock state.value
+        val loaded = withContext(dispatchers.io) {
+            readAll(getPrefs())
         }
-        state.value
+        state.value = loaded
+        initialized = true
+        loaded
     }
 
     private suspend fun write(block: SharedPreferences.Editor.() -> Unit) {
-        val updated = withContext(dispatchers.io) {
-            val p = getPrefs()
-            p.edit().apply(block).apply()
+        stateMutex.withLock {
+            val updated = withContext(dispatchers.io) {
+                val p = getPrefs()
+                p.edit().apply(block).commit()
+                readAll(p)
+            }
+            state.value = updated
             initialized = true
-            readAll(p)
         }
-        state.value = updated
     }
 
     private fun readAll(prefs: SharedPreferences): AppSettings = AppSettings(
@@ -116,11 +119,14 @@ class SecureSettingsStore @Inject constructor(
         defaultVideoQuality = prefs.getString(KEY_VIDEO_QUALITY, null)
             ?.let { runCatching { VideoQuality.valueOf(it) }.getOrNull() } ?: VideoQuality.P720,
         defaultAudioBitrate = prefs.getString(KEY_AUDIO_BITRATE, null)
-            ?.let { runCatching { AudioBitrate.valueOf(it) }.getOrNull() } ?: AudioBitrate.KBPS192,
-        maxConcurrentDownloads = prefs.getInt(KEY_MAX_CONCURRENT, 3),
-        retryCount = prefs.getInt(KEY_RETRY_COUNT, 3),
-        saveSubfolder = prefs.getString(KEY_SAVE_SUBFOLDER, Constants.SHARED_SUBFOLDER)
-            ?: Constants.SHARED_SUBFOLDER
+            ?.let { runCatching { AudioBitrate.valueOf(it) }.getOrNull() } ?: AudioBitrate.KBPS160,
+        maxConcurrentDownloads = prefs.getInt(KEY_MAX_CONCURRENT, 3)
+            .coerceIn(AppSettings.MIN_CONCURRENT, AppSettings.MAX_CONCURRENT),
+        retryCount = prefs.getInt(KEY_RETRY_COUNT, 3)
+            .coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES),
+        saveSubfolder = AppSettings.sanitizeSubfolder(
+            prefs.getString(KEY_SAVE_SUBFOLDER, Constants.SHARED_SUBFOLDER) ?: Constants.SHARED_SUBFOLDER
+        )
     )
 
     private fun createPrefs(): SharedPreferences = try {

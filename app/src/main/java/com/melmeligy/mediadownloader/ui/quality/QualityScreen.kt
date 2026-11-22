@@ -66,10 +66,12 @@ import coil.compose.AsyncImage
 import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.Resource
 import com.melmeligy.mediadownloader.core.util.FormatUtils
+import com.melmeligy.mediadownloader.domain.model.AudioBitrate
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
+import com.melmeligy.mediadownloader.domain.model.VideoQuality
 import com.melmeligy.mediadownloader.ui.common.ErrorState
 import com.melmeligy.mediadownloader.ui.common.LoadingState
 import com.melmeligy.mediadownloader.ui.common.asMessage
@@ -93,6 +95,7 @@ fun QualityScreen(
     viewModel: QualityViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
 
     LaunchedEffect(url) {
         if (url.isNotBlank()) viewModel.resolve(url)
@@ -118,6 +121,8 @@ fun QualityScreen(
             state = state,
             url = url,
             contentPadding = padding,
+            defaultVideoQuality = settings.defaultVideoQuality,
+            defaultAudioBitrate = settings.defaultAudioBitrate,
             onRetry = { viewModel.resolve(url) },
             onOpenInBrowser = onOpenInBrowser,
             onDownload = viewModel::download,
@@ -141,6 +146,8 @@ fun ChooseFormatStateContent(
     url: String,
     contentPadding: PaddingValues = PaddingValues(0.dp),
     useShimmerLoading: Boolean = false,
+    defaultVideoQuality: VideoQuality = VideoQuality.P720,
+    defaultAudioBitrate: AudioBitrate = AudioBitrate.KBPS160,
     onRetry: () -> Unit,
     onOpenInBrowser: ((String) -> Unit)? = null,
     onDownload: (MediaStream) -> Unit,
@@ -210,6 +217,8 @@ fun ChooseFormatStateContent(
                 SnaptubeFormatSheetContent(
                     resolved = resolved,
                     contentPadding = contentPadding,
+                    defaultVideoQuality = defaultVideoQuality,
+                    defaultAudioBitrate = defaultAudioBitrate,
                     onDownload = onDownload
                 )
             }
@@ -221,9 +230,17 @@ fun ChooseFormatStateContent(
 private fun SnaptubeFormatSheetContent(
     resolved: ResolvedMedia,
     contentPadding: PaddingValues,
+    defaultVideoQuality: VideoQuality,
+    defaultAudioBitrate: AudioBitrate,
     onDownload: (MediaStream) -> Unit
 ) {
-    val prepared = remember(resolved) { prepareSnaptubeStreams(resolved) }
+    val prepared = remember(resolved, defaultVideoQuality, defaultAudioBitrate) {
+        prepareSnaptubeStreams(
+            resolved = resolved,
+            preferredVideoQuality = defaultVideoQuality,
+            preferredAudioBitrate = defaultAudioBitrate
+        )
+    }
     val imageStreams = prepared.images
     val musicStreams = prepared.music
     val videoStreams = prepared.video
@@ -232,8 +249,36 @@ private fun SnaptubeFormatSheetContent(
     val quickVideo = prepared.quickVideo
     val allStreams = remember(imageStreams, musicStreams, videoStreams) { imageStreams + musicStreams + videoStreams }
 
-    var selectedStream by remember(prepared) {
-        mutableStateOf(selectDefaultStream(prepared))
+    var userManuallySelected by remember(resolved) { mutableStateOf(false) }
+    var selectedStream by remember(resolved) {
+        mutableStateOf(
+            selectDefaultStream(
+                prepared = prepared,
+                preferredVideoQuality = defaultVideoQuality,
+                preferredAudioBitrate = defaultAudioBitrate
+            )
+        )
+    }
+
+    // Reactively re-apply user's default quality/bitrate if preferences finish loading or change,
+    // without overriding an explicit manual tap by the user.
+    LaunchedEffect(prepared, defaultVideoQuality, defaultAudioBitrate) {
+        val currentId = selectedStream?.id
+        if (!userManuallySelected || currentId == null) {
+            selectedStream = selectDefaultStream(
+                prepared = prepared,
+                preferredVideoQuality = defaultVideoQuality,
+                preferredAudioBitrate = defaultAudioBitrate
+            )
+        } else {
+            // Rebind to updated MediaStream instance if ID still exists (e.g. bitrate/size updated)
+            val refreshed = allStreams.firstOrNull { it.id == currentId }
+            selectedStream = refreshed ?: selectDefaultStream(
+                prepared = prepared,
+                preferredVideoQuality = defaultVideoQuality,
+                preferredAudioBitrate = defaultAudioBitrate
+            )
+        }
     }
 
     var showMoreFormats by rememberSaveable { mutableStateOf(false) }
@@ -260,7 +305,10 @@ private fun SnaptubeFormatSheetContent(
                     quickMusic = quickMusic,
                     quickVideo = quickVideo,
                     selectedId = selectedStream?.id,
-                    onSelect = { selectedStream = it },
+                    onSelect = {
+                        userManuallySelected = true
+                        selectedStream = it
+                    },
                     onMoreFormatsClick = { showMoreFormats = true }
                 )
             } else {
@@ -269,7 +317,10 @@ private fun SnaptubeFormatSheetContent(
                     musicStreams = musicStreams,
                     videoStreams = videoStreams,
                     selectedId = selectedStream?.id,
-                    onSelect = { selectedStream = it },
+                    onSelect = {
+                        userManuallySelected = true
+                        selectedStream = it
+                    },
                     onBackClick = { showMoreFormats = false }
                 )
             }
@@ -738,7 +789,11 @@ internal data class PreparedSnaptubeStreams(
     val quickVideo: List<MediaStream>
 )
 
-internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeStreams {
+internal fun prepareSnaptubeStreams(
+    resolved: ResolvedMedia,
+    preferredVideoQuality: VideoQuality = VideoQuality.P720,
+    preferredAudioBitrate: AudioBitrate = AudioBitrate.KBPS160
+): PreparedSnaptubeStreams {
     val rawImages = resolved.streams
         .filter { it.type == MediaType.IMAGE }
         .distinctBy { it.url }
@@ -796,6 +851,8 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             } else a
         }
 
+    val targetMp3Kbps = preferredAudioBitrate.kbps
+
     // If a non-YouTube extractor only returned video streams, synthesize Fast (M4A) and Classic MP3 options
     // strictly from valid audio-bearing sources (never null/zero-size broken progressive streams or mute adaptive video).
     if (rawMusic.isEmpty() && rawVideos.isNotEmpty()) {
@@ -841,9 +898,9 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             } else null
 
             val estMp3Size = if (durationSeconds != null && durationSeconds > 0L) {
-                (160_000L * durationSeconds) / 8L
+                (targetMp3Kbps.toLong() * 1000L * durationSeconds) / 8L
             } else if (vSize > 500_000L) {
-                (vSize * 18L) / 100L
+                (((vSize * 18L) / 100L) * targetMp3Kbps.toLong()) / 160L
             } else null
 
             val baseHeaders = sourceVideo.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) } + buildMap {
@@ -874,11 +931,11 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
                     type = MediaType.AUDIO,
                     container = "mp3",
                     label = "Classic MP3",
-                    bitrateKbps = 160,
+                    bitrateKbps = targetMp3Kbps,
                     sizeBytes = estMp3Size,
                     isHls = sourceVideo.isHls,
                     headers = baseHeaders + mapOf(
-                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Subtitle" to "MP3 (${targetMp3Kbps}K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )
                 )
@@ -893,7 +950,7 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
             val audioBytes = companionCarrier.headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
             val estM4aSize = audioBytes ?: FormatUtils.estimateTranscodedAudioBytes(128, durationSeconds)
             val estMp3Size = FormatUtils.estimateTranscodedAudioBytes(
-                targetBitrateKbps = 160,
+                targetBitrateKbps = targetMp3Kbps,
                 durationSeconds = durationSeconds,
                 sourceSizeBytes = audioBytes,
                 sourceBitrateKbps = 128
@@ -930,39 +987,29 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
                     type = MediaType.AUDIO,
                     container = "mp3",
                     label = "Classic MP3",
-                    bitrateKbps = 160,
+                    bitrateKbps = targetMp3Kbps,
                     sizeBytes = estMp3Size,
                     isHls = audioIsHls,
                     headers = cleanBase + mapOf(
-                        "X-Internal-Subtitle" to "MP3 (160K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                        "X-Internal-Subtitle" to "MP3 (${targetMp3Kbps}K), support Bluetooth speaker, mobile phone, car, watch etc.",
                         "X-Internal-Quick" to "true"
                     )
                 )
             )
         }
+    } else {
+        // When a non-YouTube extractor emitted a single transcoded Classic MP3 option alongside Fast M4A
+        // (not a native original MP3 file), align its target encoding bitrate and estimated size with Settings.
+        rawMusic = adaptSingleTranscodedMp3Option(rawMusic, preferredAudioBitrate)
     }
 
-    // Consistency guard: if an extractor emitted both M4A (128K) and transcoded MP3 (160K/320K/70K)
+    // Consistency guard: if an extractor emitted both M4A (128K) and transcoded MP3 (160K/192K/320K/70K)
     // backed by the exact same URL and raw source byte size, compute the target-bitrate MP3 size so
     // distinct bitrate options never show contradictory identical sizes.
     rawMusic = normalizeAudioOptionSizes(rawMusic)
 
-    val quickMusic = rawMusic.filter { it.headers["X-Internal-Quick"] == "true" }
-        .ifEmpty { rawMusic.take(2) }
-
-    val quickVideo = rawVideos.filter { it.headers["X-Internal-Quick"] == "true" }
-        .ifEmpty {
-            val picked = mutableListOf<MediaStream>()
-            rawVideos.firstOrNull { it.height == 360 }?.let { picked += it }
-            rawVideos.firstOrNull { it.height == 720 }?.let { picked += it }
-            if (picked.size < 2) {
-                for (v in rawVideos) {
-                    if (v !in picked) picked += v
-                    if (picked.size >= 2) break
-                }
-            }
-            picked
-        }
+    val quickMusic = buildQuickMusic(rawMusic, preferredAudioBitrate)
+    val quickVideo = buildQuickVideo(rawVideos, preferredVideoQuality)
 
     return PreparedSnaptubeStreams(
         images = rawImages,
@@ -976,24 +1023,246 @@ internal fun prepareSnaptubeStreams(resolved: ResolvedMedia): PreparedSnaptubeSt
 
 /**
  * Selects the default stream for the format sheet:
- * - Always defaults to VIDEO on video pages (even when explicit/synthesized audio exists).
- * - Selects IMAGE on pure image pages and AUDIO on pure audio pages.
+ * - Always defaults to VIDEO on video pages (even when explicit/synthesized audio exists),
+ *   respecting [preferredVideoQuality] (exact match -> closest lower -> nearest available).
+ * - Selects IMAGE on pure image pages.
+ * - Selects AUDIO on pure audio pages, respecting [preferredAudioBitrate] (exact match -> closest lower -> nearest available).
  */
-internal fun selectDefaultStream(prepared: PreparedSnaptubeStreams): MediaStream? {
-    val videoDefault = prepared.video.firstOrNull { it.headers["X-Internal-Default"] == "true" }
-        ?: prepared.quickVideo.lastOrNull()
-        ?: prepared.video.lastOrNull()
-    if (videoDefault != null) return videoDefault
+internal fun selectDefaultStream(
+    prepared: PreparedSnaptubeStreams,
+    preferredVideoQuality: VideoQuality = VideoQuality.P720,
+    preferredAudioBitrate: AudioBitrate = AudioBitrate.KBPS160
+): MediaStream? {
+    if (prepared.video.isNotEmpty()) {
+        return selectPreferredVideoStream(prepared.video, preferredVideoQuality)
+            ?: prepared.quickVideo.lastOrNull()
+            ?: prepared.video.lastOrNull()
+    }
 
     val imageDefault = prepared.quickImages.firstOrNull() ?: prepared.images.firstOrNull()
     if (imageDefault != null) return imageDefault
 
-    return prepared.music.firstOrNull { it.headers["X-Internal-Default"] == "true" }
-        ?: prepared.quickMusic.lastOrNull()
-        ?: prepared.music.lastOrNull()
+    if (prepared.music.isNotEmpty()) {
+        return selectPreferredAudioStream(prepared.music, preferredAudioBitrate)
+            ?: prepared.quickMusic.lastOrNull()
+            ?: prepared.music.lastOrNull()
+    }
+
+    return null
 }
 
+private val videoLabelHeightRegex = Regex("""\b(\d{3,4})p\b""", RegexOption.IGNORE_CASE)
 private val audioSubtitleBitrateRegex = Regex("""\((\d{2,3})K\)""", RegexOption.IGNORE_CASE)
+
+internal fun effectiveVideoHeight(stream: MediaStream): Int? {
+    stream.height?.takeIf { it > 0 }?.let { return it }
+    val label = stream.label
+    videoLabelHeightRegex.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    return when {
+        label.contains("4K", ignoreCase = true) -> 2160
+        label.contains("2K", ignoreCase = true) -> 1440
+        else -> null
+    }
+}
+
+internal fun effectiveAudioBitrateKbps(stream: MediaStream): Int? {
+    stream.bitrateKbps?.takeIf { it > 0 }?.let { return it }
+    audioSubtitleBitrateRegex.find(stream.label)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    return audioSubtitleBitrateRegex.find(stream.headers["X-Internal-Subtitle"].orEmpty())
+        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+}
+
+/**
+ * Deterministically selects the best video stream for [preferred]:
+ * - [VideoQuality.HIGHEST]: picks the highest available resolution.
+ * - Fixed resolution (e.g. 480p, 720p, 1080p):
+ *   1. Exact match if available.
+ *   2. Closest lower resolution (< target) if available.
+ *   3. Nearest available resolution (smallest > target) when all streams exceed the target.
+ */
+internal fun selectPreferredVideoStream(
+    videos: List<MediaStream>,
+    preferred: VideoQuality
+): MediaStream? {
+    if (videos.isEmpty()) return null
+    val withHeight = videos.mapNotNull { stream -> effectiveVideoHeight(stream)?.let { stream to it } }
+    if (withHeight.isEmpty()) {
+        return videos.firstOrNull { it.headers["X-Internal-Default"] == "true" } ?: videos.lastOrNull()
+    }
+
+    if (preferred == VideoQuality.HIGHEST) {
+        return withHeight.maxWithOrNull(
+            compareBy<Pair<MediaStream, Int>> { it.second }
+                .thenBy { it.first.sizeBytes ?: -1L }
+        )?.first
+    }
+
+    val target = preferred.maxHeight
+
+    // 1. Exact resolution match
+    withHeight
+        .filter { it.second == target }
+        .maxByOrNull { it.first.sizeBytes ?: -1L }
+        ?.let { return it.first }
+
+    // 2. Closest lower resolution
+    withHeight
+        .filter { it.second < target }
+        .maxWithOrNull(
+            compareBy<Pair<MediaStream, Int>> { it.second }
+                .thenBy { it.first.sizeBytes ?: -1L }
+        )
+        ?.let { return it.first }
+
+    // 3. Nearest available when all available resolutions are higher than preferred
+    return withHeight
+        .minWithOrNull(
+            compareBy<Pair<MediaStream, Int>> { it.second }
+                .thenByDescending { it.first.sizeBytes ?: -1L }
+        )
+        ?.first
+}
+
+/**
+ * Deterministically selects the best audio stream for [preferred]:
+ * 1. Exact bitrate match (preferring MP3 over M4A on an exact tie).
+ * 2. Closest lower bitrate (< target).
+ * 3. Nearest available bitrate (smallest > target) when all streams exceed the target.
+ */
+internal fun selectPreferredAudioStream(
+    audios: List<MediaStream>,
+    preferred: AudioBitrate
+): MediaStream? {
+    if (audios.isEmpty()) return null
+    val withBitrate = audios.mapNotNull { stream -> effectiveAudioBitrateKbps(stream)?.let { stream to it } }
+    if (withBitrate.isEmpty()) return audios.lastOrNull()
+
+    val target = preferred.kbps
+    val mp3TieBreak: (MediaStream) -> Int = { if (it.container.equals("mp3", ignoreCase = true)) 1 else 0 }
+
+    // 1. Exact bitrate match
+    withBitrate
+        .filter { it.second == target }
+        .maxByOrNull { mp3TieBreak(it.first) }
+        ?.let { return it.first }
+
+    // 2. Closest lower bitrate
+    withBitrate
+        .filter { it.second < target }
+        .maxWithOrNull(
+            compareBy<Pair<MediaStream, Int>> { it.second }
+                .thenBy { mp3TieBreak(it.first) }
+        )
+        ?.let { return it.first }
+
+    // 3. Nearest available when all streams are higher
+    return withBitrate
+        .minWithOrNull(
+            compareBy<Pair<MediaStream, Int>> { it.second }
+                .thenByDescending { mp3TieBreak(it.first) }
+        )
+        ?.first
+}
+
+private fun adaptSingleTranscodedMp3Option(
+    music: List<MediaStream>,
+    preferredAudioBitrate: AudioBitrate
+): List<MediaStream> {
+    val mp3Streams = music.filter { it.container.equals("mp3", ignoreCase = true) }
+    if (mp3Streams.size != 1) return music
+    val singleMp3 = mp3Streams.first()
+    val subtitle = singleMp3.headers["X-Internal-Subtitle"].orEmpty()
+    if (subtitle.startsWith("Original MP3", ignoreCase = true)) return music
+
+    val hasSiblingSameUrl = music.any { it.id != singleMp3.id && it.url == singleMp3.url }
+    val isExtractedFromVideo = singleMp3.headers["X-Internal-Extract-Audio"] == "true"
+    if (!hasSiblingSameUrl && !isExtractedFromVideo) return music
+
+    val targetKbps = preferredAudioBitrate.kbps
+    val currentKbps = effectiveAudioBitrateKbps(singleMp3) ?: 160
+    if (currentKbps == targetKbps) return music
+
+    val m4aAnchor = music.firstOrNull { it.container.equals("m4a", ignoreCase = true) && it.url == singleMp3.url }
+    val durationSec = singleMp3.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+    val sourceSize = m4aAnchor?.sizeBytes?.takeIf { it > 0L }
+        ?: singleMp3.headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L && !isExtractedFromVideo }
+        ?: singleMp3.sizeBytes?.takeIf { it > 0L }
+    val sourceKbps = when {
+        m4aAnchor != null -> effectiveAudioBitrateKbps(m4aAnchor) ?: 128
+        else -> currentKbps
+    }
+    val adjustedSize = FormatUtils.estimateTranscodedAudioBytes(
+        targetBitrateKbps = targetKbps,
+        durationSeconds = durationSec,
+        sourceSizeBytes = sourceSize,
+        sourceBitrateKbps = sourceKbps
+    ) ?: singleMp3.sizeBytes
+
+    val updatedMp3 = singleMp3.copy(
+        bitrateKbps = targetKbps,
+        sizeBytes = adjustedSize,
+        headers = singleMp3.headers + (
+            "X-Internal-Subtitle" to "MP3 (${targetKbps}K), support Bluetooth speaker, mobile phone, car, watch etc."
+            )
+    )
+    return music.map { if (it.id == singleMp3.id) updatedMp3 else it }
+}
+
+private fun buildQuickMusic(
+    rawMusic: List<MediaStream>,
+    preferredAudioBitrate: AudioBitrate
+): List<MediaStream> {
+    if (rawMusic.size <= 2) return rawMusic
+    val mp3s = rawMusic.filter { it.container.equals("mp3", ignoreCase = true) }
+    val fastM4a = rawMusic.firstOrNull { it.container.equals("m4a", ignoreCase = true) }
+    val preferredMp3 = selectPreferredAudioStream(mp3s, preferredAudioBitrate)
+    if (fastM4a != null && preferredMp3 != null) {
+        return listOf(fastM4a, preferredMp3)
+    }
+    val baseQuick = rawMusic.filter { it.headers["X-Internal-Quick"] == "true" }
+        .ifEmpty { rawMusic.take(2) }
+    val preferred = selectPreferredAudioStream(rawMusic, preferredAudioBitrate)
+    if (preferred != null && baseQuick.none { it.id == preferred.id }) {
+        return (baseQuick.take(1) + preferred).distinctBy { it.id }
+    }
+    return baseQuick
+}
+
+private fun buildQuickVideo(
+    rawVideos: List<MediaStream>,
+    preferredVideoQuality: VideoQuality
+): List<MediaStream> {
+    if (rawVideos.isEmpty()) return emptyList()
+    val baseQuick = rawVideos.filter { it.headers["X-Internal-Quick"] == "true" }
+        .ifEmpty {
+            val picked = mutableListOf<MediaStream>()
+            rawVideos.firstOrNull { it.height == 360 }?.let { picked += it }
+            rawVideos.firstOrNull { it.height == 720 }?.let { picked += it }
+            if (picked.size < 2) {
+                for (v in rawVideos) {
+                    if (v !in picked) picked += v
+                    if (picked.size >= 2) break
+                }
+            }
+            picked
+        }
+
+    val preferred = selectPreferredVideoStream(rawVideos, preferredVideoQuality) ?: return baseQuick
+    if (baseQuick.any { it.id == preferred.id }) return baseQuick
+
+    // Ensure the user's preferred quality is immediately visible in the compact format sheet
+    // paired with a contrasting quick option (preferring 360p fast or the first quick item).
+    val companion = baseQuick.firstOrNull { it.id != preferred.id && (effectiveVideoHeight(it) ?: 0) == 360 }
+        ?: baseQuick.firstOrNull { it.id != preferred.id }
+        ?: rawVideos.firstOrNull { it.id != preferred.id }
+
+    return listOfNotNull(companion, preferred)
+        .distinctBy { it.id }
+        .sortedWith(
+            compareBy<MediaStream> { effectiveVideoHeight(it) ?: Int.MAX_VALUE }
+                .thenBy { it.sizeBytes ?: Long.MAX_VALUE }
+        )
+}
 
 internal fun normalizeAudioOptionSizes(music: List<MediaStream>): List<MediaStream> {
     if (music.size <= 1) return music
