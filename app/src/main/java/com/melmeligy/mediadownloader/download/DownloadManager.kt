@@ -480,6 +480,7 @@ class DownloadManager @Inject constructor(
                 val stagingVideo = File(stagingDir(), "dl_${item.id}_video.${item.container}.part")
                 val stagingAudio = File(stagingDir(), "dl_${item.id}_audio.part")
 
+                var adaptiveMuxComplete = false
                 try {
                     // 1. Download adaptive video track
                     segmentedDownloader.download(
@@ -521,9 +522,14 @@ class DownloadManager @Inject constructor(
                         videoAudioMuxer.mux(stagingVideo, stagingAudio, staging)
                     }
                     if (!ok) throw MediaException(AppError.GENERIC, "Failed to mux video and audio tracks")
+                    adaptiveMuxComplete = true
                 } finally {
-                    runCatching { stagingVideo.delete() }
-                    runCatching { stagingAudio.delete() }
+                    if (adaptiveMuxComplete) {
+                        runCatching { stagingVideo.delete() }
+                        runCatching { stagingAudio.delete() }
+                        runCatching { File(stagingVideo.parentFile, "${stagingVideo.name}.idx").delete() }
+                        runCatching { File(stagingAudio.parentFile, "${stagingAudio.name}.idx").delete() }
+                    }
                 }
             } else if (isAudioExtraction) {
                 val isVideoSourceExtract = headers["X-Internal-Extract-Audio"] == "true"
@@ -532,6 +538,7 @@ class DownloadManager @Inject constructor(
                 val targetAudioTotal = item.totalBytes.takeIf { it > 0L } ?: 0L
                 val stagingSource = File(stagingDir(), "dl_${item.id}_src.part")
 
+                var extractComplete = false
                 try {
                     segmentedDownloader.download(
                         url = item.remoteUrl,
@@ -563,8 +570,12 @@ class DownloadManager @Inject constructor(
                         videoAudioMuxer.extractAudioOnly(stagingSource, staging, item.container, targetBitrateKbps)
                     }
                     if (!ok) throw MediaException(AppError.GENERIC, "Audio extraction failed")
+                    extractComplete = true
                 } finally {
-                    runCatching { stagingSource.delete() }
+                    if (extractComplete) {
+                        runCatching { stagingSource.delete() }
+                        runCatching { File(stagingSource.parentFile, "${stagingSource.name}.idx").delete() }
+                    }
                 }
             } else {
                 val realKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
@@ -735,7 +746,8 @@ class DownloadManager @Inject constructor(
             ?.filter {
                 it.name.startsWith("dl_$id.") ||
                     it.name.startsWith("dl_${id}_") ||
-                    it.name.startsWith("hls_parts_dl_${id}_")
+                    it.name.startsWith("hls_parts_dl_${id}_") ||
+                    it.name.startsWith("hls_parts_dl_${id}.")
             }
             ?.forEach {
                 runCatching {

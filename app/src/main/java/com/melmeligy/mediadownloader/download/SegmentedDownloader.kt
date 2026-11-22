@@ -91,9 +91,14 @@ class SegmentedDownloader @Inject constructor(
             return@coroutineScope
         }
 
+        val idxFile = File(dest.parentFile, dest.name + ".idx")
+        if (total > 0L && dest.exists() && dest.length() == total && !idxFile.exists()) {
+            onProgress(DownloadProgress(total, total, 0, 0))
+            return@coroutineScope
+        }
+
         val n = effectiveSegments.coerceIn(2, 8)
         val bounds = computeBounds(total, n)
-        val idxFile = File(dest.parentFile, dest.name + ".idx")
         val positions = loadOrInit(idxFile, dest, bounds, total)
 
         val downloaded = AtomicLong(positions.indices.sumOf { positions[it] - bounds[it].first })

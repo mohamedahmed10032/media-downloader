@@ -464,4 +464,92 @@ class DownloadManagerTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun adaptiveDownload_pausePreservesPartialStagingFiles_andCancelCleansHlsPartsDir() = kotlinx.coroutines.runBlocking {
+        val tempDir = java.nio.file.Files.createTempDirectory("dm_resume_staging_test").toFile()
+        try {
+            every { context.getExternalFilesDir(null) } returns tempDir
+            every { context.filesDir } returns tempDir
+            val settings = com.melmeligy.mediadownloader.domain.model.AppSettings(maxConcurrentDownloads = 1)
+            every { settingsRepository.settings } returns kotlinx.coroutines.flow.flowOf(settings)
+            coEvery { settingsRepository.current() } returns settings
+
+            val headersJson = com.melmeligy.mediadownloader.core.util.JsonUtils.mapToJson(
+                mapOf("X-Internal-Companion-Audio" to "https://cdn.example/audio.m4a")
+            )
+            var currentItem: DownloadItem? = DownloadItem(
+                id = 104L,
+                title = "Adaptive Pause Test",
+                sourceUrl = "https://example.com/watch",
+                remoteUrl = "https://cdn.example/video.mp4",
+                type = MediaType.VIDEO,
+                container = "mp4",
+                qualityLabel = "720p",
+                headersJson = headersJson,
+                isHls = false,
+                status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED,
+                createdAt = 1000L,
+                updatedAt = 1000L
+            )
+            val audioStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+            var claimed = false
+
+            coEvery { repository.resetInterrupted() } returns Unit
+            coEvery { repository.claimNextQueued(any()) } answers {
+                val item = currentItem
+                if (!claimed && item != null && item.status == com.melmeligy.mediadownloader.domain.model.DownloadStatus.QUEUED) {
+                    claimed = true
+                    val running = item.copy(status = com.melmeligy.mediadownloader.domain.model.DownloadStatus.RUNNING)
+                    currentItem = running
+                    listOf(running)
+                } else emptyList()
+            }
+            every { repository.observeActive() } answers {
+                val item = currentItem
+                kotlinx.coroutines.flow.flowOf(if (item != null && item.isActive) listOf(item) else emptyList())
+            }
+            coEvery { repository.getById(104L) } answers { currentItem }
+            coEvery { repository.updateStatus(104L, any()) } answers {
+                val st = secondArg<com.melmeligy.mediadownloader.domain.model.DownloadStatus>()
+                currentItem = currentItem?.copy(status = st)
+            }
+
+            coEvery {
+                segmentedDownloader.download(any(), any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                val dest = arg<java.io.File>(2)
+                dest.parentFile?.mkdirs()
+                if (dest.name.contains("_video.")) {
+                    dest.writeBytes(ByteArray(1024) { 0x11 })
+                } else {
+                    dest.writeBytes(ByteArray(256) { 0x22 })
+                    audioStarted.complete(Unit)
+                    kotlinx.coroutines.awaitCancellation()
+                }
+            }
+
+            val queueJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+                downloadManager.runQueue { }
+            }
+
+            kotlinx.coroutines.withTimeout(2000L) { audioStarted.await() }
+            downloadManager.pause(104L)
+            kotlinx.coroutines.withTimeout(2000L) { queueJob.join() }
+
+            val downloadsDir = java.io.File(tempDir, "Downloads")
+            val videoPart = java.io.File(downloadsDir, "dl_104_video.mp4.part")
+            val audioPart = java.io.File(downloadsDir, "dl_104_audio.part")
+            org.junit.Assert.assertTrue("Video staging file must be preserved on Pause", videoPart.exists() && videoPart.length() == 1024L)
+            org.junit.Assert.assertTrue("Audio partial staging file must be preserved on Pause", audioPart.exists() && audioPart.length() == 256L)
+
+            // Also verify Cancel cleans up deterministic hls_parts_dl_<id>.mp4 directory
+            val hlsPartsDir = java.io.File(downloadsDir, "hls_parts_dl_105.mp4").apply { mkdirs() }
+            java.io.File(hlsPartsDir, "seg_0.part").writeText("SEG0")
+            downloadManager.cancel(105L)
+            org.junit.Assert.assertFalse("hls_parts_dl_105.mp4 must be deleted on Cancel", hlsPartsDir.exists())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

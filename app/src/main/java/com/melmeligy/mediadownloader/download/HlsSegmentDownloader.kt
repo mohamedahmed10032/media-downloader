@@ -126,12 +126,39 @@ class HlsSegmentDownloader @Inject constructor(
 
         val partsDir = File(
             dest.parentFile,
-            "hls_parts_${dest.nameWithoutExtension}_${System.currentTimeMillis()}"
+            "hls_parts_${dest.nameWithoutExtension}"
         ).apply { mkdirs() }
 
-        val written = AtomicLong(0L)
-        val completedMediaSegments = AtomicInteger(0)
-        val tracker = SpeedTracker(0L)
+        val metaFile = File(partsDir, ".meta")
+        val playlistMeta = "${segments.size}:$totalDurationMs"
+        val existingMeta = runCatching { metaFile.takeIf { it.exists() }?.readText()?.trim() }.getOrNull()
+        if (existingMeta != null && existingMeta != playlistMeta) {
+            runCatching { partsDir.deleteRecursively() }
+            partsDir.mkdirs()
+        } else {
+            // Remove any interrupted .tmp segment files while keeping completed seg_N.part files intact
+            partsDir.listFiles { _, name -> name.endsWith(".tmp") }?.forEach { runCatching { it.delete() } }
+        }
+        runCatching { metaFile.writeText(playlistMeta) }
+
+        var initialWritten = 0L
+        var initialCompletedSegs = 0
+        val alreadyCompleted = BooleanArray(segments.size)
+        for ((index, segment) in segments.withIndex()) {
+            val partFile = File(partsDir, "seg_$index.part")
+            val len = if (partFile.exists()) partFile.length() else 0L
+            if (len > 0L) {
+                alreadyCompleted[index] = true
+                initialWritten += len
+                if (!segment.isInitMap) {
+                    initialCompletedSegs++
+                }
+            }
+        }
+
+        val written = AtomicLong(initialWritten)
+        val completedMediaSegments = AtomicInteger(initialCompletedSegs)
+        val tracker = SpeedTracker(initialWritten)
 
         fun computeSegmentDrivenTotal(currentWritten: Long): Long {
             if (exactByteRangeTotal > 0L) {
@@ -154,6 +181,11 @@ class HlsSegmentDownloader @Inject constructor(
             return maxOf(currentWritten + 1L, impliedTotal)
         }
 
+        if (initialWritten > 0L) {
+            val estTotal = computeSegmentDrivenTotal(initialWritten)
+            onProgress(DownloadProgress(initialWritten, estTotal, 0L, -1L))
+        }
+
         val progressJob = launch {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
@@ -172,9 +204,15 @@ class HlsSegmentDownloader @Inject constructor(
         val effectiveRetries = maxRetries.coerceAtLeast(0)
         val tasks = segments.mapIndexed { index, segment ->
             async(Dispatchers.IO) {
+                val partFile = File(partsDir, "seg_$index.part")
+                if (alreadyCompleted[index] && partFile.exists() && partFile.length() > 0L) {
+                    return@async partFile
+                }
                 semaphore.withPermit {
                     currentCoroutineContext().ensureActive()
-                    val partFile = File(partsDir, "seg_$index.part")
+                    if (partFile.exists() && partFile.length() > 0L) {
+                        return@withPermit partFile
+                    }
                     val keyBytes = if (segment.keySpec.method == HlsEncryptionMethod.AES_128 && !segment.isInitMap) {
                         segment.keySpec.uri?.let { aesKeys[it] }
                     } else null
@@ -196,6 +234,7 @@ class HlsSegmentDownloader @Inject constructor(
         var succeeded = false
         try {
             val tsNormalizer = MpegTsTimestampNormalizer()
+            if (dest.exists()) dest.delete()
             FileOutputStream(dest, true).use { output ->
                 for ((index, task) in tasks.withIndex()) {
                     currentCoroutineContext().ensureActive()
@@ -206,7 +245,6 @@ class HlsSegmentDownloader @Inject constructor(
                     } else {
                         tsNormalizer.writeSegment(partFile, seg.discontinuityBlock, output)
                     }
-                    partFile.delete()
                 }
                 output.flush()
             }
@@ -214,8 +252,10 @@ class HlsSegmentDownloader @Inject constructor(
         } finally {
             progressJob.cancel()
             tasks.forEach { it.cancel() }
-            runCatching { partsDir.deleteRecursively() }
-            if (!succeeded) {
+            if (succeeded) {
+                runCatching { partsDir.deleteRecursively() }
+            } else {
+                // Keep completed seg_N.part files in partsDir for Resume; only remove incomplete assembled dest
                 runCatching { dest.delete() }
             }
         }
@@ -302,8 +342,9 @@ class HlsSegmentDownloader @Inject constructor(
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
                     val serverIgnoredRange = rangeLen != null && rangeLen > 0L && response.code == 200
 
-                    partFile.parentFile?.mkdirs()
-                    FileOutputStream(partFile).use { output ->
+                    val tempPartFile = File(partFile.parentFile, "${partFile.name}.tmp")
+                    tempPartFile.parentFile?.mkdirs()
+                    FileOutputStream(tempPartFile).use { output ->
                         body.byteStream().use { rawInput ->
                             if (serverIgnoredRange && rangeStart > 0L) {
                                 skipFully(rawInput, rangeStart)
@@ -335,16 +376,20 @@ class HlsSegmentDownloader @Inject constructor(
                         }
                         output.flush()
                     }
+                    if (!tempPartFile.renameTo(partFile)) {
+                        tempPartFile.copyTo(partFile, overwrite = true)
+                        tempPartFile.delete()
+                    }
                 }
                 return attemptBytes
             } catch (e: kotlinx.coroutines.CancellationException) {
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
-                runCatching { partFile.delete() }
+                runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
                 throw e
             } catch (e: SegmentHttpException) {
                 currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
-                runCatching { partFile.delete() }
+                runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
                 val isRetryable = e.code == 429 || e.code == 408 || e.code in 500..599
                 if (!isRetryable || attempt >= maxRetries) {
                     throw e.mediaException
@@ -355,7 +400,7 @@ class HlsSegmentDownloader @Inject constructor(
             } catch (e: MediaException) {
                 currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
-                runCatching { partFile.delete() }
+                runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
                 if (e.error == AppError.GEO_BLOCKED || e.error == AppError.NO_MEDIA_FOUND || e.error == AppError.EXPIRED_LINK) {
                     throw e
                 }
@@ -364,7 +409,7 @@ class HlsSegmentDownloader @Inject constructor(
                 delay(minOf(4_000L, 450L * attempt))
             } catch (e: Exception) {
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
-                runCatching { partFile.delete() }
+                runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
                 currentCoroutineContext().ensureActive()
                 if (attempt >= maxRetries) throw e
                 attempt++

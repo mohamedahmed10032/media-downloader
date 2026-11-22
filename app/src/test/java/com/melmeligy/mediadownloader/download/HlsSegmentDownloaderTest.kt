@@ -240,11 +240,182 @@ class HlsSegmentDownloaderTest {
             val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
             assertTrue("Expected prompt cancellation (< 1500ms) instead of 30s read timeout, took ${elapsedMs}ms", elapsedMs < 1500L)
 
-            val remainingPartDirs = tempFolder.root.listFiles()?.filter { it.name.startsWith("hls_parts_") } ?: emptyList()
-            assertTrue("Temporary part directories should be cleaned up after cancel", remainingPartDirs.isEmpty())
+            assertFalse("Incomplete destination file should not exist after cancel", destFile.exists())
+            val remainingTmpFiles = File(tempFolder.root, "hls_parts_stalled")
+                .listFiles { _, name -> name.endsWith(".tmp") }
+                ?.toList()
+                ?: emptyList()
+            assertTrue("In-flight .tmp segment files should be cleaned up on cancel", remainingTmpFiles.isEmpty())
         } finally {
             releaseStalledServer.countDown()
             runCatching { server.close() }
         }
+    }
+
+    @Test
+    fun download_pauseThenResume_skipsCompletedSegmentsAndResumesSavedProgress() = kotlinx.coroutines.runBlocking {
+        val playlist4 = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:10
+            #EXTINF:10.0,
+            https://example.com/seg_0.ts
+            #EXTINF:10.0,
+            https://example.com/seg_1.ts
+            #EXTINF:10.0,
+            https://example.com/seg_2.ts
+            #EXTINF:10.0,
+            https://example.com/seg_3.ts
+        """.trimIndent()
+
+        val payloads = mapOf(
+            "seg_0.ts" to "SEG0_CONTENT_AAAA",
+            "seg_1.ts" to "SEG1_CONTENT_BBBB",
+            "seg_2.ts" to "SEG2_CONTENT_CCCC",
+            "seg_3.ts" to "SEG3_CONTENT_DDDD"
+        )
+        val requestCounts = ConcurrentHashMap<String, AtomicInteger>()
+        val seg2Entered = java.util.concurrent.CountDownLatch(1)
+        val allowSeg2ToFinish = java.util.concurrent.CountDownLatch(1)
+        var stallOnSeg2 = true
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                if (url.endsWith("playlist.m3u8")) {
+                    return@addInterceptor Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(playlist4.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
+                        .build()
+                }
+                val segName = payloads.keys.first { url.endsWith(it) }
+                requestCounts.computeIfAbsent(segName) { AtomicInteger(0) }.incrementAndGet()
+                if (segName == "seg_2.ts" && stallOnSeg2) {
+                    seg2Entered.countDown()
+                    allowSeg2ToFinish.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    throw java.io.InterruptedIOException("Simulated socket cancel on pause")
+                }
+                val bodyBytes = payloads.getValue(segName).toByteArray()
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(bodyBytes.toResponseBody("video/mp2t".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val http = ExtractorHttp(client)
+        val downloader = HlsSegmentDownloader(client, http)
+        val destFile = File(tempFolder.root, "dl_42.mp4.part")
+
+        // Run 1: let seg_0 and seg_1 complete, then pause while seg_2 is in-flight
+        val job1 = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            downloader.download("https://example.com/playlist.m3u8", emptyMap(), destFile) {}
+        }
+        assertTrue("seg_2 should start", seg2Entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        // Ensure seg_0 and seg_1 have promoted their .part files on disk
+        val partsDir = File(tempFolder.root, "hls_parts_dl_42.mp4")
+        val deadline = System.currentTimeMillis() + 3000L
+        while (System.currentTimeMillis() < deadline &&
+            (!File(partsDir, "seg_0.part").exists() || !File(partsDir, "seg_1.part").exists())
+        ) {
+            Thread.sleep(20)
+        }
+        assertTrue(File(partsDir, "seg_0.part").exists())
+        assertTrue(File(partsDir, "seg_1.part").exists())
+
+        job1.cancel()
+        allowSeg2ToFinish.countDown()
+        job1.join()
+
+        // Run 2 (Resume): seg_0 and seg_1 must NOT be re-downloaded
+        stallOnSeg2 = false
+        val resumeProgress = mutableListOf<DownloadProgress>()
+        downloader.download(
+            playlistUrl = "https://example.com/playlist.m3u8",
+            headers = emptyMap(),
+            dest = destFile,
+            onProgress = { resumeProgress.add(it) }
+        )
+
+        assertEquals(1, requestCounts["seg_0.ts"]?.get())
+        assertEquals(1, requestCounts["seg_1.ts"]?.get())
+        assertEquals(1, requestCounts["seg_3.ts"]?.get())
+        assertTrue("Resume must emit initial progress >= saved bytes", resumeProgress.isNotEmpty())
+        val expectedInitialSaved = (payloads.getValue("seg_0.ts") + payloads.getValue("seg_1.ts")).length.toLong()
+        assertTrue(
+            "First resume progress (${resumeProgress.first().downloaded}) should reflect saved bytes ($expectedInitialSaved)",
+            resumeProgress.first().downloaded >= expectedInitialSaved
+        )
+        assertEquals(
+            "SEG0_CONTENT_AAAASSEG1_CONTENT_BBBB".replace("SS", "S")
+                .let { payloads.getValue("seg_0.ts") + payloads.getValue("seg_1.ts") + payloads.getValue("seg_2.ts") + payloads.getValue("seg_3.ts") },
+            destFile.readText()
+        )
+        assertFalse("partsDir should be cleaned up after completion", partsDir.exists())
+    }
+
+    @Test
+    fun download_resumeWithEmptyPartAndStaleTmp_reDownloadsOnlyInvalidSegments() = kotlinx.coroutines.runBlocking {
+        val playlist3 = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:10
+            #EXTINF:10.0,
+            https://example.com/seg_0.ts
+            #EXTINF:10.0,
+            https://example.com/seg_1.ts
+            #EXTINF:10.0,
+            https://example.com/seg_2.ts
+        """.trimIndent()
+        val payloads = mapOf(
+            "seg_0.ts" to "VALID_SEG_0",
+            "seg_1.ts" to "VALID_SEG_1",
+            "seg_2.ts" to "VALID_SEG_2"
+        )
+        val requestCounts = ConcurrentHashMap<String, AtomicInteger>()
+
+        val destFile = File(tempFolder.root, "dl_77.mp4.part")
+        val partsDir = File(tempFolder.root, "hls_parts_dl_77.mp4").apply { mkdirs() }
+        File(partsDir, "seg_0.part").writeText("VALID_SEG_0")
+        File(partsDir, "seg_1.part").writeBytes(ByteArray(0)) // corrupt 0-byte .part
+        File(partsDir, "seg_2.part.tmp").writeText("PARTIAL_GARBAGE") // interrupted .tmp
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                if (url.endsWith("playlist.m3u8")) {
+                    return@addInterceptor Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(playlist3.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
+                        .build()
+                }
+                val segName = payloads.keys.first { url.endsWith(it) }
+                requestCounts.computeIfAbsent(segName) { AtomicInteger(0) }.incrementAndGet()
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(payloads.getValue(segName).toByteArray().toResponseBody("video/mp2t".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val downloader = HlsSegmentDownloader(client, ExtractorHttp(client))
+        downloader.download("https://example.com/playlist.m3u8", emptyMap(), destFile) {}
+
+        assertEquals(null, requestCounts["seg_0.ts"]?.get())
+        assertEquals(1, requestCounts["seg_1.ts"]?.get())
+        assertEquals(1, requestCounts["seg_2.ts"]?.get())
+        assertEquals("VALID_SEG_0VALID_SEG_1VALID_SEG_2", destFile.readText())
     }
 }
