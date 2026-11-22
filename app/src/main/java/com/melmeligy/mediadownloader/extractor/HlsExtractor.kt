@@ -98,16 +98,16 @@ class HlsExtractor @Inject constructor(
                 }
             }
 
-            // Probe first variant playlist to calculate total duration from #EXTINF segments
+            // Probe first variant playlist to calculate sanitized duration (excluding injected discontinuity ad blocks)
             val firstVariantUrl = rawVariants.firstOrNull()?.variantUrl
             val variantText = if (firstVariantUrl != null) {
                 runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
             } else null
 
-            val probedDurationSeconds = if (!variantText.isNullOrBlank()) {
-                extInfRegex.findAll(variantText).sumOf {
-                    it.groupValues[1].toDoubleOrNull() ?: 0.0
-                }.roundToLong()
+            val probedDurationSeconds = if (!variantText.isNullOrBlank() && firstVariantUrl != null) {
+                HlsPlaylistSanitizer.parseAndSanitize(variantText, firstVariantUrl)
+                    .totalDurationSec
+                    .roundToLong()
             } else 0L
 
             val headerDurationSeconds = headers["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
@@ -123,9 +123,8 @@ class HlsExtractor @Inject constructor(
                 val resolution = v.attrs["RESOLUTION"]
                 var width = resolution?.substringBefore('x')?.toIntOrNull()?.takeIf { it > 0 }
                 var height = resolution?.substringAfter('x')?.toIntOrNull()?.takeIf { it > 0 }
-                if (width != null && height != null && height > width) {
-                    // Portrait video (e.g. 720x1280 -> 720p)
-                    height = width
+                if (width != null && height != null) {
+                    height = JsUnpacker.normalizeVideoHeight(width, height)
                 } else if (height != null && width == null) {
                     width = (height * 16) / 9
                 }
@@ -261,40 +260,31 @@ class HlsExtractor @Inject constructor(
 
         if (streams.isEmpty()) {
             if (text.contains("#EXTINF")) {
-                val totalDurationSeconds = extInfRegex.findAll(text).sumOf {
-                    it.groupValues[1].toDoubleOrNull() ?: 0.0
-                }.roundToLong()
+                val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, url)
+                val mediaSegments = sanitized.segments.filter { !it.isInitMap }
+                val totalDurationSeconds = sanitized.totalDurationSec.roundToLong()
 
                 val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(url)
                 val inferredWidth = inferredHeight?.let { (it * 16) / 9 }
 
-                // 1. Check if playlist advertises exact #EXT-X-BYTERANGE segment lengths (e.g. xHamster/fMP4 HLS)
-                val byteRangeTotal = sumByteRanges(text)
+                // 1. Check if sanitized playlist advertises exact #EXT-X-BYTERANGE segment lengths (e.g. xHamster/fMP4 HLS)
+                val allHaveRanges = mediaSegments.isNotEmpty() && mediaSegments.all { (it.byteRangeLength ?: 0L) > 0L }
+                val byteRangeTotal = if (allHaveRanges) {
+                    sanitized.segments.sumOf { it.byteRangeLength ?: 0L }
+                } else {
+                    0L
+                }
 
                 var sizeBytes: Long? = byteRangeTotal.takeIf { it > 0L }
                 var bitrateKbps: Int? = if (sizeBytes != null && totalDurationSeconds > 0L) {
                     ((sizeBytes * 8L) / (totalDurationSeconds * 1000L)).toInt()
                 } else null
 
-                // 2. Otherwise probe first segment
+                // 2. Otherwise probe first non-ad media segment
                 if (sizeBytes == null) {
-                    val lines = text.lines()
-                    var seg0Url: String? = null
-                    var seg0Duration: Double? = null
-                    for (i in lines.indices) {
-                        val line = lines[i].trim()
-                        if (line.startsWith("#EXTINF")) {
-                            seg0Duration = extInfRegex.find(line)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
-                            var j = i + 1
-                            while (j < lines.size && (lines[j].trim().isEmpty() || lines[j].trim().startsWith("#"))) {
-                                j++
-                            }
-                            if (j < lines.size) {
-                                seg0Url = UrlUtils.resolveUrl(url, lines[j].trim())
-                            }
-                            break
-                        }
-                    }
+                    val seg0 = mediaSegments.firstOrNull()
+                    val seg0Url = seg0?.url
+                    val seg0Duration = seg0?.durationSec
 
                     if (seg0Url != null) {
                         val probe = runCatching { http.probe(seg0Url, headers) }.getOrNull()

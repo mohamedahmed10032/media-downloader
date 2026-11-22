@@ -5,6 +5,10 @@ import com.melmeligy.mediadownloader.core.Constants
 import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.extractor.ExtractorHttp
+import com.melmeligy.mediadownloader.extractor.HlsEncryptionMethod
+import com.melmeligy.mediadownloader.extractor.HlsKeySpec
+import com.melmeligy.mediadownloader.extractor.HlsParsedSegment
+import com.melmeligy.mediadownloader.extractor.HlsPlaylistSanitizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -15,24 +19,31 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Cipher
+import javax.crypto.CipherInputStream
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Downloads clear HLS streams (both MPEG-TS `.ts` and fragmented MP4 `#EXT-X-MAP` /
- * `#EXT-X-BYTERANGE` playlists) concurrently and concatenates segments in strict playlist order.
+ * Downloads HLS streams (MPEG-TS `.ts`, fragmented MP4 `#EXT-X-MAP` / `#EXT-X-BYTERANGE`,
+ * and standard RFC 8216 clear `#EXT-X-KEY:METHOD=AES-128` playlists) concurrently and
+ * concatenates segments in strict playlist order.
  *
- * Progress & total-byte estimation:
- * - Uses exact byte sum when `#EXT-X-BYTERANGE` lengths are advertised on every segment.
- * - Otherwise tracks completed-segment byte & duration totals atomically upon each segment's
- *   completion (isolated from partial in-flight worker bytes and `#EXT-X-MAP` init headers) so
- *   concurrent workers never inflate the estimated total size by 5x.
+ * - Strips injected `#EXT-X-DISCONTINUITY` ad/bumper blocks via [HlsPlaylistSanitizer].
+ * - Strictly rejects DRM (`SAMPLE-AES*`, non-identity `KEYFORMAT`) and missing/invalid keys.
+ * - Forwards exact captured headers (`Referer`, `Origin`, `User-Agent`, `Cookie`) on playlist,
+ *   key, and segment requests.
+ * - Retries transient `429`/`5xx`/network errors cleanly while respecting configured retry counts.
  */
 @Singleton
 class HlsSegmentDownloader @Inject constructor(
@@ -45,7 +56,9 @@ class HlsSegmentDownloader @Inject constructor(
         val durationSec: Double,
         val byteRangeOffset: Long? = null,
         val byteRangeLength: Long? = null,
-        val isInitMap: Boolean = false
+        val isInitMap: Boolean = false,
+        val keySpec: HlsKeySpec = HlsKeySpec(),
+        val mediaSequence: Long = 0L
     )
 
     suspend fun download(
@@ -53,13 +66,22 @@ class HlsSegmentDownloader @Inject constructor(
         headers: Map<String, String>,
         dest: File,
         onProgress: ProgressCallback
-    ) = download(playlistUrl, headers, dest, 0L, onProgress)
+    ) = download(playlistUrl, headers, dest, 0L, Constants.SEGMENT_MAX_RETRIES, onProgress)
 
     suspend fun download(
         playlistUrl: String,
         headers: Map<String, String>,
         dest: File,
         expectedTotalBytes: Long,
+        onProgress: ProgressCallback
+    ) = download(playlistUrl, headers, dest, expectedTotalBytes, Constants.SEGMENT_MAX_RETRIES, onProgress)
+
+    suspend fun download(
+        playlistUrl: String,
+        headers: Map<String, String>,
+        dest: File,
+        expectedTotalBytes: Long,
+        maxRetries: Int,
         onProgress: ProgressCallback
     ) = coroutineScope {
         var mediaUrl = playlistUrl
@@ -71,20 +93,24 @@ class HlsSegmentDownloader @Inject constructor(
             text = http.fetchString(mediaUrl, headers)
         }
 
-        if (isEncrypted(text)) {
+        val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, mediaUrl)
+        if (sanitized.hasUnsupportedDrm) {
             throw MediaException(
                 AppError.GENERIC,
                 "This stream is encrypted (DRM) and cannot be downloaded."
             )
         }
 
-        val segments = parseSegments(text, mediaUrl)
+        val segments = sanitized.segments.map { it.toHlsSegment() }
         if (segments.isEmpty()) throw MediaException(AppError.NO_MEDIA_FOUND, "No HLS segments found")
+
+        // Fetch any distinct RFC 8216 clear AES-128 keys upfront with identical headers
+        val aesKeys = fetchAes128Keys(segments, headers)
 
         dest.parentFile?.mkdirs()
         if (dest.exists()) dest.delete()
 
-        val exactByteRangeTotal = if (segments.all { it.byteRangeLength != null && it.byteRangeLength > 0L }) {
+        val exactByteRangeTotal = if (segments.all { it.byteRangeLength != null && it.byteRangeLength > 0L } && aesKeys.isEmpty()) {
             segments.sumOf { it.byteRangeLength ?: 0L }
         } else 0L
 
@@ -170,12 +196,23 @@ class HlsSegmentDownloader @Inject constructor(
             .find(mediaUrl)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 }
         val maxConcurrent = if (cdnLimit != null) minOf(CONCURRENT_SEGMENTS, cdnLimit) else CONCURRENT_SEGMENTS
         val semaphore = Semaphore(maxConcurrent)
+        val effectiveRetries = maxRetries.coerceAtLeast(0)
         val tasks = segments.mapIndexed { index, segment ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     currentCoroutineContext().ensureActive()
                     val partFile = File(partsDir, "seg_$index.part")
-                    val segBytes = downloadSegmentToPart(segment, headers, partFile, written)
+                    val keyBytes = if (segment.keySpec.method == HlsEncryptionMethod.AES_128 && !segment.isInitMap) {
+                        segment.keySpec.uri?.let { aesKeys[it] }
+                    } else null
+                    val segBytes = downloadSegmentToPart(
+                        segment = segment,
+                        headers = headers,
+                        keyBytes = keyBytes,
+                        maxRetries = effectiveRetries,
+                        partFile = partFile,
+                        written = written
+                    )
                     if (segment.isInitMap) {
                         initMapBytes.addAndGet(segBytes)
                     } else {
@@ -221,9 +258,51 @@ class HlsSegmentDownloader @Inject constructor(
         onProgress(DownloadProgress(finalBytes, finalBytes, 0, 0))
     }
 
+    private suspend fun fetchAes128Keys(
+        segments: List<HlsSegment>,
+        headers: Map<String, String>
+    ): Map<String, ByteArray> {
+        val aesSegments = segments.filter { !it.isInitMap && it.keySpec.method == HlsEncryptionMethod.AES_128 }
+        if (aesSegments.isEmpty()) return emptyMap()
+
+        val keys = LinkedHashMap<String, ByteArray>()
+        for (seg in aesSegments) {
+            val uri = seg.keySpec.uri?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                ?: throw MediaException(
+                    AppError.GENERIC,
+                    "This stream is encrypted and has no retrievable AES-128 key URI."
+                )
+            if (keys.containsKey(uri)) continue
+
+            val keyBytes = withContext(Dispatchers.IO) {
+                runCatching {
+                    val req = http.buildRequest(uri, headers)
+                        .header("X-Internal-Download", "true")
+                        .get()
+                        .build()
+                    client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use null
+                        resp.body?.bytes()
+                    }
+                }.getOrNull()
+            }
+
+            if (keyBytes == null || keyBytes.size != AES_128_KEY_SIZE) {
+                throw MediaException(
+                    AppError.GENERIC,
+                    "This stream is encrypted and its decryption key could not be retrieved."
+                )
+            }
+            keys[uri] = keyBytes
+        }
+        return keys
+    }
+
     private suspend fun downloadSegmentToPart(
         segment: HlsSegment,
         headers: Map<String, String>,
+        keyBytes: ByteArray?,
+        maxRetries: Int,
         partFile: File,
         written: AtomicLong
     ): Long {
@@ -243,29 +322,47 @@ class HlsSegmentDownloader @Inject constructor(
                     reqBuilder.header("Range", "bytes=$rangeStart-$rangeEnd")
                 }
 
+                var retryAfterMs: Long? = null
                 client.newCall(reqBuilder.build()).execute().use { response ->
                     if (!response.isSuccessful && response.code != 206) {
-                        throw http.mapHttpError(response.code)
+                        if (response.code == 429) {
+                            retryAfterMs = response.header("Retry-After")?.trim()?.toLongOrNull()
+                                ?.coerceIn(1L, 10L)?.times(1000L)
+                        }
+                        throw SegmentHttpException(response.code, http.mapHttpError(response.code), retryAfterMs)
                     }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
                     val serverIgnoredRange = rangeLen != null && rangeLen > 0L && response.code == 200
 
                     partFile.parentFile?.mkdirs()
                     FileOutputStream(partFile).use { output ->
-                        body.byteStream().use { input ->
+                        body.byteStream().use { rawInput ->
                             if (serverIgnoredRange && rangeStart > 0L) {
-                                skipFully(input, rangeStart)
+                                skipFully(rawInput, rangeStart)
                             }
-                            var remaining = if (rangeLen != null && rangeLen > 0L) rangeLen else Long.MAX_VALUE
-                            while (remaining > 0L) {
-                                currentCoroutineContext().ensureActive()
-                                val maxToRead = minOf(buffer.size.toLong(), remaining).toInt()
-                                val read = input.read(buffer, 0, maxToRead)
-                                if (read == -1) break
-                                output.write(buffer, 0, read)
-                                attemptBytes += read
-                                remaining -= read
-                                written.addAndGet(read.toLong())
+                            val boundedInput: InputStream = if (rangeLen != null && rangeLen > 0L) {
+                                BoundedInputStream(rawInput, rangeLen)
+                            } else {
+                                rawInput
+                            }
+                            val effectiveInput: InputStream = if (keyBytes != null) {
+                                val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                                val iv = resolveAesIv(segment.keySpec.ivHex, segment.mediaSequence)
+                                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
+                                CipherInputStream(boundedInput, cipher)
+                            } else {
+                                boundedInput
+                            }
+
+                            effectiveInput.use { input ->
+                                while (true) {
+                                    currentCoroutineContext().ensureActive()
+                                    val read = input.read(buffer)
+                                    if (read == -1) break
+                                    output.write(buffer, 0, read)
+                                    attemptBytes += read
+                                    written.addAndGet(read.toLong())
+                                }
                             }
                         }
                         output.flush()
@@ -273,32 +370,77 @@ class HlsSegmentDownloader @Inject constructor(
                 }
                 return attemptBytes
             } catch (e: kotlinx.coroutines.CancellationException) {
-                if (attemptBytes > 0) {
-                    written.addAndGet(-attemptBytes)
-                }
+                if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
                 throw e
-            } catch (e: MediaException) {
-                if (attemptBytes > 0) {
-                    written.addAndGet(-attemptBytes)
+            } catch (e: SegmentHttpException) {
+                if (attemptBytes > 0) written.addAndGet(-attemptBytes)
+                runCatching { partFile.delete() }
+                val isRetryable = e.code == 429 || e.code == 408 || e.code in 500..599
+                if (!isRetryable || attempt >= maxRetries) {
+                    throw e.mediaException
                 }
+                attempt++
+                val backoffMs = e.retryAfterMs ?: minOf(4_000L, 450L * (1L shl (attempt - 1).coerceAtMost(4)))
+                delay(backoffMs)
+            } catch (e: MediaException) {
+                if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
                 if (e.error == AppError.GEO_BLOCKED || e.error == AppError.NO_MEDIA_FOUND || e.error == AppError.EXPIRED_LINK) {
                     throw e
                 }
+                if (attempt >= maxRetries) throw e
                 attempt++
-                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
-                delay(400L * attempt)
+                delay(minOf(4_000L, 450L * attempt))
             } catch (e: Exception) {
-                if (attemptBytes > 0) {
-                    written.addAndGet(-attemptBytes)
-                }
+                if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { partFile.delete() }
+                if (attempt >= maxRetries) throw e
                 attempt++
-                if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e
-                delay(400L * attempt)
+                delay(minOf(4_000L, 450L * attempt))
             }
         }
+    }
+
+    private class SegmentHttpException(
+        val code: Int,
+        val mediaException: MediaException,
+        val retryAfterMs: Long?
+    ) : Exception(mediaException.message, mediaException)
+
+    private class BoundedInputStream(
+        private val delegate: InputStream,
+        private var remaining: Long
+    ) : InputStream() {
+        override fun read(): Int {
+            if (remaining <= 0L) return -1
+            val b = delegate.read()
+            if (b != -1) remaining--
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining <= 0L) return -1
+            val toRead = minOf(len.toLong(), remaining).toInt()
+            val n = delegate.read(b, off, toRead)
+            if (n > 0) remaining -= n
+            return n
+        }
+    }
+
+    internal fun resolveAesIv(ivHex: String?, mediaSequence: Long): ByteArray {
+        val iv = ByteArray(16)
+        if (!ivHex.isNullOrBlank()) {
+            val clean = ivHex.trim().removePrefix("0x").removePrefix("0X").padStart(32, '0').takeLast(32)
+            for (i in 0 until 16) {
+                val byteVal = clean.substring(i * 2, i * 2 + 2).toIntOrNull(16) ?: 0
+                iv[i] = byteVal.toByte()
+            }
+            return iv
+        }
+        // RFC 8216 §5.2: 128-bit big-endian binary representation of media sequence number
+        ByteBuffer.wrap(iv, 8, 8).putLong(mediaSequence)
+        return iv
     }
 
     private fun skipFully(input: InputStream, bytesToSkip: Long) {
@@ -340,88 +482,21 @@ class HlsSegmentDownloader @Inject constructor(
         return bestUrl
     }
 
-    private fun isEncrypted(mediaText: String): Boolean =
-        mediaText.lineSequence().any {
-            val line = it.trim()
-            line.startsWith("#EXT-X-KEY") && !line.contains("METHOD=NONE")
-        }
+    internal fun parseSegments(mediaText: String, baseUrl: String): List<HlsSegment> =
+        HlsPlaylistSanitizer.parseAndSanitize(mediaText, baseUrl).segments.map { it.toHlsSegment() }
 
-    internal fun parseSegments(mediaText: String, baseUrl: String): List<HlsSegment> {
-        val result = mutableListOf<HlsSegment>()
-        val mapUriRegex = Regex("""URI="([^"]+)"""")
-        val mapRangeRegex = Regex("""BYTERANGE="(\d+)(?:@(\d+))?"""")
-        val byteRangeRegex = Regex("""#EXT-X-BYTERANGE:\s*(\d+)(?:@(\d+))?""", RegexOption.IGNORE_CASE)
-        val extInfRegex = Regex("""#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)""", RegexOption.IGNORE_CASE)
-
-        var pendingDuration = 0.0
-        var pendingRangeLen: Long? = null
-        var pendingRangeOffset: Long? = null
-        val nextImplicitOffsetByUri = HashMap<String, Long>()
-        var lastInitKey: String? = null
-
-        for (rawLine in mediaText.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.isEmpty()) continue
-            when {
-                line.startsWith("#EXT-X-MAP:") -> {
-                    val mapUri = mapUriRegex.find(line)?.groupValues?.getOrNull(1)
-                    if (!mapUri.isNullOrBlank()) {
-                        val resolvedMap = UrlUtils.resolveUrl(baseUrl, mapUri)
-                        val rangeMatch = mapRangeRegex.find(line)
-                        val rLen = rangeMatch?.groupValues?.getOrNull(1)?.toLongOrNull()
-                        val rOff = rangeMatch?.groupValues?.getOrNull(2)?.takeIf { it.isNotEmpty() }?.toLongOrNull()
-                            ?: if (rLen != null) 0L else null
-                        val initKey = "$resolvedMap|${rOff ?: -1}|${rLen ?: -1}"
-                        if (initKey != lastInitKey) {
-                            lastInitKey = initKey
-                            result.add(
-                                HlsSegment(
-                                    url = resolvedMap,
-                                    durationSec = 0.0,
-                                    byteRangeOffset = rOff,
-                                    byteRangeLength = rLen,
-                                    isInitMap = true
-                                )
-                            )
-                        }
-                    }
-                }
-                line.startsWith("#EXTINF:") -> {
-                    pendingDuration = extInfRegex.find(line)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
-                }
-                line.startsWith("#EXT-X-BYTERANGE:") -> {
-                    val m = byteRangeRegex.find(line)
-                    pendingRangeLen = m?.groupValues?.getOrNull(1)?.toLongOrNull()
-                    pendingRangeOffset = m?.groupValues?.getOrNull(2)?.takeIf { it.isNotEmpty() }?.toLongOrNull()
-                }
-                !line.startsWith("#") -> {
-                    val resolvedUri = UrlUtils.resolveUrl(baseUrl, line)
-                    val len = pendingRangeLen
-                    val offset = if (len != null) {
-                        val explicit = pendingRangeOffset ?: nextImplicitOffsetByUri[resolvedUri] ?: 0L
-                        nextImplicitOffsetByUri[resolvedUri] = explicit + len
-                        explicit
-                    } else null
-
-                    result.add(
-                        HlsSegment(
-                            url = resolvedUri,
-                            durationSec = pendingDuration,
-                            byteRangeOffset = offset,
-                            byteRangeLength = len,
-                            isInitMap = false
-                        )
-                    )
-                    pendingDuration = 0.0
-                    pendingRangeLen = null
-                    pendingRangeOffset = null
-                }
-            }
-        }
-        return result
-    }
+    private fun HlsParsedSegment.toHlsSegment(): HlsSegment = HlsSegment(
+        url = url,
+        durationSec = durationSec,
+        byteRangeOffset = byteRangeOffset,
+        byteRangeLength = byteRangeLength,
+        isInitMap = isInitMap,
+        keySpec = keySpec,
+        mediaSequence = mediaSequence
+    )
 
     private companion object {
         const val CONCURRENT_SEGMENTS = 5
+        const val AES_128_KEY_SIZE = 16
     }
 }

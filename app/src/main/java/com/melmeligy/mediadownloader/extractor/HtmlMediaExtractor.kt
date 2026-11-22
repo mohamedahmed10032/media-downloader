@@ -34,8 +34,23 @@ class HtmlMediaExtractor @Inject constructor(
     private val http: ExtractorHttp,
     private val hlsExtractor: HlsExtractor,
     private val dashExtractor: DashExtractor,
-    private val headlessWebExtractor: HeadlessWebExtractor
+    private val headlessWebExtractor: HeadlessWebExtractor,
+    private val progressTracker: ExtractionProgressTracker
 ) : MediaExtractor {
+
+    constructor(
+        http: ExtractorHttp,
+        hlsExtractor: HlsExtractor,
+        dashExtractor: DashExtractor,
+        headlessWebExtractor: HeadlessWebExtractor
+    ) : this(http, hlsExtractor, dashExtractor, headlessWebExtractor, ExtractionProgressTracker())
+
+    private val portalResolver = StreamingPortalResolver(
+        http = http,
+        hlsExtractor = hlsExtractor,
+        dashExtractor = dashExtractor,
+        progressTracker = progressTracker
+    )
 
     override val name = "Web page"
     override val priority = 50
@@ -88,10 +103,12 @@ class HtmlMediaExtractor @Inject constructor(
         customHeaders: Map<String, String> = emptyMap(),
         allowHeadlessFallback: Boolean = true
     ): ResolvedMedia? = coroutineScope {
+        progressTracker.update(ExtractionProgressTracker.STAGE_FETCHING)
         val pageHeaders = buildPageHeaders(url, customHeaders)
         val html = runCatching { http.fetchString(url, pageHeaders) }.getOrNull().orEmpty()
         if (html.isBlank()) {
             return@coroutineScope if (allowHeadlessFallback) {
+                progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
                 runCatching { headlessWebExtractor.extract(url) }.getOrNull()
             } else null
         }
@@ -102,14 +119,34 @@ class HtmlMediaExtractor @Inject constructor(
             baseHeaders = pageHeaders,
             allowEmbedFollow = true
         )
-        if (parsed != null && parsed.streams.isNotEmpty()) {
+        val hasVideoOrAudio = parsed?.streams?.any {
+            it.type == MediaType.VIDEO || it.type == MediaType.AUDIO
+        } == true
+        if (parsed != null && hasVideoOrAudio) {
             return@coroutineScope parsed
         }
-        if (allowHeadlessFallback) {
-            runCatching { headlessWebExtractor.extract(url) }.getOrNull()
-        } else {
-            null
+        if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
+            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            val headless = runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+            if (headless != null && headless.streams.isNotEmpty()) {
+                return@coroutineScope headless
+            }
         }
+        parsed?.takeIf { it.streams.isNotEmpty() }
+    }
+
+    private fun looksLikeStreamingOrEmbedPage(html: String): Boolean {
+        val lower = html.lowercase()
+        return lower.contains("<iframe") ||
+            lower.contains("<video") ||
+            lower.contains("data-server") ||
+            lower.contains("data-embed") ||
+            lower.contains("data-post") ||
+            lower.contains("/watch") ||
+            lower.contains("jwplayer") ||
+            lower.contains("playerjs") ||
+            lower.contains("cloudflare") ||
+            lower.contains("cf-browser-verification")
     }
 
     internal suspend fun parseHtml(
@@ -673,6 +710,61 @@ class HtmlMediaExtractor @Inject constructor(
             }
         }
 
+        // ---- 6b. Dean Edwards packed JS, PlayerJS/JWPlayer/Plyr configs, Streamtape robotlink & atob/hex ----
+        val unpackedDirectBlocks = JsUnpacker.unpackAll(html)
+        val combinedDirectText = if (unpackedDirectBlocks.isNotEmpty()) {
+            buildString {
+                append(cleanedScripts)
+                unpackedDirectBlocks.forEach { block ->
+                    append('\n')
+                    append(block)
+                }
+            }
+        } else {
+            cleanedScripts
+        }
+        val directPlayerCfg = JsUnpacker.extractPlayerConfigs(combinedDirectText)
+        directPlayerCfg.durationSec?.takeIf { it > pageDurationSec }?.let { pageDurationSec = it }
+        if (customThumb == null && !directPlayerCfg.posterUrl.isNullOrBlank()) {
+            customThumb = directPlayerCfg.posterUrl
+        }
+        directPlayerCfg.sources.forEach { src ->
+            if (src.url.contains(".m3u8", ignoreCase = true)) {
+                addExpandedHls(src.url, src.height, authoritative = true)
+            } else if (src.url.contains(".mpd", ignoreCase = true)) {
+                val expanded = runCatching { dashExtractor.extract(src.url, effectiveHeaders()) }.getOrNull()
+                expanded?.streams?.forEach { variant ->
+                    val k = MediaSniffer.dedupeKey(variant.url)
+                    if (!found.containsKey(k)) {
+                        found[k] = variant.copy(id = "html-${counter++}", headers = effectiveHeaders() + variant.headers)
+                    }
+                }
+            } else {
+                val container = containerFor(src.url, "mp4")
+                addStream(
+                    rawUrl = src.url,
+                    type = MediaType.VIDEO,
+                    container = container,
+                    label = src.label.ifBlank { if (src.height != null) "${src.height}p" else "Video" },
+                    width = src.width,
+                    height = src.height,
+                    authoritative = true
+                )
+            }
+        }
+        JsUnpacker.extractStreamtapeUrls(combinedDirectText).forEach { stUrl ->
+            addStream(stUrl, MediaType.VIDEO, "mp4", "HD Video", authoritative = true)
+        }
+        if (!authoritativeFound) {
+            JsUnpacker.decodeObfuscatedUrls(combinedDirectText).forEach { obfUrl ->
+                if (obfUrl.contains(".m3u8", ignoreCase = true)) {
+                    addExpandedHls(obfUrl, authoritative = true)
+                } else {
+                    addStream(obfUrl, MediaType.VIDEO, containerFor(obfUrl, "mp4"), "Video", authoritative = true)
+                }
+            }
+        }
+
         // ---- 7. Explicit HTML5 media elements (filtering out hover-preview / ad nodes) ----
         doc.select("video source[src], video source[data-src], source[src]").forEach { el ->
             if (isPreviewOrAdElement(el)) return@forEach
@@ -780,9 +872,56 @@ class HtmlMediaExtractor @Inject constructor(
             }
         }
 
-        // ---- 10. Follow 1-hop player iframe embeds (e.g. Arabsex / tube embed wrappers) ----
+        // ---- 10. Streaming portal unwrapping (watch/download tabs, multi-server AJAX, up to 3-hop embeds) ----
         val hasVideoOrAudio = found.values.any { it.type == MediaType.VIDEO || it.type == MediaType.AUDIO }
         if (!hasVideoOrAudio && allowEmbedFollow) {
+            val portalRes = portalResolver.resolvePortalAndEmbeds(
+                pageUrl = pageUrl,
+                html = html,
+                doc = doc,
+                baseHeaders = baseHeaders
+            )
+            if (portalRes.streams.isNotEmpty()) {
+                val rankedVideos = StreamCandidateRanker.filterAndRankVideos(
+                    portalRes.streams.filter { it.type == MediaType.VIDEO }
+                )
+                val collapsedPortalVideos = rankedVideos
+                    .groupBy { it.height }
+                    .flatMap { (h, group) ->
+                        if (h != null) {
+                            listOfNotNull(StreamCandidateRanker.pickBestForResolution(group))
+                        } else {
+                            if (rankedVideos.any { it.height != null }) emptyList() else collapseNullHeightMirrors(group)
+                        }
+                    }
+                    .sortedWith(
+                        compareByDescending<MediaStream> { it.height ?: it.bitrateKbps ?: 0 }
+                            .thenByDescending { it.sizeBytes ?: 0L }
+                    )
+                val portalNonVideos = portalRes.streams.filter { it.type != MediaType.VIDEO }
+                val finalPortalStreams = collapsedPortalVideos + portalNonVideos
+                if (finalPortalStreams.isNotEmpty()) {
+                    val thumbnail = customThumb
+                        ?: doc.select("meta[property=og:image]").attr("abs:content").ifBlank { null }
+                        ?: doc.select("meta[name=twitter:image]").attr("abs:content").ifBlank { null }
+                        ?: jsonLdThumb
+                        ?: portalRes.posterUrl
+                    val title = customTitle
+                        ?: doc.select("meta[property=og:title]").attr("content").ifBlank { null }
+                        ?: jsonLdTitle
+                        ?: doc.title().ifBlank { null }
+                        ?: UrlUtils.host(pageUrl) ?: "Media"
+                    return@coroutineScope ResolvedMedia(
+                        sourceUrl = pageUrl,
+                        title = title,
+                        thumbnailUrl = thumbnail,
+                        streams = finalPortalStreams,
+                        extractor = name
+                    )
+                }
+            }
+
+            // Fallback for specialized tube embeds (KVS/Pornhub/XVideos inside an iframe) with proper embed Referer/Origin
             val iframeUrls = doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src]")
                 .mapNotNull { el ->
                     val raw = el.absUrl("src")
@@ -800,10 +939,12 @@ class HtmlMediaExtractor @Inject constructor(
                 .take(2)
 
             for (iframeUrl in iframeUrls) {
-                val embedHeaders = buildPageHeaders(iframeUrl, baseHeaders + ("Referer" to pageUrl))
-                val iframeHtml = runCatching { http.fetchString(iframeUrl, embedHeaders) }.getOrNull().orEmpty()
+                val fetchHeaders = buildPageHeaders(iframeUrl, baseHeaders + ("Referer" to pageUrl))
+                val iframeHtml = runCatching { http.fetchString(iframeUrl, fetchHeaders) }.getOrNull().orEmpty()
                 if (iframeHtml.isNotBlank()) {
-                    val embedded = parseHtml(iframeUrl, iframeHtml, embedHeaders, allowEmbedFollow = false)
+                    // Use the iframe's own URL as Referer & Origin for streams extracted inside the iframe
+                    val iframeStreamHeaders = buildPageHeaders(iframeUrl, emptyMap())
+                    val embedded = parseHtml(iframeUrl, iframeHtml, iframeStreamHeaders, allowEmbedFollow = false)
                     if (embedded != null && embedded.streams.isNotEmpty()) {
                         val thumbnail = customThumb
                             ?: doc.select("meta[property=og:image]").attr("abs:content").ifBlank { null }
@@ -872,7 +1013,11 @@ class HtmlMediaExtractor @Inject constructor(
                                 } else {
                                     stream.headers
                                 }
+                                val finalUrl = info.finalUrl.takeIf { it.startsWith("http") }
+                                    ?.let { MediaSniffer.cleanMediaUrl(it) }
+                                    ?: stream.url
                                 val finalStream = stream.copy(
+                                    url = finalUrl,
                                     sizeBytes = info.contentLength.takeIf { it > 0 } ?: stream.sizeBytes,
                                     headers = updatedHeaders
                                 )
@@ -907,18 +1052,15 @@ class HtmlMediaExtractor @Inject constructor(
 
         if (probedStreams.isEmpty()) return@coroutineScope null
 
-        // Deduplicate same-height video variants and collapse null-height mirrors (identical size or filename)
-        val videos = probedStreams.filter { it.type == MediaType.VIDEO }
+        // Filter out pre-roll ads & short 5-45s intro bumpers when a primary feature exists, then deduplicate
+        val videos = StreamCandidateRanker.filterAndRankVideos(
+            probedStreams.filter { it.type == MediaType.VIDEO }
+        )
         val collapsedVideos = videos
             .groupBy { it.height }
             .flatMap { (h, group) ->
                 if (h != null) {
-                    val best = group.maxWithOrNull(
-                        compareBy<MediaStream> { !it.isHls && (it.sizeBytes ?: 0L) >= 500_000L }
-                            .thenBy { !it.isHls && group.none { g -> (g.sizeBytes ?: 0L) > 0L } }
-                            .thenBy { it.sizeBytes ?: 0L }
-                    )
-                    listOfNotNull(best)
+                    listOfNotNull(StreamCandidateRanker.pickBestForResolution(group))
                 } else {
                     if (videos.any { it.height != null }) emptyList() else collapseNullHeightMirrors(group)
                 }
@@ -1136,6 +1278,14 @@ class HtmlMediaExtractor @Inject constructor(
     private fun buildPageHeaders(url: String, customHeaders: Map<String, String>): Map<String, String> {
         val merged = LinkedHashMap<String, String>()
         merged["Referer"] = url
+        runCatching {
+            val uri = java.net.URI(UrlUtils.encodeNonAsciiUrl(url))
+            val scheme = uri.scheme
+            val host = uri.host
+            if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
+                merged["Origin"] = if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
+            }
+        }
         runCatching {
             CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() }?.let {
                 merged["Cookie"] = it

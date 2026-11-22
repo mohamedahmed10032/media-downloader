@@ -324,12 +324,17 @@ class DownloadManager @Inject constructor(
                     item.totalBytes.takeIf { it > 0L } ?: 0L
                 } else 0L
 
+                val configuredRetries = settingsRepository.current()
+                    .retryCount
+                    .coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES)
+
                 try {
                     hlsDownloader.download(
                         playlistUrl = item.remoteUrl,
                         headers = headers,
                         dest = stagingTs,
-                        expectedTotalBytes = videoKnownBytes
+                        expectedTotalBytes = videoKnownBytes,
+                        maxRetries = configuredRetries
                     ) { p ->
                         if (targetAudioTotal > 0L) {
                             // Keep progress aligned with target audio bytes without rolling back or spiking to video size
@@ -357,7 +362,8 @@ class DownloadManager @Inject constructor(
                                 playlistUrl = companionAudioUrl,
                                 headers = headers,
                                 dest = stagingAudioTs,
-                                expectedTotalBytes = audioKnownBytes
+                                expectedTotalBytes = audioKnownBytes,
+                                maxRetries = configuredRetries
                             ) { p ->
                                 val total = if (p.total > 0L) videoActual + p.total else -1L
                                 reportProgress(videoActual + p.downloaded, total, p.speed, p.eta)

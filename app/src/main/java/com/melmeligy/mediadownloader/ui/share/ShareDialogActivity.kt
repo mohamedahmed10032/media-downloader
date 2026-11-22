@@ -136,6 +136,7 @@ private fun ShareOverlaySheet(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
 
@@ -148,7 +149,10 @@ private fun ShareOverlaySheet(
     }
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            viewModel.cancelResolve()
+            onDismiss()
+        },
         sheetState = sheetState,
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
         containerColor = MaterialTheme.colorScheme.surface,
@@ -169,9 +173,14 @@ private fun ShareOverlaySheet(
                 state = state,
                 url = url,
                 useShimmerLoading = true,
+                loadingMessage = loadingStage,
                 defaultVideoQuality = settings.defaultVideoQuality,
                 defaultAudioBitrate = settings.defaultAudioBitrate,
                 onRetry = { viewModel.resolve(url) },
+                onCancel = {
+                    viewModel.cancelResolve()
+                    onDismiss()
+                },
                 onOpenInBrowser = onOpenInBrowser,
                 onDownload = viewModel::download,
                 onDownloadBatch = viewModel::downloadBatch

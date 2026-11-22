@@ -44,8 +44,16 @@ object HeaderExtractor {
             out["Referer"] = pageUrl
         }
 
-        if (!out.containsKey("Origin") && !pageUrl.isNullOrBlank()) {
-            originOf(pageUrl)?.let { out["Origin"] = it }
+        val effectiveReferer = out["Referer"] ?: pageUrl
+        if (!out.containsKey("Origin") && !effectiveReferer.isNullOrBlank()) {
+            originOf(effectiveReferer)?.let { out["Origin"] = it }
+        }
+
+        if (!out.containsKey("Cookie") && !effectiveReferer.isNullOrBlank()) {
+            runCatching { CookieManager.getInstance().getCookie(effectiveReferer) }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { out["Cookie"] = it }
         }
 
         return out

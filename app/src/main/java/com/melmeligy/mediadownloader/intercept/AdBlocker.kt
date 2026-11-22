@@ -18,6 +18,8 @@ object AdBlocker {
         "/vast.xml",
         "/vast?",
         "/vast/",
+        "/vast-",
+        "vast-30s-ad",
         "vast_tag=",
         "ad_tag=",
         "/adserver/",
@@ -31,7 +33,16 @@ object AdBlocker {
     )
 
     private val BUILTIN_AD_HOSTS = setOf(
-        // Tube / Adult ad networks & VAST preroll servers
+        // Tube / Adult & Movie-portal ad networks, pop-unders & VAST preroll servers
+        "llvpn.com",
+        "playertest.longtailvideo.com",
+        "acscdn.com",
+        "alwingulla.com",
+        "tzegilo.com",
+        "a-ads.com",
+        "monetag.com",
+        "adcash.com",
+        "galaksion.com",
         "exoclick.com",
         "exosrv.com",
         "exdynsrv.com",

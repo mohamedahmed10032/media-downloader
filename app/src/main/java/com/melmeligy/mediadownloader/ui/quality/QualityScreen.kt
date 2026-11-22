@@ -96,6 +96,7 @@ fun QualityScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
 
     LaunchedEffect(url) {
         if (url.isNotBlank()) viewModel.resolve(url)
@@ -110,7 +111,10 @@ fun QualityScreen(
             TopAppBar(
                 title = { Text(stringResource(R.string.quality_title)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = {
+                        viewModel.cancelResolve()
+                        onBack()
+                    }) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -121,9 +125,14 @@ fun QualityScreen(
             state = state,
             url = url,
             contentPadding = padding,
+            loadingMessage = loadingStage,
             defaultVideoQuality = settings.defaultVideoQuality,
             defaultAudioBitrate = settings.defaultAudioBitrate,
             onRetry = { viewModel.resolve(url) },
+            onCancel = {
+                viewModel.cancelResolve()
+                onBack()
+            },
             onOpenInBrowser = onOpenInBrowser,
             onDownload = viewModel::download,
             onDownloadBatch = viewModel::downloadBatch
@@ -146,9 +155,11 @@ fun ChooseFormatStateContent(
     url: String,
     contentPadding: PaddingValues = PaddingValues(0.dp),
     useShimmerLoading: Boolean = false,
+    loadingMessage: String = "Getting media formats…",
     defaultVideoQuality: VideoQuality = VideoQuality.P720,
     defaultAudioBitrate: AudioBitrate = AudioBitrate.KBPS160,
     onRetry: () -> Unit,
+    onCancel: (() -> Unit)? = null,
     onOpenInBrowser: ((String) -> Unit)? = null,
     onDownload: (MediaStream) -> Unit,
     onDownloadBatch: ((List<GallerySlide>) -> Unit)? = null
@@ -156,9 +167,35 @@ fun ChooseFormatStateContent(
     when (state) {
         is Resource.Loading -> {
             if (useShimmerLoading) {
-                when (loadingSkeletonStyleForUrl(url)) {
-                    LoadingSkeletonStyle.IMAGE_GRID -> MultiImageSheetSkeleton(contentPadding = contentPadding)
-                    LoadingSkeletonStyle.NEUTRAL -> NeutralSheetLoadingSkeleton(contentPadding = contentPadding)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = loadingMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (onCancel != null) {
+                            androidx.compose.material3.TextButton(
+                                onClick = onCancel,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+                            ) {
+                                Text("Cancel", fontSize = 13.sp)
+                            }
+                        }
+                    }
+                    when (loadingSkeletonStyleForUrl(url)) {
+                        LoadingSkeletonStyle.IMAGE_GRID -> MultiImageSheetSkeleton(contentPadding = contentPadding)
+                        LoadingSkeletonStyle.NEUTRAL -> NeutralSheetLoadingSkeleton(contentPadding = contentPadding)
+                    }
                 }
             } else {
                 LoadingState(
@@ -166,7 +203,8 @@ fun ChooseFormatStateContent(
                         .fillMaxWidth()
                         .height(280.dp)
                         .padding(contentPadding),
-                    message = "Getting media formats…"
+                    message = loadingMessage,
+                    onCancel = onCancel
                 )
             }
         }

@@ -13,6 +13,7 @@ import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.domain.repository.MediaRepository
 import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
 import com.melmeligy.mediadownloader.download.DownloadManager
+import com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker
 import com.melmeligy.mediadownloader.ui.navigation.Routes
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.Channel
@@ -30,13 +31,24 @@ class QualityViewModel @Inject constructor(
     private val mediaRepository: MediaRepository,
     private val downloadManager: DownloadManager,
     private val settingsRepository: SettingsRepository,
+    private val progressTracker: ExtractionProgressTracker,
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
+    constructor(
+        mediaRepository: MediaRepository,
+        downloadManager: DownloadManager,
+        settingsRepository: SettingsRepository,
+        savedStateHandle: SavedStateHandle
+    ) : this(mediaRepository, downloadManager, settingsRepository, ExtractionProgressTracker(), savedStateHandle)
+
     private var currentUrl: String = savedStateHandle.get<String>(Routes.ARG_URL).orEmpty()
+    private var resolveJob: kotlinx.coroutines.Job? = null
 
     val settings: StateFlow<AppSettings> = settingsRepository.settings
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
+
+    val loadingStage: StateFlow<String> = progressTracker.stage
 
     private val _state = MutableStateFlow<Resource<ResolvedMedia>>(Resource.Loading)
     val state: StateFlow<Resource<ResolvedMedia>> = _state.asStateFlow()
@@ -59,17 +71,27 @@ class QualityViewModel @Inject constructor(
     fun resolve(targetUrl: String = currentUrl) {
         if (targetUrl.isBlank()) return
         currentUrl = targetUrl
-        viewModelScope.launch {
+        resolveJob?.cancel()
+        progressTracker.reset()
+        resolveJob = viewModelScope.launch {
             _state.value = Resource.Loading
             runCatching { settingsRepository.current() }
             _state.value = try {
                 Resource.Success(mediaRepository.resolve(targetUrl))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: MediaException) {
                 Resource.Error(e.error)
             } catch (e: Exception) {
                 Resource.Error(AppError.GENERIC, e.message)
             }
         }
+    }
+
+    fun cancelResolve() {
+        resolveJob?.cancel()
+        resolveJob = null
+        progressTracker.reset()
     }
 
     fun download(stream: MediaStream) {

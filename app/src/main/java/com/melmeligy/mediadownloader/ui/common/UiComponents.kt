@@ -18,18 +18,33 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 
+import androidx.compose.material3.TextButton
+
 @Composable
-fun LoadingState(modifier: Modifier = Modifier, message: String? = null) {
+fun LoadingState(
+    modifier: Modifier = Modifier,
+    message: String? = null,
+    onCancel: (() -> Unit)? = null
+) {
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator()
             if (message != null) {
                 Text(
                     text = message,
-                    modifier = Modifier.padding(top = 16.dp),
+                    modifier = Modifier.padding(top = 16.dp, start = 24.dp, end = 24.dp),
                     style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+            if (onCancel != null) {
+                TextButton(
+                    onClick = onCancel,
+                    modifier = Modifier.padding(top = 8.dp)
+                ) {
+                    Text("Cancel")
+                }
             }
         }
     }

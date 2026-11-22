@@ -42,16 +42,20 @@ class HeadlessWebExtractor @Inject constructor(
     private val http: ExtractorHttp,
     private val hlsExtractor: HlsExtractor,
     private val dashExtractor: DashExtractor,
-    private val dispatchers: DispatcherProvider
+    private val dispatchers: DispatcherProvider,
+    private val progressTracker: ExtractionProgressTracker
 ) {
 
     private val resRegex = Regex("(?:^|[^0-9])(2160|1440|1080|720|540|480|360|240)p?(?:[^0-9]|$)", RegexOption.IGNORE_CASE)
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun extract(targetUrl: String, timeoutMs: Long = 6_800L): ResolvedMedia? = coroutineScope {
+    suspend fun extract(targetUrl: String, timeoutMs: Long = 9_500L): ResolvedMedia? = coroutineScope {
+        progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
         val localCaptured = CopyOnWriteArrayList<MediaStreamPayload>()
         var capturedTitle: String? = null
         var capturedThumb: String? = null
+        var currentPageUrl = targetUrl
+        val targetHostFamily = extractHostFamily(targetUrl)
 
         var webViewRef: WebView? = null
         try {
@@ -62,6 +66,10 @@ class HeadlessWebExtractor @Inject constructor(
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false
                         loadsImagesAutomatically = false
+                        setSupportMultipleWindows(false)
+                        javaScriptCanOpenWindowsAutomatically = false
+                        allowFileAccess = false
+                        allowContentAccess = false
                         userAgentString = Constants.DEFAULT_USER_AGENT
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
@@ -82,12 +90,38 @@ class HeadlessWebExtractor @Inject constructor(
                 )
 
                 wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView,
+                        request: WebResourceRequest
+                    ): Boolean {
+                        val reqUrl = request.url?.toString().orEmpty()
+                        if (!reqUrl.startsWith("http://") && !reqUrl.startsWith("https://")) {
+                            return true // Block intent://, market://, tel:, javascript: hijacks
+                        }
+                        if (com.melmeligy.mediadownloader.intercept.AdBlocker.isAd(reqUrl) ||
+                            MediaSniffer.isPreviewOrAdUrl(reqUrl)
+                        ) {
+                            return true // Block ad & pop-under redirects
+                        }
+                        if (request.isForMainFrame) {
+                            val nextFamily = extractHostFamily(reqUrl)
+                            val sameDomain = targetHostFamily.isNotEmpty() && nextFamily == targetHostFamily
+                            val isKnownPlayerPath = reqUrl.contains("/embed", ignoreCase = true) ||
+                                reqUrl.contains("/watch", ignoreCase = true) ||
+                                reqUrl.contains("/play", ignoreCase = true)
+                            if (!sameDomain && !isKnownPlayerPath) {
+                                return true // Block off-domain top-frame ad hijack
+                            }
+                        }
+                        return false
+                    }
+
                     override fun shouldInterceptRequest(
                         view: WebView,
                         request: WebResourceRequest
                     ): WebResourceResponse? {
                         val reqUrl = request.url.toString()
-                        if (!request.isForMainFrame && com.melmeligy.mediadownloader.intercept.AdBlocker.isAd(reqUrl)) {
+                        if (com.melmeligy.mediadownloader.intercept.AdBlocker.isAd(reqUrl)) {
                             return com.melmeligy.mediadownloader.intercept.AdBlocker.createEmptyResponse()
                         }
                         runCatching {
@@ -98,12 +132,13 @@ class HeadlessWebExtractor @Inject constructor(
                                 val accept = request.requestHeaders["Accept"]
                                 val type = MediaSniffer.classify(reqUrl, accept)
                                 if (MediaSniffer.isMedia(type)) {
+                                    val capturedHeaders = HeaderExtractor.fromRequest(request, currentPageUrl)
                                     tempEngine.submit(
                                         MediaStreamPayload(
                                             url = MediaSniffer.cleanMediaUrl(reqUrl),
                                             streamType = type,
-                                            headersMap = HeaderExtractor.fromRequest(request, targetUrl),
-                                            pageUrl = targetUrl,
+                                            headersMap = capturedHeaders,
+                                            pageUrl = currentPageUrl,
                                             mimeType = accept
                                         )
                                     )
@@ -115,9 +150,14 @@ class HeadlessWebExtractor @Inject constructor(
 
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
+                        if (!url.isNullOrBlank() && url.startsWith("http")) {
+                            currentPageUrl = url
+                            tempEngine.onPageChanged(url)
+                        }
                         if (!view.title.isNullOrBlank()) capturedTitle = view.title
                         runCatching {
                             view.evaluateJavascript(BlobBridge.SCRIPT, null)
+                            view.evaluateJavascript(STREAMING_TRIGGER_JS, null)
                             view.evaluateJavascript(
                                 "(function(){try{" +
                                     "if(window.__dlScanNow) window.__dlScanNow();" +
@@ -143,16 +183,26 @@ class HeadlessWebExtractor @Inject constructor(
             }
 
             val start = System.currentTimeMillis()
+            var triedNextServerTab = false
             while (System.currentTimeMillis() - start < timeoutMs) {
                 delay(300)
+                val elapsed = System.currentTimeMillis() - start
                 val hasAuthoritative = localCaptured.any { it.isAuthoritativePlayer }
                 val hasVideo = localCaptured.any { !MediaSniffer.isAudioTrackUrl(it.url, it.mimeType) }
                 val hasAudio = localCaptured.any { MediaSniffer.isAudioTrackUrl(it.url, it.mimeType) }
-                if (hasAuthoritative && System.currentTimeMillis() - start > 900L) {
+                if (hasAuthoritative && elapsed > 1_000L) {
                     break
                 }
-                if (hasVideo && (hasAudio || System.currentTimeMillis() - start > 2_800L)) {
+                if (hasVideo && (hasAudio || elapsed > 3_200L)) {
                     break
+                }
+                // If Server #0 produced nothing after 3.5s, try clicking the next watch server tab safely
+                if (!hasVideo && !triedNextServerTab && elapsed > 3_500L) {
+                    triedNextServerTab = true
+                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                    withContext(dispatchers.main) {
+                        runCatching { webViewRef?.evaluateJavascript(TRY_NEXT_SERVER_JS, null) }
+                    }
                 }
             }
         } finally {
@@ -166,6 +216,7 @@ class HeadlessWebExtractor @Inject constructor(
         }
 
         if (localCaptured.isEmpty()) return@coroutineScope null
+        progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
 
         if (capturedTitle.isNullOrBlank()) {
             capturedTitle = localCaptured.firstNotNullOfOrNull { it.pageTitle?.takeIf { t -> t.isNotBlank() } }
@@ -242,9 +293,11 @@ class HeadlessWebExtractor @Inject constructor(
             .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
         val bestAudio = rawAudios.firstOrNull()
 
-        val videos = resolved.filter { it.type == MediaType.VIDEO }
-            .distinctBy { it.url.substringBefore('?') }
-            .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
+        val filteredVideos = StreamCandidateRanker.filterAndRankVideos(
+            resolved.filter { it.type == MediaType.VIDEO }
+                .distinctBy { it.url.substringBefore('?') }
+        )
+        val videos = filteredVideos
             .mapIndexed { i, s ->
                 val label = when {
                     s.height != null && s.height >= 1080 -> "${s.height}p FHD"
@@ -424,5 +477,62 @@ class HeadlessWebExtractor @Inject constructor(
         }
 
         resultHolder.get()
+    }
+
+    private fun extractHostFamily(url: String): String {
+        val host = runCatching { java.net.URI(UrlUtils.encodeNonAsciiUrl(url)).host?.lowercase().orEmpty() }
+            .getOrDefault("")
+            .removePrefix("www.")
+        if (host.isEmpty()) return ""
+        val parts = host.split('.')
+        return if (parts.size >= 2) "${parts[parts.size - 2]}.${parts[parts.size - 1]}" else host
+    }
+
+    private companion object {
+        val STREAMING_TRIGGER_JS = """
+            (function(){
+              try {
+                window.open = function(){ return null; };
+                var hasMedia = document.querySelector('video, iframe[src*="embed"], iframe[src*="player"], [data-server]');
+                if (!hasMedia && !window.__dlFollowedWatch) {
+                  var curPath = (location.pathname || '').replace(/\/+$/, '');
+                  var links = document.querySelectorAll('a[href]');
+                  for (var i = 0; i < links.length; i++) {
+                    var a = links[i];
+                    if (a.hostname !== location.hostname) continue;
+                    var p = (a.pathname || '').replace(/\/+$/, '');
+                    if (p && curPath && p.indexOf(curPath + '/') === 0 && /\/(watch|play|stream)$/i.test(p)) {
+                      window.__dlFollowedWatch = true;
+                      location.href = a.href;
+                      return;
+                    }
+                  }
+                }
+                var videos = document.querySelectorAll('video');
+                for (var v = 0; v < videos.length; v++) {
+                  try { videos[v].muted = true; videos[v].play().catch(function(){}); } catch(e){}
+                }
+                var playBtns = document.querySelectorAll('.jw-display-icon-container, .plyr__control--overlaid, .vjs-big-play-button, button[aria-label*="Play" i]');
+                if (playBtns.length > 0 && playBtns[0].tagName !== 'A') {
+                  try { playBtns[0].click(); } catch(e){}
+                }
+              } catch(e) {}
+            })();
+        """.trimIndent()
+
+        val TRY_NEXT_SERVER_JS = """
+            (function(){
+              try {
+                var tabs = document.querySelectorAll('.server--item, [data-server], [data-post][data-nume]');
+                for (var i = 0; i < tabs.length; i++) {
+                  if (!tabs[i].classList.contains('active') && !tabs[i].getAttribute('data-dl-tried')) {
+                    tabs[i].setAttribute('data-dl-tried', '1');
+                    tabs[i].click();
+                    break;
+                  }
+                }
+              } catch(e) {}
+            })();
+        """.trimIndent()
     }
 }
