@@ -105,11 +105,23 @@ class HtmlMediaExtractor @Inject constructor(
     ): ResolvedMedia? = coroutineScope {
         progressTracker.update(ExtractionProgressTracker.STAGE_FETCHING)
         val pageHeaders = buildPageHeaders(url, customHeaders)
-        val html = runCatching { http.fetchString(url, pageHeaders) }.getOrNull().orEmpty()
+        val html = try {
+            http.fetchString(url, pageHeaders)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            ""
+        }
         if (html.isBlank()) {
             return@coroutineScope if (allowHeadlessFallback) {
                 progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
-                runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+                try {
+                    headlessWebExtractor.extract(url)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
             } else null
         }
 
@@ -127,7 +139,13 @@ class HtmlMediaExtractor @Inject constructor(
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
-            val headless = runCatching { headlessWebExtractor.extract(url) }.getOrNull()
+            val headless = try {
+                headlessWebExtractor.extract(url)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
             if (headless != null && headless.streams.isNotEmpty()) {
                 return@coroutineScope headless
             }

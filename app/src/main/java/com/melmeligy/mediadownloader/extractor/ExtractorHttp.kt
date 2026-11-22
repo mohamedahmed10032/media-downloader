@@ -6,6 +6,9 @@ import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.data.remote.RawContentService
 import com.melmeligy.mediadownloader.domain.extractor.ExtractorRegistry
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -70,31 +73,41 @@ class ExtractorHttp {
                     .build()
                 try {
                     client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) throw mapHttpError(response.code)
                         val ct = response.header("Content-Type")
+                        markIfHtml(url, ct)
+                        if (!response.isSuccessful) throw mapHttpError(response.code)
                         val text = response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
                         markIfHtml(url, ct ?: text.take(128))
                         text
                     }
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (e: MediaException) {
                     throw e
                 } catch (e: UnknownHostException) {
+                    currentCoroutineContext().ensureActive()
                     throw MediaException(AppError.NO_INTERNET, e.message, e)
                 } catch (e: IOException) {
+                    currentCoroutineContext().ensureActive()
                     throw MediaException(AppError.GENERIC, e.message, e)
                 }
             }
         }
         val response = try {
             service.fetch(safeUrl, merged)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: UnknownHostException) {
+            currentCoroutineContext().ensureActive()
             throw MediaException(AppError.NO_INTERNET, e.message, e)
         } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
             throw MediaException(AppError.GENERIC, e.message, e)
         }
         response.body().use { body ->
-            if (!response.isSuccessful) throw mapHttpError(response.code())
             val ct = response.headers()["Content-Type"]
+            markIfHtml(url, ct)
+            if (!response.isSuccessful) throw mapHttpError(response.code())
             val text = body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
             markIfHtml(url, ct ?: text.take(128))
             return text

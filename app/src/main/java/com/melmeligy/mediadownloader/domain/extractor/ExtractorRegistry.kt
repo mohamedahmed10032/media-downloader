@@ -6,6 +6,9 @@ import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.NetworkMonitor
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -36,14 +39,19 @@ class ExtractorRegistry @Inject constructor(
         var lastError: MediaException? = null
 
         for (extractor in willing) {
+            currentCoroutineContext().ensureActive()
             try {
                 val result = extractor.extract(url)
                 if (result != null && result.streams.isNotEmpty()) {
                     return@withContext result
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: MediaException) {
+                currentCoroutineContext().ensureActive()
                 lastError = preferMoreSpecific(lastError, e)
             } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
                 lastError = lastError ?: MediaException(AppError.GENERIC, e.message, e)
             }
         }
@@ -80,15 +88,20 @@ class ExtractorRegistry @Inject constructor(
 
         val fallback = extractors.filterNot { it.canHandle(url) }.sortedByDescending { it.priority }
         for (extractor in fallback) {
+            currentCoroutineContext().ensureActive()
             if (isConfirmedHtml(url)) break
             try {
                 val result = extractor.extract(url)
                 if (result != null && result.streams.isNotEmpty()) {
                     return@withContext result
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: MediaException) {
+                currentCoroutineContext().ensureActive()
                 lastError = preferMoreSpecific(lastError, e)
             } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
                 lastError = lastError ?: MediaException(AppError.GENERIC, e.message, e)
             }
         }
@@ -115,15 +128,19 @@ class ExtractorRegistry @Inject constructor(
             )
 
         fun markConfirmedHtml(url: String) {
-            val key = url.trim()
-            if (key.isNotEmpty()) {
-                confirmedHtmlUrls[key] = true
+            val rawKey = url.trim()
+            if (rawKey.isNotEmpty()) {
+                confirmedHtmlUrls[rawKey] = true
+                UrlUtils.normalize(rawKey)?.let { confirmedHtmlUrls[it] = true }
             }
         }
 
         fun isConfirmedHtml(url: String): Boolean {
-            val key = url.trim()
-            return key.isNotEmpty() && confirmedHtmlUrls.containsKey(key)
+            val rawKey = url.trim()
+            if (rawKey.isEmpty()) return false
+            if (confirmedHtmlUrls.containsKey(rawKey)) return true
+            val normalized = UrlUtils.normalize(rawKey) ?: return false
+            return confirmedHtmlUrls.containsKey(normalized)
         }
 
         fun clearConfirmedHtml() {

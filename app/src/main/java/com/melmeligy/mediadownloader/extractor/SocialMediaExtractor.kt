@@ -73,14 +73,16 @@ class SocialMediaExtractor @Inject constructor(
     }
 
     override suspend fun extract(url: String): ResolvedMedia? {
+        if (!canHandle(url) && !UrlUtils.isShortOrRedirectUrl(url)) return null
         val workingUrl = if (UrlUtils.isShortOrRedirectUrl(url)) {
             resolveRedirectUrl(url)
         } else {
             url
         }
+        if (!canHandle(workingUrl) && !canHandle(url)) return null
         val host = UrlUtils.host(workingUrl)?.lowercase().orEmpty()
         val timeoutMs = if (host.contains("pinterest.") || host.contains("pin.it")) 16_000L else 12_000L
-        val fastResult = runCatching {
+        val fastResult = try {
             withTimeoutOrNull(timeoutMs) {
                 when {
                     host.contains("instagram.com") || host.contains("instagr.am") -> extractInstagram(workingUrl)
@@ -93,7 +95,11 @@ class SocialMediaExtractor @Inject constructor(
                     else -> null
                 }
             }
-        }.getOrNull()
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
 
         if (fastResult != null && (fastResult.streams.isNotEmpty() || fastResult.gallerySlides.isNotEmpty())) {
             return fastResult
@@ -109,7 +115,13 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         // Fallback to Headless WebView to execute JS/GraphQL and intercept live CDN streams
-        return runCatching { headlessWebExtractor.extract(workingUrl) }.getOrNull()
+        return try {
+            headlessWebExtractor.extract(workingUrl)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun resolveRedirectUrl(rawUrl: String): String {

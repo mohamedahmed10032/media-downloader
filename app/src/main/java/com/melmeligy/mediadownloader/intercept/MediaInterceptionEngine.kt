@@ -197,7 +197,16 @@ class MediaInterceptionEngine @Inject constructor() {
         val reqPageKey = normalizePageKey(url)
         val curPageKey = normalizePageKey(currentPageUrl)
         if (url == currentPageUrl || cleaned == currentPageUrl || (reqPageKey != null && reqPageKey == curPageKey)) {
-            return current
+            val byActivePage = if (reqPageKey != null) {
+                current.filter { it.pageUrl == null || normalizePageKey(it.pageUrl) == reqPageKey }
+            } else current
+            return byActivePage.ifEmpty { current }
+        }
+        if (reqPageKey != null) {
+            val byPageUrl = current.filter {
+                it.pageUrl != null && normalizePageKey(it.pageUrl) == reqPageKey
+            }
+            if (byPageUrl.isNotEmpty()) return byPageUrl
         }
         val matched = lookup(cleaned)
         if (matched != null) {
@@ -214,7 +223,9 @@ class MediaInterceptionEngine @Inject constructor() {
 
     private fun normalizePageKey(url: String?): String? {
         val trimmed = url?.trim()?.takeIf { it.isNotEmpty() && !it.startsWith("about:") } ?: return null
-        return trimmed.substringBefore('#').trimEnd('/')
+        val noFrag = trimmed.substringBefore('#').trimEnd('/')
+        val encoded = com.melmeligy.mediadownloader.core.util.UrlUtils.encodeNonAsciiUrl(noFrag)
+        return PERCENT_HEX_REGEX.replace(encoded) { it.value.uppercase() }
     }
 
     private fun accept(key: String): Boolean {
@@ -228,5 +239,6 @@ class MediaInterceptionEngine @Inject constructor() {
     private companion object {
         const val DEDUPE_WINDOW_MS = 60_000L
         const val MAX_DETECTIONS = 50
+        val PERCENT_HEX_REGEX = Regex("%[0-9a-fA-F]{2}")
     }
 }

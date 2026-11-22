@@ -176,7 +176,7 @@ private fun ShareOverlaySheet(
                 loadingMessage = loadingStage,
                 defaultVideoQuality = settings.defaultVideoQuality,
                 defaultAudioBitrate = settings.defaultAudioBitrate,
-                onRetry = { viewModel.resolve(url) },
+                onRetry = { viewModel.resolve(url, forceRetry = true) },
                 onCancel = {
                     viewModel.cancelResolve()
                     onDismiss()

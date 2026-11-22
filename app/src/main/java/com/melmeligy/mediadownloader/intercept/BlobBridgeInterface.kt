@@ -55,14 +55,15 @@ class BlobBridgeInterface(
     fun onHttpMediaDetected(url: String, mime: String, pageUrl: String) {
         if (url.isBlank() || !(url.startsWith("http://") || url.startsWith("https://"))) return
         if (MediaSniffer.isPreviewOrAdUrl(url)) return
-        val effectivePage = pageUrl.ifBlank { engine.currentPageUrl }
-        val headers = HeaderExtractor.forUrl(url, effectivePage, null)
+        val frameRefererPage = pageUrl.ifBlank { engine.currentPageUrl }
+        val topLevelPage = engine.currentPageUrl ?: frameRefererPage
+        val headers = HeaderExtractor.forUrl(url, frameRefererPage, null)
         engine.submit(
             MediaStreamPayload(
                 url = url,
                 streamType = MediaSniffer.classify(url, mime.ifBlank { null }),
                 headersMap = headers,
-                pageUrl = effectivePage,
+                pageUrl = topLevelPage,
                 mimeType = mime.ifBlank { null }
             )
         )
@@ -80,14 +81,15 @@ class BlobBridgeInterface(
     ) {
         if (url.isBlank() || !(url.startsWith("http://") || url.startsWith("https://"))) return
         if (MediaSniffer.isPreviewOrAdUrl(url)) return
-        val effectivePage = pageUrl.ifBlank { engine.currentPageUrl }
-        val headers = HeaderExtractor.forUrl(url, effectivePage, null)
+        val frameRefererPage = pageUrl.ifBlank { engine.currentPageUrl }
+        val topLevelPage = engine.currentPageUrl ?: frameRefererPage
+        val headers = HeaderExtractor.forUrl(url, frameRefererPage, null)
         engine.submit(
             MediaStreamPayload(
                 url = url,
                 streamType = MediaSniffer.classify(url, mime.ifBlank { null }),
                 headersMap = headers,
-                pageUrl = effectivePage,
+                pageUrl = topLevelPage,
                 pageTitle = title.ifBlank { null },
                 thumbnailUrl = thumb.ifBlank { null },
                 mimeType = mime.ifBlank { null },

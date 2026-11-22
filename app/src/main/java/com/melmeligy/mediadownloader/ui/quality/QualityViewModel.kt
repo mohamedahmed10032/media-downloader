@@ -68,15 +68,23 @@ class QualityViewModel @Inject constructor(
         }
     }
 
-    fun resolve(targetUrl: String = currentUrl) {
+    fun resolve(targetUrl: String = currentUrl, forceRetry: Boolean = false) {
         if (targetUrl.isBlank()) return
+        val normalizedTarget = com.melmeligy.mediadownloader.core.util.UrlUtils.normalize(targetUrl) ?: targetUrl.trim()
+        val normalizedCurrent = com.melmeligy.mediadownloader.core.util.UrlUtils.normalize(currentUrl) ?: currentUrl.trim()
+        if (!forceRetry &&
+            normalizedTarget == normalizedCurrent &&
+            (resolveJob?.isActive == true || _state.value is Resource.Success)
+        ) {
+            return
+        }
         currentUrl = targetUrl
         resolveJob?.cancel()
         progressTracker.reset()
-        resolveJob = viewModelScope.launch {
+        val job = viewModelScope.launch {
             _state.value = Resource.Loading
             runCatching { settingsRepository.current() }
-            _state.value = try {
+            val nextState = try {
                 Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -85,7 +93,11 @@ class QualityViewModel @Inject constructor(
             } catch (e: Exception) {
                 Resource.Error(AppError.GENERIC, e.message)
             }
+            if (kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]?.isActive == true) {
+                _state.value = nextState
+            }
         }
+        resolveJob = job
     }
 
     fun cancelResolve() {
