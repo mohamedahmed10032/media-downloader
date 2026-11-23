@@ -999,7 +999,17 @@ class HtmlMediaExtractor @Inject constructor(
                     .groupBy { it.height }
                     .flatMap { (h, group) ->
                         if (h != null) {
-                            listOfNotNull(StreamCandidateRanker.pickBestForResolution(group))
+                            val best = StreamCandidateRanker.pickBestForResolution(group)
+                            if (best != null) {
+                                val bestHost = UrlUtils.host(best.url)?.lowercase()
+                                val backup = group.firstOrNull { alt ->
+                                    alt.url != best.url &&
+                                        (bestHost == null || UrlUtils.host(alt.url)?.lowercase() != bestHost)
+                                } ?: group.firstOrNull { it.url != best.url }
+                                listOf(attachBackupMirror(best, backup))
+                            } else {
+                                emptyList()
+                            }
                         } else {
                             if (rankedVideos.any { it.height != null }) emptyList() else collapseNullHeightMirrors(group)
                         }
@@ -1019,11 +1029,11 @@ class HtmlMediaExtractor @Inject constructor(
                         jsonLdThumb = jsonLdThumb,
                         playerPoster = portalRes.posterUrl
                     )
-                    val title = customTitle
-                        ?: doc.select("meta[property=og:title]").attr("content").ifBlank { null }
-                        ?: jsonLdTitle
-                        ?: doc.title().ifBlank { null }
-                        ?: UrlUtils.host(pageUrl) ?: "Media"
+                    val title = HtmlThumbnailExtractor.extractTitle(
+                        doc = doc,
+                        pageUrl = pageUrl,
+                        preferredTitle = customTitle ?: jsonLdTitle
+                    )
                     return@coroutineScope ResolvedMedia(
                         sourceUrl = pageUrl,
                         title = title,
@@ -1485,6 +1495,22 @@ class HtmlMediaExtractor @Inject constructor(
         val ext = UrlUtils.fileExtension(url) ?: return null
         val type = UrlUtils.mediaTypeForExtension(ext) ?: return null
         return type to ext
+    }
+
+    private fun attachBackupMirror(primary: MediaStream, backup: MediaStream?): MediaStream {
+        if (backup == null || backup.url == primary.url) return primary
+        val cleanBackupHeaders = backup.headers.filterKeys { !it.startsWith("X-Internal-", ignoreCase = true) }
+        val extra = LinkedHashMap<String, String>(primary.headers).apply {
+            put("X-Internal-Fallback-Url", backup.url)
+            put("X-Internal-Fallback-IsHls", backup.isHls.toString())
+            if (backup.container.isNotBlank()) {
+                put("X-Internal-Fallback-Container", backup.container)
+            }
+            if (cleanBackupHeaders.isNotEmpty()) {
+                put("X-Internal-Fallback-Headers", com.melmeligy.mediadownloader.core.util.JsonUtils.mapToJson(cleanBackupHeaders))
+            }
+        }
+        return primary.copy(headers = extra)
     }
 
     private fun defaultLabel(type: MediaType): String = when (type) {

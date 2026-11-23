@@ -31,7 +31,8 @@ class BrowserViewModel @Inject constructor(
     private val mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository,
     private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager,
     private val settingsRepository: SettingsRepository,
-    private val streamSizeRefiner: com.melmeligy.mediadownloader.extractor.StreamSizeRefiner
+    private val streamSizeRefiner: com.melmeligy.mediadownloader.extractor.StreamSizeRefiner,
+    private val thumbnailCache: com.melmeligy.mediadownloader.download.DownloadThumbnailCache
 ) : ViewModel() {
 
     private var nextId = 2L
@@ -53,6 +54,7 @@ class BrowserViewModel @Inject constructor(
 
     private var resolveJob: kotlinx.coroutines.Job? = null
     private var sizeRefineJob: kotlinx.coroutines.Job? = null
+    private var thumbCacheJob: kotlinx.coroutines.Job? = null
     private var currentSheetUrl: String = ""
 
     init {
@@ -67,6 +69,7 @@ class BrowserViewModel @Inject constructor(
     fun prepareSheetLoading() {
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
+        thumbCacheJob?.cancel()
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
 
@@ -74,6 +77,7 @@ class BrowserViewModel @Inject constructor(
         currentSheetUrl = targetUrl
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
+        thumbCacheJob?.cancel()
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
         }
@@ -93,18 +97,38 @@ class BrowserViewModel @Inject constructor(
                 )
             }
             _formatState.value = nextState
-            if (nextState is com.melmeligy.mediadownloader.core.Resource.Success &&
-                streamSizeRefiner.needsRefinement(nextState.data)
-            ) {
+            if (nextState is com.melmeligy.mediadownloader.core.Resource.Success) {
                 val resolved = nextState.data
-                sizeRefineJob = viewModelScope.launch {
-                    val refined = runCatching { streamSizeRefiner.refineMissingSizes(resolved) }.getOrNull()
-                        ?: return@launch
-                    if (currentSheetUrl == targetUrl &&
-                        _formatState.value is com.melmeligy.mediadownloader.core.Resource.Success
-                    ) {
-                        _formatState.value = com.melmeligy.mediadownloader.core.Resource.Success(refined)
-                        (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.updateCached(refined)
+                if (streamSizeRefiner.needsRefinement(resolved)) {
+                    sizeRefineJob = viewModelScope.launch {
+                        val refined = runCatching { streamSizeRefiner.refineMissingSizes(resolved) }.getOrNull()
+                            ?: return@launch
+                        val latest = (_formatState.value as? com.melmeligy.mediadownloader.core.Resource.Success)?.data
+                        if (currentSheetUrl == targetUrl && latest != null) {
+                            val merged = refined.copy(thumbnailUrl = latest.thumbnailUrl ?: refined.thumbnailUrl)
+                            _formatState.value = com.melmeligy.mediadownloader.core.Resource.Success(merged)
+                            (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.updateCached(merged)
+                        }
+                    }
+                }
+                val remoteThumb = resolved.thumbnailUrl?.trim()
+                    ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+                if (remoteThumb != null) {
+                    val streamHeaders = resolved.streams.firstOrNull { it.headers.isNotEmpty() }?.headers.orEmpty()
+                    thumbCacheJob = viewModelScope.launch {
+                        val cachedFile = runCatching {
+                            thumbnailCache.cachePreviewThumbnail(
+                                thumbnailUrl = remoteThumb,
+                                sourceUrl = resolved.sourceUrl,
+                                headers = streamHeaders
+                            )
+                        }.getOrNull() ?: return@launch
+                        val latest = (_formatState.value as? com.melmeligy.mediadownloader.core.Resource.Success)?.data
+                        if (currentSheetUrl == targetUrl && latest != null) {
+                            val updated = latest.copy(thumbnailUrl = cachedFile.absolutePath)
+                            _formatState.value = com.melmeligy.mediadownloader.core.Resource.Success(updated)
+                            (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.updateCached(updated)
+                        }
                     }
                 }
             }

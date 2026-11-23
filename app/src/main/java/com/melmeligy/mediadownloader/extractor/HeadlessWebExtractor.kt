@@ -70,6 +70,7 @@ class HeadlessWebExtractor @Inject constructor(
             HtmlThumbnailExtractor.resolveValidImageCandidate(prefetched?.second, targetUrl)
         )
         var currentPageUrl = targetUrl
+        val lastEmbedIframeUrl = AtomicReference<String?>(null)
         val targetHostFamily = extractHostFamily(targetUrl)
 
         val destroyed = AtomicBoolean(false)
@@ -89,9 +90,16 @@ class HeadlessWebExtractor @Inject constructor(
 
         fun hasValidThumb(): Boolean = !capturedThumbRef.get().isNullOrBlank()
 
-        fun scrapeMetadataFromWebView(view: WebView, pageUrlForResolve: String, tempEngine: MediaInterceptionEngine) {
+        fun scrapeMetadataFromWebView(
+            view: WebView,
+            pageUrlForResolve: String,
+            tempEngine: MediaInterceptionEngine,
+            isFinalPass: Boolean
+        ) {
             if (destroyed.get()) return
-            metadataScrapeTriggered.set(true)
+            if (isFinalPass) {
+                metadataScrapeTriggered.set(true)
+            }
             runCatching {
                 val pageViewTitle = view.title?.trim()
                 if (!pageViewTitle.isNullOrBlank() &&
@@ -123,7 +131,11 @@ class HeadlessWebExtractor @Inject constructor(
                             }
                         }
                     }
-                    metadataScrapeCompleted.set(true)
+                    // Never mark metadata scrape complete on an early onPageCommitVisible pass if the
+                    // real title/poster haven't rendered yet (e.g. Cloudflare interstitial or lazy DOM).
+                    if (isFinalPass || pageFinished.get() || (hasValidTitle() && hasValidThumb())) {
+                        metadataScrapeCompleted.set(true)
+                    }
                     wakeSignal.trySend(Unit)
                 }
             }
@@ -204,6 +216,18 @@ class HeadlessWebExtractor @Inject constructor(
                         val reqUrl = request.url.toString()
                         val accept = request.requestHeaders["Accept"]
 
+                        // Track sub-frame embed player URLs so media requests with stripped Referer still inherit the real embed origin
+                        if (!request.isForMainFrame &&
+                            accept?.contains("text/html", ignoreCase = true) == true &&
+                            reqUrl.startsWith("http", ignoreCase = true) &&
+                            !AdBlocker.isAd(reqUrl)
+                        ) {
+                            val subFamily = extractHostFamily(reqUrl)
+                            if (subFamily.isNotEmpty() && subFamily != targetHostFamily) {
+                                lastEmbedIframeUrl.set(reqUrl)
+                            }
+                        }
+
                         // Always inspect for media streams FIRST so real CDN streams are never blocked
                         var detectedMedia = false
                         runCatching {
@@ -215,7 +239,8 @@ class HeadlessWebExtractor @Inject constructor(
                                 val type = MediaSniffer.classify(reqUrl, accept)
                                 if (MediaSniffer.isMedia(type)) {
                                     detectedMedia = true
-                                    val capturedHeaders = HeaderExtractor.fromRequest(request, currentPageUrl)
+                                    val fallbackRefererPage = lastEmbedIframeUrl.get() ?: currentPageUrl
+                                    val capturedHeaders = HeaderExtractor.fromRequest(request, fallbackRefererPage)
                                     tempEngine.submit(
                                         MediaStreamPayload(
                                             url = MediaSniffer.cleanMediaUrl(reqUrl),
@@ -248,7 +273,7 @@ class HeadlessWebExtractor @Inject constructor(
                             view.evaluateJavascript(STREAMING_TRIGGER_JS, null)
                         }
                         if (!hasValidTitle() || !hasValidThumb()) {
-                            scrapeMetadataFromWebView(view, url ?: targetUrl, tempEngine)
+                            scrapeMetadataFromWebView(view, url ?: targetUrl, tempEngine, isFinalPass = false)
                         }
                     }
 
@@ -265,7 +290,7 @@ class HeadlessWebExtractor @Inject constructor(
                             view.evaluateJavascript(STREAMING_TRIGGER_JS, null)
                         }
                         if (!hasValidTitle() || !hasValidThumb() || !metadataScrapeCompleted.get()) {
-                            scrapeMetadataFromWebView(view, url ?: targetUrl, tempEngine)
+                            scrapeMetadataFromWebView(view, url ?: targetUrl, tempEngine, isFinalPass = true)
                         } else {
                             wakeSignal.trySend(Unit)
                         }
@@ -295,7 +320,7 @@ class HeadlessWebExtractor @Inject constructor(
                     EarlyExitDecision.TRIGGER_METADATA_SCRAPE -> {
                         if (!metadataScrapeTriggered.getAndSet(true)) {
                             withContext(dispatchers.main) {
-                                webViewRef?.let { scrapeMetadataFromWebView(it, currentPageUrl, tempEngineRef) }
+                                webViewRef?.let { scrapeMetadataFromWebView(it, currentPageUrl, tempEngineRef, isFinalPass = true) }
                             }
                         }
                     }
@@ -360,52 +385,51 @@ class HeadlessWebExtractor @Inject constructor(
                     val headers = payload.headersMap
                     when (payload.streamType) {
                         StreamType.HLS -> runCatching {
-                            if (payload.qualityHint != null) {
-                                hlsExtractor.extract(cleanUrl, headers, payload.qualityHint)?.streams
-                            } else {
-                                hlsExtractor.extract(cleanUrl, headers)?.streams
-                            }
+                            hlsExtractor.extractVerified(cleanUrl, headers, payload.qualityHint)?.streams
                         }.getOrNull().orEmpty()
-                    StreamType.DASH -> runCatching { dashExtractor.extract(cleanUrl, headers)?.streams }.getOrNull().orEmpty()
-                    StreamType.PROGRESSIVE -> {
-                        val info = runCatching { http.probe(cleanUrl, headers) }.getOrNull()
-                        if (info != null && info.code !in 200..299) {
-                            emptyList()
-                        } else {
-                            val contentType = (info?.contentType ?: payload.mimeType.orEmpty()).lowercase()
-                            if (contentType.startsWith("text/html") ||
-                                contentType.startsWith("application/json") ||
-                                contentType.startsWith("image/")
-                            ) {
+                        StreamType.DASH -> runCatching { dashExtractor.extract(cleanUrl, headers)?.streams }.getOrNull().orEmpty()
+                        StreamType.PROGRESSIVE -> {
+                            val probed = probeHeadlessProgressiveWithFallback(cleanUrl, headers)
+                            if (probed == null) {
                                 emptyList()
                             } else {
-                                val isAudio = MediaSniffer.isAudioTrackUrl(cleanUrl, contentType)
-                                val type = if (isAudio) MediaType.AUDIO else MediaType.VIDEO
-                                val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, cleanUrl, contentType)
-                                val size = info?.contentLength?.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
-                                val height = payload.qualityHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(cleanUrl)
-                                if (size != null && size in 1..40_000L) {
+                                val (info, workingHeaders) = probed
+                                val contentType = (info.contentType ?: payload.mimeType.orEmpty()).lowercase()
+                                if (ExtractorHttp.isRejectedMediaContentType(contentType)) {
                                     emptyList()
                                 } else {
-                                    listOf(
-                                        MediaStream(
-                                            id = "hl-$idx",
-                                            url = info?.finalUrl?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl,
-                                            type = type,
-                                            container = container,
-                                            label = if (type == MediaType.AUDIO) "Original Audio (${container.uppercase()})"
-                                            else if (height != null) "${height}p" else "HD Video",
-                                            height = height,
-                                            sizeBytes = size,
-                                            isHls = false,
-                                            headers = headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                    val isAudio = MediaSniffer.isAudioTrackUrl(cleanUrl, contentType)
+                                    val type = if (isAudio) MediaType.AUDIO else MediaType.VIDEO
+                                    val container = MediaSniffer.containerFor(StreamType.PROGRESSIVE, cleanUrl, contentType)
+                                    val size = info.contentLength.takeIf { it > 0 } ?: payload.sizeBytes?.takeIf { it > 0 }
+                                    val height = payload.qualityHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(cleanUrl)
+                                    if (size != null && size in 1..40_000L) {
+                                        emptyList()
+                                    } else {
+                                        val finalHeaders = LinkedHashMap<String, String>(
+                                            workingHeaders.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                        ).apply {
+                                            if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
+                                        }
+                                        listOf(
+                                            MediaStream(
+                                                id = "hl-$idx",
+                                                url = info.finalUrl.takeIf { it.startsWith("http") }?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl,
+                                                type = type,
+                                                container = container,
+                                                label = if (type == MediaType.AUDIO) "Original Audio (${container.uppercase()})"
+                                                else if (height != null) "${height}p" else "HD Video",
+                                                height = height,
+                                                sizeBytes = size,
+                                                isHls = false,
+                                                headers = finalHeaders
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             }
                         }
-                    }
-                    else -> emptyList()
+                        else -> emptyList()
                     }
                 }
             }.awaitAll().flatten()
@@ -624,6 +648,33 @@ class HeadlessWebExtractor @Inject constructor(
         resultHolder.get()
     }
 
+    private fun probeHeadlessProgressiveWithFallback(
+        url: String,
+        primaryHeaders: Map<String, String>
+    ): Pair<HeadInfo, Map<String, String>>? {
+        val candidates = listOf(primaryHeaders) +
+            ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)
+        for (hdrs in candidates) {
+            val info = try {
+                http.probe(url, hdrs, POST_CAPTURE_PROBE_TIMEOUT_MS)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
+                if (me.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED) continue
+                return null
+            } catch (_: Exception) {
+                return null
+            }
+            if (info.code in 200..299 && !ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+                return info to hdrs
+            }
+            if (info.code != 401 && info.code != 403) {
+                return null
+            }
+        }
+        return null
+    }
+
     private fun extractHostFamily(url: String): String {
         val host = runCatching { java.net.URI(UrlUtils.encodeNonAsciiUrl(url)).host?.lowercase().orEmpty() }
             .getOrDefault("")
@@ -644,7 +695,7 @@ class HeadlessWebExtractor @Inject constructor(
         private const val MAX_METADATA_HINTS = 32
         private const val EARLY_EXIT_TICK_MS = 120L
         private const val NEXT_SERVER_TAB_DELAY_MS = 1_800L
-        private const val POST_CAPTURE_PROBE_TIMEOUT_MS = 2_000L
+        private const val POST_CAPTURE_PROBE_TIMEOUT_MS = 3_000L
         private const val SELF_CONTAINED_SETTLE_MS = 220L
         private const val SPLIT_DASH_AUDIO_WAIT_MS = 750L
         private const val METADATA_SCRAPE_MAX_WAIT_MS = 750L
@@ -813,15 +864,17 @@ class HeadlessWebExtractor @Inject constructor(
             "(function(){try{" +
                 "if(window.__dlScanNow) window.__dlScanNow();" +
                 "function abs(u){if(!u)return '';try{var r=new URL(u,location.href).href;return /^https?:\\/\\//i.test(r)?r:'';}catch(e){return '';}}" +
+                "function cssUrl(s){if(!s)return '';var m=s.match(/url\\(\\s*(?:'([^']+)'|\"([^\"]+)\"|([^)'\"\\s]+))\\s*\\)/i);return m?(m[1]||m[2]||m[3]||''):'';}" +
                 "var sels=['meta[property=\"og:image:secure_url\"]','meta[property=\"og:image\"]','meta[property=\"og:image:url\"]','meta[name=\"og:image\"]','meta[name=\"twitter:image\"]','meta[property=\"twitter:image\"]','meta[name=\"twitter:image:src\"]','meta[itemprop=\"thumbnailUrl\"]','meta[itemprop=\"image\"]','meta[name=\"thumbnail\"]'];" +
                 "var img='';" +
                 "for(var s=0;s<sels.length&&!img;s++){var m=document.querySelector(sels[s]);if(m&&m.content)img=abs(m.content);}" +
                 "if(!img){var l=document.querySelector('link[rel=\"image_src\"]');if(l&&l.href)img=abs(l.href);}" +
                 "if(!img){var v=document.querySelector('video[poster],video[data-poster]');if(v)img=abs(v.getAttribute('poster')||v.getAttribute('data-poster'));}" +
-                "if(!img){var p=document.querySelector('[data-poster],[data-thumb],[data-thumbnail],[data-bg],[data-background]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail')||p.getAttribute('data-bg')||p.getAttribute('data-background'));}" +
+                "if(!img){var p=document.querySelector('[data-poster],[data-poster-url],[data-thumb],[data-thumbnail],[data-bg],[data-bg-src],[data-lazy-bg],[data-image-src],[data-background]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-poster-url')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail')||p.getAttribute('data-bg')||p.getAttribute('data-bg-src')||p.getAttribute('data-lazy-bg')||p.getAttribute('data-image-src')||p.getAttribute('data-background'));}" +
                 "if(!img){try{var lds=document.querySelectorAll('script[type=\"application/ld+json\"]');for(var i=0;i<lds.length&&!img;i++){var d=JSON.parse(lds[i].textContent||'{}');var arr=Array.isArray(d)?d:(d['@graph']?[d].concat(d['@graph']):[d]);for(var j=0;j<arr.length&&!img;j++){var it=arr[j]||{};var c=it.thumbnailUrl||it.image||it.primaryImageOfPage||it.thumbnail;if(Array.isArray(c))c=c[0];if(c&&typeof c==='object')c=c.contentUrl||c.url||c['@id'];if(typeof c==='string'&&c)img=abs(c);}}}catch(e){}}" +
-                "if(!img){var cn=document.querySelectorAll('.BG--Mycima-Single,.wecima,.mycima,.Poster,.poster,.Single--Poster,.jw-preview,.vjs-poster,.plyr__poster,[data-lazy-style],[style*=\"--image\"],[style*=\"background-image\"]');for(var k=0;k<cn.length&&!img;k++){var st=(cn[k].getAttribute('data-lazy-style')||'')+' '+(cn[k].getAttribute('style')||'');var cm=st.match(/url\\(\\s*['\"]?([^'\")\\s]+)['\"]?\\s*\\)/i);if(cm&&cm[1])img=abs(cm[1]);}}" +
-                "if(!img){var ims=document.querySelectorAll('.Poster img,.poster img,.Single--Poster img,.thumb img,.thumbnail img,img.wp-post-image,img[class*=\"poster\" i],img[class*=\"thumb\" i],img[class*=\"cover\" i]');for(var n=0;n<ims.length&&!img;n++){var ci=ims[n].getAttribute('data-lazy-src')||ims[n].getAttribute('data-src')||ims[n].getAttribute('data-original')||ims[n].currentSrc||ims[n].src;if(ci&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(ci))img=abs(ci);}}" +
+                "if(!img){var cn=document.querySelectorAll('.BG--Mycima-Single,.Separate--Poster,.BG--GridItem,.Thumb--GridItem,.PosterBlock,.wecima,.mycima,.Poster,.poster,.Single--Poster,.jw-preview,.vjs-poster,.plyr__poster,[data-lazy-style],[style*=\"--image\"],[style*=\"background-image\"]');for(var k=0;k<cn.length&&!img;k++){var st=(cn[k].getAttribute('data-lazy-style')||'')+' '+(cn[k].getAttribute('style')||'');var cu=cssUrl(st);if(!cu&&window.getComputedStyle){try{var cs=window.getComputedStyle(cn[k]);cu=cssUrl((cs.backgroundImage||'')+' '+(cs.getPropertyValue('--image')||''));}catch(e){}}if(cu&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(cu))img=abs(cu);}}" +
+                "if(!img){var sts=document.querySelectorAll('style');for(var x=0;x<sts.length&&!img;x++){var sm=(sts[x].textContent||'').match(/(?:BG--Mycima-Single|Single--Poster|Separate--Poster|Poster|--image)[^}]{0,400}?url\\(\\s*(?:'([^']+)'|\"([^\"]+)\"|([^)'\"\\s]+))\\s*\\)/i);if(sm){img=abs(sm[1]||sm[2]||sm[3]||'');}}}" +
+                "if(!img){var ims=document.querySelectorAll('.Poster img,.poster img,.Single--Poster img,.Separate--Poster img,.PosterBlock img,.thumb img,.thumbnail img,img.wp-post-image,img[class*=\"poster\" i],img[class*=\"thumb\" i],img[class*=\"cover\" i]');for(var n=0;n<ims.length&&!img;n++){var ci=ims[n].getAttribute('data-lazy-src')||ims[n].getAttribute('data-src')||ims[n].getAttribute('data-original')||ims[n].currentSrc||ims[n].src;if(ci&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(ci))img=abs(ci);}}" +
                 "var ogTitle=document.querySelector('meta[property=\"og:title\"],meta[name=\"twitter:title\"]');" +
                 "var h1=document.querySelector('h1');" +
                 "var bestTitle=(ogTitle&&ogTitle.content)||(h1&&h1.innerText)||document.title||'';" +

@@ -219,6 +219,15 @@ class MovieSitesEngineTest {
                             .body(variantM3u8.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
                             .build()
                     }
+                    url.startsWith("https://cdn-hls.example/hls2/seg_") -> {
+                        Response.Builder()
+                            .request(req).protocol(Protocol.HTTP_1_1).code(206).message("Partial Content")
+                            .header("Content-Type", "video/mp2t")
+                            .header("Content-Range", "bytes 0-0/2000000")
+                            .header("Accept-Ranges", "bytes")
+                            .body(byteArrayOf(0x47).toResponseBody("video/mp2t".toMediaType()))
+                            .build()
+                    }
                     url == "https://gamescdn.example/dl/video.mp4" -> {
                         req.header("Referer")?.let { observedMp4Headers["Referer"] = it }
                         req.header("Origin")?.let { observedMp4Headers["Origin"] = it }

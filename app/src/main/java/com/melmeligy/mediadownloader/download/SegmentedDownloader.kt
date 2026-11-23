@@ -52,6 +52,7 @@ class SegmentedDownloader @Inject constructor(
     ) = coroutineScope {
         dest.parentFile?.mkdirs()
 
+        var effectiveHeaders = headers
         val isGoogleVideo = url.contains("googlevideo.com", ignoreCase = true)
         var total = knownTotal
         if (total <= 0 && isGoogleVideo) {
@@ -59,19 +60,15 @@ class SegmentedDownloader @Inject constructor(
         }
         var ranged = acceptsRanges || isGoogleVideo
         if (total <= 0 || !ranged) {
-            val info = withContext(Dispatchers.IO) {
-                try {
-                    http.probe(url, headers)
-                } catch (e: MediaException) {
-                    if (isPermanentError(e.error)) throw e
-                    null
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            if (info != null) {
+            val probed = probeWithHeaderFallback(url, effectiveHeaders)
+            if (probed != null) {
+                val (info, workingHeaders) = probed
+                effectiveHeaders = workingHeaders
                 if (info.code !in 200..299 && info.code != 405 && info.code != 416) {
                     throw http.mapHttpError(info.code)
+                }
+                if (ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+                    throw MediaException(AppError.EXPIRED_LINK, "Media URL returned non-media content (${info.contentType})")
                 }
                 if (total <= 0 && info.contentLength > 0) total = info.contentLength
                 ranged = ranged || info.acceptsRanges
@@ -87,7 +84,7 @@ class SegmentedDownloader @Inject constructor(
 
         val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && effectiveSegments > 1
         if (!canSegment) {
-            singleStream(url, headers, dest, total, ranged, isGoogleVideo, onProgress)
+            singleStream(url, effectiveHeaders, dest, total, ranged, isGoogleVideo, onProgress)
             return@coroutineScope
         }
 
@@ -104,7 +101,7 @@ class SegmentedDownloader @Inject constructor(
         val downloaded = AtomicLong(positions.indices.sumOf { positions[it] - bounds[it].first })
 
         val tracker = SpeedTracker(downloaded.get())
-        val progressJob = launch {
+        val progressJob = launch(Dispatchers.Default) {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
                 emit(downloaded.get().coerceAtMost(total), total, tracker, onProgress)
@@ -117,12 +114,14 @@ class SegmentedDownloader @Inject constructor(
             coroutineScope {
                 val tasks = (0 until n).map { i ->
                     async(Dispatchers.IO) {
-                        downloadSegment(url, headers, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo)
+                        downloadSegment(url, effectiveHeaders, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo)
                     }
                 }
                 tasks.awaitAll()
             }
         } catch (_: RangeNotSupportedException) {
+            fallbackToSingleStream = true
+        } catch (_: ParallelConnectionRejectedException) {
             fallbackToSingleStream = true
         } finally {
             progressJob.cancel()
@@ -134,7 +133,7 @@ class SegmentedDownloader @Inject constructor(
         if (fallbackToSingleStream) {
             runCatching { idxFile.delete() }
             runCatching { dest.delete() }
-            singleStream(url, headers, dest, total, acceptsRanges = false, isGoogleVideo = false, onProgress = onProgress)
+            singleStream(url, effectiveHeaders, dest, total, acceptsRanges = false, isGoogleVideo = false, onProgress = onProgress)
             return@coroutineScope
         }
 
@@ -148,7 +147,40 @@ class SegmentedDownloader @Inject constructor(
         onProgress(DownloadProgress(total, total, 0, 0))
     }
 
+    private suspend fun probeWithHeaderFallback(
+        url: String,
+        primaryHeaders: Map<String, String>
+    ): Pair<HeadInfo, Map<String, String>>? = withContext(Dispatchers.IO) {
+        val candidates = listOf(primaryHeaders) +
+            ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)
+        var lastPermanent: MediaException? = null
+        for (hdrs in candidates) {
+            val info = try {
+                http.probe(url, hdrs)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: MediaException) {
+                if (e.error == AppError.GEO_BLOCKED) {
+                    lastPermanent = e
+                    continue
+                }
+                if (isPermanentError(e.error)) throw e
+                return@withContext null
+            } catch (_: Exception) {
+                return@withContext null
+            }
+            if (info.code == 401 || info.code == 403) {
+                lastPermanent = http.mapHttpError(info.code)
+                continue
+            }
+            return@withContext info to hdrs
+        }
+        if (lastPermanent != null) throw lastPermanent
+        null
+    }
+
     private class RangeNotSupportedException : Exception("Server returned HTTP 200 instead of 206 for Range request")
+    private class ParallelConnectionRejectedException(code: Int) : Exception("Parallel Range connection rejected with HTTP $code")
 
     private suspend fun downloadSegment(
         url: String,
@@ -183,8 +215,15 @@ class SegmentedDownloader @Inject constructor(
                     if (response.code == 200 && (startByte > 0L || chunkEnd < total - 1L)) {
                         throw RangeNotSupportedException()
                     }
+                    // Many movie CDNs enforce 1 connection per IP/token and return 403/429/503 on parallel ranges -> degrade cleanly to singleStream
+                    if (response.code == 403 || response.code == 429 || response.code == 503) {
+                        throw ParallelConnectionRejectedException(response.code)
+                    }
                     if (response.code != 206 && !response.isSuccessful) {
                         throw http.mapHttpError(response.code)
+                    }
+                    if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"))) {
+                        throw MediaException(AppError.EXPIRED_LINK, "Segment returned HTML instead of media")
                     }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
                     RandomAccessFile(dest, "rw").use { raf ->
@@ -215,6 +254,8 @@ class SegmentedDownloader @Inject constructor(
                 throw e
             } catch (e: RangeNotSupportedException) {
                 throw e
+            } catch (e: ParallelConnectionRejectedException) {
+                throw e
             } catch (e: MediaException) {
                 currentCoroutineContext().ensureActive()
                 if (isPermanentError(e.error)) throw e
@@ -241,13 +282,17 @@ class SegmentedDownloader @Inject constructor(
     ) = coroutineScope {
         val downloaded = AtomicLong(if (dest.exists()) dest.length() else 0L)
         val tracker = SpeedTracker(downloaded.get())
-        val progressJob = launch {
+        val progressJob = launch(Dispatchers.Default) {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
                 emit(downloaded.get(), total, tracker, onProgress)
             }
         }
 
+        var activeHeaders = headers
+        val relaxedHeaderQueue = ArrayDeque(
+            ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
+        )
         var attempt = 0
         try {
             while (total <= 0 || downloaded.get() < total) {
@@ -258,7 +303,7 @@ class SegmentedDownloader @Inject constructor(
                     dest.delete()
                 }
 
-                val builder = http.buildRequest(url, headers)
+                val builder = http.buildRequest(url, activeHeaders)
                     .header("X-Internal-Download", "true")
                 if (isGoogleVideo && total > 0L) {
                     val chunkEnd = minOf(total - 1L, existing + GOOGLE_VIDEO_CHUNK_BYTES - 1L)
@@ -273,6 +318,9 @@ class SegmentedDownloader @Inject constructor(
                     var responseContentLength = -1L
                     client.executeCancellable(request) { response ->
                         if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
+                        if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"))) {
+                            throw MediaException(AppError.EXPIRED_LINK, "Stream returned HTML instead of media")
+                        }
                         val isPartial = response.code == 206
                         val append = (canResume || existing > 0L) && isPartial
                         if (!append && existing > 0) {
@@ -309,6 +357,10 @@ class SegmentedDownloader @Inject constructor(
                     throw ce
                 } catch (e: MediaException) {
                     currentCoroutineContext().ensureActive()
+                    if (e.error == AppError.GEO_BLOCKED && relaxedHeaderQueue.isNotEmpty()) {
+                        activeHeaders = relaxedHeaderQueue.removeFirst()
+                        continue
+                    }
                     if (isPermanentError(e.error)) throw e
                     attempt++
                     if (attempt >= Constants.SEGMENT_MAX_RETRIES) throw e

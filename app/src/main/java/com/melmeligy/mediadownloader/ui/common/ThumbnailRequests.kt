@@ -58,11 +58,12 @@ internal fun buildThumbnailImageRequest(
         is ThumbnailCandidate.LocalFile -> builder.data(candidate.file)
         is ThumbnailCandidate.ContentUri -> builder.data(candidate.uriString.toUri())
         is ThumbnailCandidate.RemoteUrl -> {
-            builder.data(candidate.url)
+            val encodedUrl = com.melmeligy.mediadownloader.core.util.UrlUtils.encodeNonAsciiUrl(candidate.url)
+            builder.data(encodedUrl)
             val reqHeaders = DownloadThumbnailCache.buildThumbnailHeaders(
                 sourceUrl = sourceUrl,
                 headers = headers,
-                thumbnailUrl = candidate.url
+                thumbnailUrl = encodedUrl
             )
             reqHeaders.forEach { (k, v) ->
                 if (!k.startsWith("X-Internal-", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) {

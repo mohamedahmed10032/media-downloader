@@ -56,16 +56,89 @@ class HlsExtractor @Inject constructor(
         headers: Map<String, String>,
         heightHint: Int? = null
     ): ResolvedMedia? = withContext(Dispatchers.IO) {
-        extractOnIo(url, headers, heightHint)
+        extractOnIo(url, headers, heightHint, verifyDownloadable = false)
+    }
+
+    /**
+     * Strict downloadability-verified extraction used when racing movie/embed servers:
+     * verifies the master/media playlist is non-DRM, at least one variant playlist resolves cleanly,
+     * and an actual media segment responds with HTTP 200/206 non-HTML media (retrying relaxed
+     * headers once on HTTP 401/403 so winning streams carry exact downloadable headers).
+     */
+    suspend fun extractVerified(
+        url: String,
+        headers: Map<String, String>,
+        heightHint: Int? = null
+    ): ResolvedMedia? = withContext(Dispatchers.IO) {
+        extractOnIo(url, headers, heightHint, verifyDownloadable = true)
+    }
+
+    private suspend fun fetchPlaylistWithHeaderFallback(
+        url: String,
+        headers: Map<String, String>,
+        allowRelaxedFallback: Boolean
+    ): Pair<String, Map<String, String>>? {
+        try {
+            return http.fetchString(url, headers) to headers
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+            if (!allowRelaxedFallback || e.error != com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED) {
+                if (allowRelaxedFallback) return null
+                throw e
+            }
+        } catch (e: Exception) {
+            if (allowRelaxedFallback) return null
+            throw e
+        }
+        for (alt in ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)) {
+            val text = try {
+                http.fetchString(url, alt)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (!text.isNullOrBlank() && text.contains("#EXTM3U")) {
+                return text to alt
+            }
+        }
+        return null
+    }
+
+    private suspend fun verifySegmentDownloadable(
+        segmentUrl: String,
+        headers: Map<String, String>
+    ): Map<String, String>? {
+        val candidates = listOf(headers) + ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
+        for (hdrs in candidates) {
+            val info = withTimeoutOrNull(SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+                withCancellableHttpCalls(timeoutMs = SEGMENT_PROBE_TIMEOUT_MS) {
+                    runCatching { http.probe(segmentUrl, hdrs, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
+                }
+            } ?: continue
+            if (info.code in 200..299 && !ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+                return hdrs
+            }
+            // Only continue relaxing headers on 401/403; 404/410/5xx means the segment itself is dead
+            if (info.code != 401 && info.code != 403) {
+                return null
+            }
+        }
+        return null
     }
 
     private suspend fun extractOnIo(
         url: String,
         headers: Map<String, String>,
-        heightHint: Int?
+        heightHint: Int?,
+        verifyDownloadable: Boolean
     ): ResolvedMedia? {
         if (ExtractorRegistry.isConfirmedHtml(url)) return null
-        val text = http.fetchString(url, headers)
+        val fetched = fetchPlaylistWithHeaderFallback(url, headers, allowRelaxedFallback = verifyDownloadable)
+            ?: return null
+        val text = fetched.first
+        var effectiveHeaders = fetched.second
         if (!text.contains("#EXTM3U")) return null
 
         val streams = mutableListOf<MediaStream>()
@@ -112,42 +185,66 @@ class HlsExtractor @Inject constructor(
                 }
             }
 
-            // Probe first variant playlist to calculate sanitized duration (excluding injected discontinuity ad blocks)
-            val firstVariant = rawVariants.firstOrNull()
-            val firstVariantUrl = firstVariant?.variantUrl
-            val variantText = if (firstVariantUrl != null) {
-                withTimeoutOrNull(VARIANT_PLAYLIST_TIMEOUT_MS) {
+            // Probe first variant playlist (trying a second variant if verifyDownloadable and the first fails)
+            var probedVariant: RawVariant? = rawVariants.firstOrNull()
+            var variantText: String? = null
+            val variantsToProbe = if (verifyDownloadable) rawVariants.take(2) else rawVariants.take(1)
+            for (candidateVar in variantsToProbe) {
+                val fetchedVar = withTimeoutOrNull(VARIANT_PLAYLIST_TIMEOUT_MS) {
                     withCancellableHttpCalls(timeoutMs = VARIANT_PLAYLIST_TIMEOUT_MS) {
-                        runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
+                        fetchPlaylistWithHeaderFallback(
+                            url = candidateVar.variantUrl,
+                            headers = effectiveHeaders,
+                            allowRelaxedFallback = verifyDownloadable
+                        )
                     }
                 }
+                if (fetchedVar != null && fetchedVar.first.contains("#EXTM3U")) {
+                    probedVariant = candidateVar
+                    variantText = fetchedVar.first
+                    effectiveHeaders = fetchedVar.second
+                    break
+                }
+            }
+
+            val sanitizedFirstVariant = if (!variantText.isNullOrBlank() && probedVariant != null) {
+                HlsPlaylistSanitizer.parseAndSanitize(variantText, probedVariant.variantUrl)
             } else null
 
-            val sanitizedFirstVariant = if (!variantText.isNullOrBlank() && firstVariantUrl != null) {
-                HlsPlaylistSanitizer.parseAndSanitize(variantText, firstVariantUrl)
-            } else null
+            if (sanitizedFirstVariant?.hasUnsupportedDrm == true) {
+                return null
+            }
+
+            if (verifyDownloadable) {
+                val mediaSegs = sanitizedFirstVariant?.segments?.filter { !it.isInitMap }.orEmpty()
+                if (mediaSegs.isEmpty()) return null
+                // Verify an actual segment is fetchable with HTTP 200/206 non-HTML media before winning the race
+                val verifiedHeaders = verifySegmentDownloadable(mediaSegs.first().url, effectiveHeaders)
+                    ?: return null
+                effectiveHeaders = verifiedHeaders
+            }
 
             val probedDurationSeconds = sanitizedFirstVariant?.totalDurationSec?.roundToLong() ?: 0L
 
-            val headerDurationSeconds = headers["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+            val headerDurationSeconds = effectiveHeaders["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
             val totalDurationSeconds = if (probedDurationSeconds > 0L) probedDurationSeconds else headerDurationSeconds
 
             // Calibrate peak-only BANDWIDTH estimates against actual interior segment byte-rates
             // (avoiding seg[0] which is frequently inflated by intro/IDR frames, and defaulting to 1.0x BANDWIDTH)
             val peakBandwidthScale = computePeakBandwidthCalibrationScale(
-                firstVariant = firstVariant,
+                firstVariant = probedVariant,
                 sanitizedFirstVariant = sanitizedFirstVariant,
                 hasPeakOnlyVariants = rawVariants.any {
                     it.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull() == null &&
                         it.attrs["BANDWIDTH"]?.toIntOrNull() != null
                 },
-                headers = headers
+                headers = effectiveHeaders
             )
 
             val baseStreamHeaders = if (totalDurationSeconds > 0L) {
-                headers + ("X-Internal-Duration-Seconds" to totalDurationSeconds.toString())
+                effectiveHeaders + ("X-Internal-Duration-Seconds" to totalDurationSeconds.toString())
             } else {
-                headers
+                effectiveHeaders
             }
 
             val parsedVariants = rawVariants.mapIndexed { variantIdx, v ->
@@ -297,7 +394,9 @@ class HlsExtractor @Inject constructor(
         if (streams.isEmpty()) {
             if (text.contains("#EXTINF")) {
                 val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, url)
+                if (sanitized.hasUnsupportedDrm) return null
                 val mediaSegments = sanitized.segments.filter { !it.isInitMap }
+                if (verifyDownloadable && mediaSegments.isEmpty()) return null
                 val totalDurationSeconds = sanitized.totalDurationSec.roundToLong()
 
                 val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(url)
@@ -316,6 +415,12 @@ class HlsExtractor @Inject constructor(
                     ((sizeBytes * 8L) / (totalDurationSeconds * 1000L)).toInt()
                 } else null
 
+                if (verifyDownloadable) {
+                    val verifiedHeaders = verifySegmentDownloadable(mediaSegments.first().url, effectiveHeaders)
+                        ?: return null
+                    effectiveHeaders = verifiedHeaders
+                }
+
                 // 2. Otherwise probe representative media segment(s)
                 if (sizeBytes == null && totalDurationSeconds > 0L) {
                     val sampleSegments = if (mediaSegments.size >= 4) {
@@ -326,7 +431,7 @@ class HlsExtractor @Inject constructor(
                     }
                     val byteRate = probeAverageByteRate(
                         segments = sampleSegments,
-                        headers = headers,
+                        headers = effectiveHeaders,
                         useShortTimeout = mediaSegments.size >= 4
                     )
                     if (byteRate != null && byteRate > 0.0) {
@@ -357,7 +462,7 @@ class HlsExtractor @Inject constructor(
                 }
 
                 val isEstimatedSize = byteRangeTotal <= 0L && sizeBytes != null && sizeBytes > 0L
-                val streamHeaders = LinkedHashMap<String, String>(headers).apply {
+                val streamHeaders = LinkedHashMap<String, String>(effectiveHeaders).apply {
                     if (totalDurationSeconds > 0L) {
                         put("X-Internal-Duration-Seconds", totalDurationSeconds.toString())
                     }

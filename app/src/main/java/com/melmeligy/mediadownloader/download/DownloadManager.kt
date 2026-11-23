@@ -179,6 +179,13 @@ class DownloadManager private constructor(
                     ?: settingsRepository.current().defaultAudioBitrate.kbps
                 put("X-Internal-Target-Bitrate-Kbps", effectiveBitrate.toString())
             }
+            val origThumb = resolved.thumbnailUrl?.trim()
+            if (!origThumb.isNullOrBlank() &&
+                (origThumb.startsWith("http://", ignoreCase = true) || origThumb.startsWith("https://", ignoreCase = true)) &&
+                !containsKey("X-Internal-Original-Thumbnail-Url")
+            ) {
+                put("X-Internal-Original-Thumbnail-Url", origThumb)
+            }
         }
         val item = DownloadItem(
             title = resolved.title,
@@ -194,6 +201,22 @@ class DownloadManager private constructor(
             isHls = stream.isHls
         )
         val id = repository.enqueue(item)
+        // If extraction already cached a local preview poster, promote it into thumb_<id>.jpg right away
+        // so QUEUED, RUNNING, PAUSED, and FAILED cards render the real poster immediately.
+        val cache = thumbnailCache
+        if (cache != null && DownloadThumbnailCache.resolveExistingLocalFile(resolved.thumbnailUrl) != null) {
+            runCatching {
+                val promoted = cache.cacheRemoteThumbnail(
+                    downloadId = id,
+                    thumbnailUrl = resolved.thumbnailUrl,
+                    sourceUrl = resolved.sourceUrl,
+                    headers = headers
+                )
+                if (promoted != null) {
+                    repository.updateThumbnail(id, promoted.absolutePath)
+                }
+            }
+        }
         queueSignal.trySend(Unit)
         schedule()
         return id
@@ -592,11 +615,18 @@ class DownloadManager private constructor(
             if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
                 // Cache remote thumbnail (or extract a remote video frame if no poster URL exists / fetch fails)
                 // on queueScope so it finishes even if the user pauses right after starting.
+                val effectiveThumbCandidate = item.thumbnailUrl?.takeIf {
+                    DownloadThumbnailCache.resolveExistingLocalFile(it) != null ||
+                        it.startsWith("http://", ignoreCase = true) ||
+                        it.startsWith("https://", ignoreCase = true)
+                } ?: headers["X-Internal-Original-Thumbnail-Url"]?.takeIf {
+                    it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+                }
                 queueScope.launch(dispatchers.io) {
-                    var cached = if (!item.thumbnailUrl.isNullOrBlank()) {
+                    var cached = if (!effectiveThumbCandidate.isNullOrBlank()) {
                         thumbnailCache.cacheRemoteThumbnail(
                             downloadId = item.id,
-                            thumbnailUrl = item.thumbnailUrl,
+                            thumbnailUrl = effectiveThumbCandidate,
                             sourceUrl = item.sourceUrl,
                             headers = headers
                         )
@@ -950,6 +980,48 @@ class DownloadManager private constructor(
             } else {
                 e
             }
+
+            // Automatic failover to a verified backup server mirror if the primary stream died at download time
+            val mappedError = (mapped as? MediaException)?.error ?: AppError.GENERIC
+            if (mappedError != AppError.INSUFFICIENT_STORAGE && mappedError != AppError.NO_INTERNET) {
+                val primaryHeaders = JsonUtils.jsonToMap(item.headersJson)
+                val fallbackUrl = primaryHeaders["X-Internal-Fallback-Url"]?.trim()
+                    ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+                if (fallbackUrl != null && fallbackUrl != item.remoteUrl) {
+                    val fallbackIsHls = primaryHeaders["X-Internal-Fallback-IsHls"]?.equals("true", ignoreCase = true) == true
+                    val fallbackContainer = if (fallbackIsHls) {
+                        "mp4"
+                    } else {
+                        primaryHeaders["X-Internal-Fallback-Container"]?.takeIf { it.isNotBlank() } ?: item.container
+                    }
+                    val fallbackHeaders = LinkedHashMap<String, String>().apply {
+                        val rawFallbackHdrs = primaryHeaders["X-Internal-Fallback-Headers"]
+                        if (!rawFallbackHdrs.isNullOrBlank()) {
+                            putAll(JsonUtils.jsonToMap(rawFallbackHdrs))
+                        } else {
+                            primaryHeaders.forEach { (k, v) ->
+                                if (!k.startsWith("X-Internal-", ignoreCase = true)) put(k, v)
+                            }
+                        }
+                        primaryHeaders["X-Internal-Original-Thumbnail-Url"]?.let {
+                            put("X-Internal-Original-Thumbnail-Url", it)
+                        }
+                        primaryHeaders["X-Internal-Target-Bitrate-Kbps"]?.let {
+                            put("X-Internal-Target-Bitrate-Kbps", it)
+                        }
+                    }
+                    cleanupStaging(item.id, deleteThumbnail = false)
+                    val fallbackItem = item.copy(
+                        remoteUrl = fallbackUrl,
+                        isHls = fallbackIsHls,
+                        container = fallbackContainer,
+                        headersJson = JsonUtils.mapToJson(fallbackHeaders)
+                    )
+                    runOne(fallbackItem, queueScope)
+                    return
+                }
+            }
+
             handleFailure(item, staging, mapped, queueScope, currentJob)
         }
     }
@@ -962,7 +1034,7 @@ class DownloadManager private constructor(
         }
         when (effectiveIntent) {
             ControlIntent.CANCEL -> {
-                cleanupStaging(item.id)
+                cleanupStaging(item.id, deleteThumbnail = true)
                 runCatching { staging.delete() }
                 repository.delete(item.id)
             }
@@ -1023,7 +1095,8 @@ class DownloadManager private constructor(
                 if (activeIntent == ControlIntent.CANCEL || activeIntent == ControlIntent.PAUSE) {
                     handleCancellation(item, staging, originJob)
                 } else {
-                    cleanupStaging(item.id)
+                    // Keep cached local thumbnail intact so the failed card still shows the real poster
+                    cleanupStaging(item.id, deleteThumbnail = false)
                     repository.setError(item.id, error)
                     notifier.notifyFailed(item.id, item.title, friendly(error))
                 }
@@ -1074,7 +1147,7 @@ class DownloadManager private constructor(
     private fun stagingFile(item: DownloadItem): File =
         File(stagingDir(), "dl_${item.id}.${item.container}.part")
 
-    private fun cleanupStaging(id: Long) {
+    private fun cleanupStaging(id: Long, deleteThumbnail: Boolean = true) {
         val dir = stagingDir()
         dir.listFiles()
             ?.filter {
@@ -1088,7 +1161,9 @@ class DownloadManager private constructor(
                     if (it.isDirectory) it.deleteRecursively() else it.delete()
                 }
             }
-        thumbnailCache?.deleteThumbnail(id)
+        if (deleteThumbnail) {
+            thumbnailCache?.deleteThumbnail(id)
+        }
     }
 
     private fun ensureSufficientStorage(target: File, requiredBytes: Long) {

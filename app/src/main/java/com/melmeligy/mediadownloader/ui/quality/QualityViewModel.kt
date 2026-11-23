@@ -40,10 +40,12 @@ class QualityViewModel : ViewModel {
     private val settingsRepository: SettingsRepository
     private val progressTracker: ExtractionProgressTracker
     private val streamSizeRefiner: StreamSizeRefiner?
+    private val thumbnailCache: com.melmeligy.mediadownloader.download.DownloadThumbnailCache?
 
     private var currentUrl: String = ""
     private var resolveJob: Job? = null
     private var sizeRefineJob: Job? = null
+    private var thumbCacheJob: Job? = null
 
     val settings: StateFlow<AppSettings>
     val loadingStage: StateFlow<String>
@@ -64,6 +66,7 @@ class QualityViewModel : ViewModel {
         settingsRepository: SettingsRepository,
         progressTracker: ExtractionProgressTracker,
         streamSizeRefiner: StreamSizeRefiner,
+        thumbnailCache: com.melmeligy.mediadownloader.download.DownloadThumbnailCache,
         savedStateHandle: SavedStateHandle
     ) : super() {
         this.mediaRepository = mediaRepository
@@ -71,6 +74,7 @@ class QualityViewModel : ViewModel {
         this.settingsRepository = settingsRepository
         this.progressTracker = progressTracker
         this.streamSizeRefiner = streamSizeRefiner
+        this.thumbnailCache = thumbnailCache
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
@@ -88,6 +92,7 @@ class QualityViewModel : ViewModel {
         this.settingsRepository = settingsRepository
         this.progressTracker = ExtractionProgressTracker()
         this.streamSizeRefiner = null
+        this.thumbnailCache = null
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
@@ -106,6 +111,7 @@ class QualityViewModel : ViewModel {
         this.settingsRepository = settingsRepository
         this.progressTracker = ExtractionProgressTracker()
         this.streamSizeRefiner = streamSizeRefiner
+        this.thumbnailCache = null
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
@@ -138,6 +144,7 @@ class QualityViewModel : ViewModel {
         currentUrl = targetUrl
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
+        thumbCacheJob?.cancel()
         progressTracker.reset()
         val job = viewModelScope.launch {
             _state.value = Resource.Loading
@@ -155,6 +162,7 @@ class QualityViewModel : ViewModel {
                 _state.value = nextState
                 if (nextState is Resource.Success) {
                     launchBackgroundSizeRefinement(nextState.data, normalizedTarget)
+                    launchBackgroundThumbnailCaching(nextState.data, normalizedTarget)
                 }
             }
         }
@@ -175,12 +183,47 @@ class QualityViewModel : ViewModel {
             } ?: return@launch
 
             val activeNormalized = UrlUtils.normalize(currentUrl) ?: currentUrl.trim()
+            val latest = (_state.value as? Resource.Success)?.data
             if (currentCoroutineContext()[Job]?.isActive == true &&
                 activeNormalized == expectedNormalizedUrl &&
-                _state.value is Resource.Success
+                latest != null
             ) {
-                _state.value = Resource.Success(refined)
-                (mediaRepository as? MediaRepositoryImpl)?.updateCached(refined)
+                val merged = refined.copy(thumbnailUrl = latest.thumbnailUrl ?: refined.thumbnailUrl)
+                _state.value = Resource.Success(merged)
+                (mediaRepository as? MediaRepositoryImpl)?.updateCached(merged)
+            }
+        }
+    }
+
+    private fun launchBackgroundThumbnailCaching(resolved: ResolvedMedia, expectedNormalizedUrl: String) {
+        val cache = thumbnailCache ?: return
+        val remoteThumb = resolved.thumbnailUrl?.trim()
+            ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+            ?: return
+        val streamHeaders = resolved.streams.firstOrNull { it.headers.isNotEmpty() }?.headers.orEmpty()
+        thumbCacheJob?.cancel()
+        thumbCacheJob = viewModelScope.launch {
+            val cachedFile = try {
+                cache.cachePreviewThumbnail(
+                    thumbnailUrl = remoteThumb,
+                    sourceUrl = resolved.sourceUrl,
+                    headers = streamHeaders
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            } ?: return@launch
+
+            val activeNormalized = UrlUtils.normalize(currentUrl) ?: currentUrl.trim()
+            val latest = (_state.value as? Resource.Success)?.data
+            if (currentCoroutineContext()[Job]?.isActive == true &&
+                activeNormalized == expectedNormalizedUrl &&
+                latest != null
+            ) {
+                val updated = latest.copy(thumbnailUrl = cachedFile.absolutePath)
+                _state.value = Resource.Success(updated)
+                (mediaRepository as? MediaRepositoryImpl)?.updateCached(updated)
             }
         }
     }
@@ -190,6 +233,8 @@ class QualityViewModel : ViewModel {
         resolveJob = null
         sizeRefineJob?.cancel()
         sizeRefineJob = null
+        thumbCacheJob?.cancel()
+        thumbCacheJob = null
         progressTracker.reset()
     }
 

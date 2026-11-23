@@ -36,10 +36,14 @@ object HtmlThumbnailExtractor {
     private val DOM_POSTER_ATTR_SELECTORS = listOf(
         "video[poster]" to "poster",
         "[data-poster]" to "data-poster",
+        "[data-poster-url]" to "data-poster-url",
         "[data-thumb]" to "data-thumb",
         "[data-thumbnail]" to "data-thumbnail",
         "[data-image]" to "data-image",
+        "[data-image-src]" to "data-image-src",
         "[data-bg]" to "data-bg",
+        "[data-bg-src]" to "data-bg-src",
+        "[data-lazy-bg]" to "data-lazy-bg",
         "[data-background]" to "data-background",
         "[data-background-image]" to "data-background-image",
         "[poster]" to "poster"
@@ -47,6 +51,11 @@ object HtmlThumbnailExtractor {
 
     private val CSS_POSTER_ELEMENT_SELECTORS = listOf(
         ".BG--Mycima-Single",
+        ".Separate--Poster",
+        ".BG--GridItem",
+        ".Thumb--GridItem",
+        ".Single--Thumb",
+        ".PosterBlock",
         ".wecima",
         ".mycima",
         ".Poster",
@@ -71,6 +80,8 @@ object HtmlThumbnailExtractor {
         ".Poster img",
         ".poster img",
         ".Single--Poster img",
+        ".Separate--Poster img",
+        ".PosterBlock img",
         ".thumb img",
         ".thumbnail img",
         ".cover img",
@@ -91,7 +102,12 @@ object HtmlThumbnailExtractor {
     )
 
     private val CSS_URL_REGEX = Regex(
-        """url\(\s*['"]?([^'")\s]+)['"]?\s*\)""",
+        """url\(\s*(?:'([^']+)'|"([^"]+)"|([^)'"\s]+))\s*\)""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val INLINE_STYLE_POSTER_RULE_REGEX = Regex(
+        """(?:BG--Mycima-Single|Single--Poster|Separate--Poster|Poster|jw-preview|vjs-poster|plyr__poster|--image)[^\}]{0,400}?url\(\s*(?:'([^']+)'|"([^"]+)"|([^)'"\s]+))\s*\)""",
         RegexOption.IGNORE_CASE
     )
 
@@ -168,7 +184,17 @@ object HtmlThumbnailExtractor {
             }
         }
 
-        // 8. Inline player configuration scripts (JWPlayer, Video.js, Plyr, Clappr, Flowplayer, etc.)
+        // 8. Inline <style> blocks with poster/background rules (e.g. .BG--Mycima-Single { --image:url(...) })
+        for (styleEl in doc.select("style")) {
+            val cssText = styleEl.data()
+            if (cssText.isBlank()) continue
+            for (match in INLINE_STYLE_POSTER_RULE_REGEX.findAll(cssText)) {
+                val candidate = extractCssMatchUrl(match) ?: continue
+                resolveValidImageCandidate(candidate, pageUrl)?.let { return it }
+            }
+        }
+
+        // 9. Inline player configuration scripts (JWPlayer, Video.js, Plyr, Clappr, Flowplayer, etc.)
         for (match in SCRIPT_POSTER_REGEX.findAll(rawHtml)) {
             val candidate = match.groupValues.getOrNull(1)?.replace("\\/", "/") ?: continue
             resolveValidImageCandidate(candidate, pageUrl)?.let { return it }
@@ -366,16 +392,19 @@ object HtmlThumbnailExtractor {
         return null
     }
 
+    private fun extractCssMatchUrl(match: MatchResult): String? =
+        (1..3).firstNotNullOfOrNull { idx -> match.groupValues.getOrNull(idx)?.takeIf { it.isNotBlank() } }
+
     private fun extractCssImageFromElement(el: Element, pageUrl: String): String? {
         for (attr in listOf("data-lazy-style", "style", "data-style")) {
             val styleVal = el.attr(attr).trim()
             if (styleVal.isEmpty()) continue
             for (match in CSS_URL_REGEX.findAll(styleVal)) {
-                val candidate = match.groupValues.getOrNull(1) ?: continue
+                val candidate = extractCssMatchUrl(match) ?: continue
                 resolveValidImageCandidate(candidate, pageUrl)?.let { return it }
             }
         }
-        for (attr in listOf("data-bg", "data-background", "data-background-image", "data-src")) {
+        for (attr in listOf("data-bg", "data-bg-src", "data-lazy-bg", "data-background", "data-background-image", "data-image-src", "data-src")) {
             val raw = el.attr(attr).trim()
             if (raw.isNotEmpty()) {
                 resolveValidImageCandidate(raw, pageUrl)?.let { return it }

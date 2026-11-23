@@ -480,7 +480,7 @@ class StreamingPortalResolver(
         val directExt = UrlUtils.fileExtension(embedUrl)
         if (directExt == "m3u8") {
             val h = buildStreamHeadersForHost(parentUrl, baseHeaders)
-            val expanded = runCatching { hlsExtractor.extract(embedUrl, h) }.getOrNull()
+            val expanded = runCatching { hlsExtractor.extractVerified(embedUrl, h) }.getOrNull()
             return@coroutineScope PortalExtractionResult(expanded?.streams.orEmpty())
         }
 
@@ -683,13 +683,14 @@ class StreamingPortalResolver(
 
         if (url.contains(".m3u8", ignoreCase = true)) {
             val expanded = runCatching {
-                hlsExtractor.extract(url, taggedHeaders, cand.height)
+                hlsExtractor.extractVerified(url, taggedHeaders, cand.height)
             }.getOrNull()
             if (expanded != null && expanded.streams.isNotEmpty()) {
+                val internalTags = taggedHeaders.filterKeys { it.startsWith("X-Internal-", ignoreCase = true) }
                 return expanded.streams.map { s ->
                     s.copy(
                         id = "portal-${idCounter.incrementAndGet()}",
-                        headers = taggedHeaders + s.headers
+                        headers = internalTags + s.headers
                     )
                 }
             }
@@ -709,18 +710,12 @@ class StreamingPortalResolver(
             return emptyList()
         }
 
-        // Progressive direct video (.mp4, .mkv, .webm, Streamtape get_video)
-        val probe = runCatching { http.probe(url, taggedHeaders, PROGRESSIVE_PROBE_TIMEOUT_MS) }.getOrNull()
+        // Progressive direct video (.mp4, .mkv, .webm, Streamtape get_video) with 401/403 header relaxation
+        val (probe, workingHeaders) = probeProgressiveWithHeaderFallback(url, taggedHeaders)
             ?: return emptyList()
-        if (probe.code !in 200..299) return emptyList()
 
         val ct = probe.contentType?.lowercase().orEmpty()
-        val isRejectedMime = ct.startsWith("text/html") ||
-            ct.startsWith("application/xhtml") ||
-            ct.startsWith("application/json") ||
-            ct.startsWith("text/plain") ||
-            ct.startsWith("image/")
-        if (isRejectedMime) return emptyList()
+        if (ExtractorHttp.isRejectedMediaContentType(ct)) return emptyList()
 
         // Accept video/*, audio/*, application/octet-stream, binary/octet-stream, or empty MIME on video URLs
         val isAllowedMime = ct.isEmpty() ||
@@ -745,7 +740,7 @@ class StreamingPortalResolver(
             else -> "HD Video"
         }
 
-        val finalHeaders = LinkedHashMap<String, String>(taggedHeaders).apply {
+        val finalHeaders = LinkedHashMap<String, String>(workingHeaders).apply {
             if (probe.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
         }
 
@@ -763,6 +758,33 @@ class StreamingPortalResolver(
                 headers = finalHeaders
             )
         )
+    }
+
+    private fun probeProgressiveWithHeaderFallback(
+        url: String,
+        primaryHeaders: Map<String, String>
+    ): Pair<HeadInfo, Map<String, String>>? {
+        val headerCandidates = listOf(primaryHeaders) +
+            ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)
+        for (hdrs in headerCandidates) {
+            val probe = try {
+                http.probe(url, hdrs, PROGRESSIVE_PROBE_TIMEOUT_MS)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
+                if (me.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED) continue
+                return null
+            } catch (_: Exception) {
+                return null
+            }
+            if (probe.code in 200..299 && !ExtractorHttp.isRejectedMediaContentType(probe.contentType)) {
+                return probe to hdrs
+            }
+            if (probe.code != 401 && probe.code != 403) {
+                return null
+            }
+        }
+        return null
     }
 
     private fun buildHopHeaders(

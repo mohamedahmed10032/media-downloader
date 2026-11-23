@@ -85,13 +85,18 @@ class HlsSegmentDownloader @Inject constructor(
         maxRetries: Int,
         onProgress: ProgressCallback
     ) = coroutineScope {
+        var effectiveHeaders = headers
         var mediaUrl = playlistUrl
-        var text = http.fetchString(playlistUrl, headers)
+        val firstFetch = fetchPlaylistWithHeaderFallback(playlistUrl, effectiveHeaders)
+        var text = firstFetch.first
+        effectiveHeaders = firstFetch.second
 
         if (text.contains("#EXT-X-STREAM-INF")) {
             mediaUrl = firstVariantUrl(text, playlistUrl)
                 ?: throw MediaException(AppError.NO_MEDIA_FOUND, "No HLS variant found")
-            text = http.fetchString(mediaUrl, headers)
+            val variantFetch = fetchPlaylistWithHeaderFallback(mediaUrl, effectiveHeaders)
+            text = variantFetch.first
+            effectiveHeaders = variantFetch.second
         }
 
         val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, mediaUrl)
@@ -106,7 +111,7 @@ class HlsSegmentDownloader @Inject constructor(
         if (segments.isEmpty()) throw MediaException(AppError.NO_MEDIA_FOUND, "No HLS segments found")
 
         // Fetch any distinct RFC 8216 clear AES-128 keys upfront with identical headers
-        val aesKeys = fetchAes128Keys(segments, headers)
+        val aesKeys = fetchAes128Keys(segments, effectiveHeaders)
 
         dest.parentFile?.mkdirs()
         if (dest.exists()) dest.delete()
@@ -218,7 +223,7 @@ class HlsSegmentDownloader @Inject constructor(
                     } else null
                     downloadSegmentToPart(
                         segment = segment,
-                        headers = headers,
+                        headers = effectiveHeaders,
                         keyBytes = keyBytes,
                         maxRetries = effectiveRetries,
                         partFile = partFile,
@@ -306,6 +311,32 @@ class HlsSegmentDownloader @Inject constructor(
         return keys
     }
 
+    private suspend fun fetchPlaylistWithHeaderFallback(
+        url: String,
+        primaryHeaders: Map<String, String>
+    ): Pair<String, Map<String, String>> {
+        try {
+            return http.fetchString(url, primaryHeaders) to primaryHeaders
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (e: MediaException) {
+            if (e.error != AppError.GEO_BLOCKED) throw e
+            for (alt in ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)) {
+                val text = try {
+                    http.fetchString(url, alt)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                if (!text.isNullOrBlank() && text.contains("#EXTM3U")) {
+                    return text to alt
+                }
+            }
+            throw e
+        }
+    }
+
     private suspend fun downloadSegmentToPart(
         segment: HlsSegment,
         headers: Map<String, String>,
@@ -314,13 +345,17 @@ class HlsSegmentDownloader @Inject constructor(
         partFile: File,
         written: AtomicLong
     ): Long {
+        var activeHeaders = headers
+        val relaxedHeaderQueue = ArrayDeque(
+            ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
+        )
         var attempt = 0
         val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
         while (true) {
             currentCoroutineContext().ensureActive()
             var attemptBytes = 0L
             try {
-                val reqBuilder = http.buildRequest(segment.url, headers)
+                val reqBuilder = http.buildRequest(segment.url, activeHeaders)
                     .header("X-Internal-Download", "true")
 
                 val rangeLen = segment.byteRangeLength
@@ -338,6 +373,10 @@ class HlsSegmentDownloader @Inject constructor(
                                 ?.coerceIn(1L, 10L)?.times(1000L)
                         }
                         throw SegmentHttpException(response.code, http.mapHttpError(response.code), retryAfterMs)
+                    }
+                    val ct = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                    if (ct.startsWith("text/html") || ct.startsWith("application/xhtml")) {
+                        throw MediaException(AppError.EXPIRED_LINK, "HLS segment returned HTML instead of media")
                     }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
                     val serverIgnoredRange = rangeLen != null && rangeLen > 0L && response.code == 200
@@ -390,6 +429,10 @@ class HlsSegmentDownloader @Inject constructor(
                 currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
+                if ((e.code == 401 || e.code == 403) && relaxedHeaderQueue.isNotEmpty()) {
+                    activeHeaders = relaxedHeaderQueue.removeFirst()
+                    continue
+                }
                 val isRetryable = e.code == 429 || e.code == 408 || e.code in 500..599
                 if (!isRetryable || attempt >= maxRetries) {
                     throw e.mediaException

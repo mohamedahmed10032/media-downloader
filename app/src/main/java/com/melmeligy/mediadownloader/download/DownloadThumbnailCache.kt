@@ -88,6 +88,8 @@ class DownloadThumbnailCache internal constructor(
 
     /**
      * Ensures [thumbnailUrl] is cached locally on disk for [downloadId].
+     * If [thumbnailUrl] already points to an existing local preview file, copies it into `thumb_<downloadId>.jpg`
+     * so deleting/evicting previews never breaks an active/failed download card.
      * Returns the local [File] on success, or null if no valid image could be fetched.
      */
     suspend fun cacheRemoteThumbnail(
@@ -96,37 +98,111 @@ class DownloadThumbnailCache internal constructor(
         sourceUrl: String,
         headers: Map<String, String>
     ): File? = withContext(Dispatchers.IO) {
-        val existingLocal = resolveExistingLocalFile(thumbnailUrl)
-        if (existingLocal != null) return@withContext existingLocal
-
         val targetFile = thumbnailFile(downloadId)
         if (targetFile.exists() && targetFile.length() > 0L) {
             return@withContext targetFile
+        }
+
+        val existingLocal = resolveExistingLocalFile(thumbnailUrl)
+        if (existingLocal != null) {
+            if (existingLocal.canonicalPath == runCatching { targetFile.canonicalPath }.getOrNull()) {
+                return@withContext existingLocal
+            }
+            val copied = runCatching {
+                writeAtomically(targetFile, existingLocal.readBytes())
+            }.getOrNull()
+            return@withContext copied?.also {
+                evictIfNeeded(protectedDownloadId = downloadId)
+            } ?: existingLocal
         }
 
         val remoteUrl = thumbnailUrl?.trim()
             ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
             ?: return@withContext null
 
-        val primaryHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl)
-        var bytes = fetchThumbnailBytes(remoteUrl, primaryHeaders)
-        if (bytes == null) {
-            // Some image CDNs block a cross-domain Referer; retry once with the image host's own origin as Referer
-            val thumbOrigin = extractOrigin(remoteUrl)
-            val sourceOrigin = extractOrigin(sourceUrl)
-            if (!thumbOrigin.isNullOrBlank() && !thumbOrigin.equals(sourceOrigin, ignoreCase = true)) {
-                val fallbackHeaders = LinkedHashMap(primaryHeaders).apply {
-                    put("Referer", "$thumbOrigin/")
-                    put("Origin", thumbOrigin)
-                }
-                bytes = fetchThumbnailBytes(remoteUrl, fallbackHeaders)
-            }
-        }
-        val validBytes = bytes ?: return@withContext null
+        val validBytes = fetchThumbnailBytesWithFallback(remoteUrl, sourceUrl, headers)
+            ?: return@withContext null
 
         writeAtomically(targetFile, validBytes)?.also {
             evictIfNeeded(protectedDownloadId = downloadId)
         }
+    }
+
+    /**
+     * Pre-caches a remote poster image immediately after extraction (before the user queues a download)
+     * so `Choose format`, `Home`, `Downloads`, and `Library` display the verified local image instantly.
+     */
+    suspend fun cachePreviewThumbnail(
+        thumbnailUrl: String?,
+        sourceUrl: String,
+        headers: Map<String, String>
+    ): File? = withContext(Dispatchers.IO) {
+        val existingLocal = resolveExistingLocalFile(thumbnailUrl)
+        if (existingLocal != null) return@withContext existingLocal
+
+        val remoteUrl = thumbnailUrl?.trim()
+            ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+            ?: return@withContext null
+
+        val previewFile = previewThumbnailFile(remoteUrl)
+        if (previewFile.exists() && previewFile.length() > 0L) {
+            runCatching { previewFile.setLastModified(System.currentTimeMillis()) }
+            return@withContext previewFile
+        }
+
+        val validBytes = fetchThumbnailBytesWithFallback(remoteUrl, sourceUrl, headers)
+            ?: return@withContext null
+
+        writeAtomically(previewFile, validBytes)?.also {
+            evictIfNeeded()
+        }
+    }
+
+    internal fun previewThumbnailFile(remoteUrl: String): File {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(remoteUrl.trim().toByteArray(Charsets.UTF_8))
+            .take(8)
+            .joinToString("") { "%02x".format(it) }
+        return File(thumbsDir, "preview_$digest.jpg")
+    }
+
+    private suspend fun fetchThumbnailBytesWithFallback(
+        remoteUrl: String,
+        sourceUrl: String,
+        headers: Map<String, String>
+    ): ByteArray? {
+        val attempts = ArrayList<Map<String, String>>(4)
+        val primaryHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl)
+        attempts += primaryHeaders
+
+        // Fallback 1: Same headers WITHOUT Origin (many WordPress/Cloudflare image CDNs reject Origin on image GETs)
+        if (primaryHeaders.containsKey("Origin")) {
+            attempts += LinkedHashMap(primaryHeaders).apply { remove("Origin") }
+        }
+
+        // Fallback 2: Thumbnail's own origin as Referer (without Origin) for strict same-origin image hosts
+        val thumbOrigin = extractOrigin(remoteUrl)
+        if (!thumbOrigin.isNullOrBlank()) {
+            val ownOriginReferer = "$thumbOrigin/"
+            if (!primaryHeaders["Referer"].equals(ownOriginReferer, ignoreCase = true)) {
+                attempts += LinkedHashMap(primaryHeaders).apply {
+                    put("Referer", ownOriginReferer)
+                    remove("Origin")
+                }
+            }
+        }
+
+        // Fallback 3: Minimal clean request (User-Agent + Accept + host Cookie only, no Referer/Origin)
+        attempts += LinkedHashMap(primaryHeaders).apply {
+            remove("Referer")
+            remove("Origin")
+        }
+
+        for (attemptHeaders in attempts) {
+            val bytes = fetchThumbnailBytes(remoteUrl, attemptHeaders)
+            if (bytes != null) return bytes
+        }
+        return null
     }
 
     private fun extractOrigin(rawUrl: String?): String? {
@@ -272,11 +348,20 @@ class DownloadThumbnailCache internal constructor(
         if (!thumbsDir.exists() || !thumbsDir.isDirectory) return 0
         val protectedName = protectedDownloadId?.let { "thumb_$it.jpg" }
         val files = thumbsDir.listFiles { file ->
-            file.isFile && file.name.startsWith("thumb_") && file.name.endsWith(".jpg")
+            file.isFile &&
+                (file.name.startsWith("thumb_") || file.name.startsWith("preview_")) &&
+                file.name.endsWith(".jpg")
         }?.toMutableList() ?: return 0
 
         if (files.isEmpty()) return 0
-        files.sortWith(compareBy<File>({ it.lastModified() }, { it.name }))
+        // Evict temporary previews before committed download thumbnails when over capacity
+        files.sortWith(
+            compareBy<File>(
+                { if (it.name.startsWith("preview_")) 0 else 1 },
+                { it.lastModified() },
+                { it.name }
+            )
+        )
 
         var totalBytes = files.sumOf { it.length().coerceAtLeast(0L) }
         var count = files.size
@@ -297,12 +382,13 @@ class DownloadThumbnailCache internal constructor(
 
     /**
      * Deletes any cached thumbnails in [thumbsDir] whose download ID is not in [keepDownloadIds],
-     * along with leftover `.tmp` files.
+     * along with leftover `.tmp` files and stale `preview_*.jpg` files older than 30 minutes.
      */
     @Synchronized
     fun clearUnusedThumbnails(keepDownloadIds: Set<Long>): Int {
         if (!thumbsDir.exists() || !thumbsDir.isDirectory) return 0
         val children = thumbsDir.listFiles() ?: return 0
+        val previewCutoff = System.currentTimeMillis() - PREVIEW_STALE_MS
         var deleted = 0
         for (file in children) {
             if (!file.isFile) continue
@@ -310,6 +396,7 @@ class DownloadThumbnailCache internal constructor(
             val id = match?.groupValues?.getOrNull(1)?.toLongOrNull()
             val shouldDelete = when {
                 file.name.endsWith(".tmp") -> true
+                file.name.startsWith("preview_") && file.lastModified() < previewCutoff -> true
                 id != null -> id !in keepDownloadIds
                 else -> false
             }
@@ -341,6 +428,7 @@ class DownloadThumbnailCache internal constructor(
     companion object {
         private const val MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024 // 8 MB safety cap
         private const val MAX_FRAME_DIM_PX = 320
+        private const val PREVIEW_STALE_MS = 30L * 60L * 1000L
         internal const val DEFAULT_MAX_CACHE_BYTES = 50L * 1024L * 1024L
         internal const val DEFAULT_MAX_ENTRIES = 200
         private val THUMB_ID_REGEX = Regex("""^thumb_(\d+)\.jpg$""")
@@ -357,6 +445,25 @@ class DownloadThumbnailCache internal constructor(
             return file.takeIf { it.exists() && it.isFile && it.length() > 0L }
         }
 
+        private fun hostFamily(rawUrl: String?): String? {
+            if (rawUrl.isNullOrBlank()) return null
+            val host = runCatching {
+                URI(UrlUtils.encodeNonAsciiUrl(rawUrl.trim())).host?.lowercase()?.removePrefix("www.")
+            }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+            val parts = host.split('.')
+            return if (parts.size >= 2) "${parts[parts.size - 2]}.${parts[parts.size - 1]}" else host
+        }
+
+        private fun sanitizeAsciiHeader(raw: String, isUrl: Boolean = false): String {
+            val trimmed = raw.substringBefore('\r').substringBefore('\n').trim()
+            val encoded = if (isUrl) UrlUtils.encodeNonAsciiUrl(trimmed) else trimmed
+            val sb = StringBuilder(encoded.length)
+            for (ch in encoded) {
+                if (ch == '\t' || ch.code in 0x20..0x7E) sb.append(ch)
+            }
+            return sb.toString()
+        }
+
         fun buildThumbnailHeaders(
             sourceUrl: String,
             headers: Map<String, String>,
@@ -364,45 +471,75 @@ class DownloadThumbnailCache internal constructor(
         ): Map<String, String> {
             val out = LinkedHashMap<String, String>()
             var userAgent: String? = null
-            var referer: String? = null
-            var origin: String? = null
-            var cookie: String? = null
+            var streamReferer: String? = null
+            var streamOrigin: String? = null
+            var streamCookie: String? = null
 
             headers.forEach { (k, v) ->
                 if (k.startsWith("X-Internal-", ignoreCase = true) || v.isBlank()) return@forEach
                 when {
                     k.equals("User-Agent", ignoreCase = true) -> userAgent = v
-                    k.equals("Referer", ignoreCase = true) -> referer = v
-                    k.equals("Origin", ignoreCase = true) -> origin = v
-                    k.equals("Cookie", ignoreCase = true) -> cookie = v
+                    k.equals("Referer", ignoreCase = true) -> streamReferer = v
+                    k.equals("Origin", ignoreCase = true) -> streamOrigin = v
+                    k.equals("Cookie", ignoreCase = true) -> streamCookie = v
                 }
             }
 
-            out["User-Agent"] = userAgent ?: Constants.DEFAULT_USER_AGENT
-            val effectiveReferer = referer?.takeIf { it.startsWith("http", ignoreCase = true) }
-                ?: sourceUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+            out["User-Agent"] = sanitizeAsciiHeader(userAgent ?: Constants.DEFAULT_USER_AGENT)
+
+            val sourceFamily = hostFamily(sourceUrl)
+            val thumbFamily = hostFamily(thumbnailUrl)
+            val streamRefFamily = hostFamily(streamReferer)
+
+            // On movie portals (e.g. wecima.here), stream.headers carries an external embed player's
+            // Referer/Origin/Cookie (e.g. vidbom.com), while the poster belongs to the portal page.
+            // Never leak the embed host's Referer/Origin/Cookie onto a portal poster request.
+            val isCrossDomainEmbedLeak = streamReferer != null &&
+                sourceFamily != null &&
+                streamRefFamily != null &&
+                streamRefFamily != sourceFamily &&
+                (thumbFamily == null || thumbFamily != streamRefFamily)
+
+            val rawReferer = if (isCrossDomainEmbedLeak) {
+                sourceUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+            } else {
+                streamReferer?.takeIf { it.startsWith("http", ignoreCase = true) }
+                    ?: sourceUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+            }
+            val effectiveReferer = rawReferer?.let { sanitizeAsciiHeader(it, isUrl = true) }?.takeIf { it.isNotBlank() }
+
+            var effectiveOrigin = if (isCrossDomainEmbedLeak) null else streamOrigin?.let { sanitizeAsciiHeader(it, isUrl = true) }
             if (effectiveReferer != null) {
                 out["Referer"] = effectiveReferer
-                if (origin == null) {
+                if (effectiveOrigin.isNullOrBlank()) {
                     runCatching {
-                        val uri = URI(UrlUtils.encodeNonAsciiUrl(effectiveReferer))
+                        val uri = URI(effectiveReferer)
                         val scheme = uri.scheme
                         val host = uri.host
                         if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
-                            origin = if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
+                            effectiveOrigin = if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
                         }
                     }
                 }
             }
-            if (!origin.isNullOrBlank()) {
-                out["Origin"] = origin!!
+            if (!effectiveOrigin.isNullOrBlank()) {
+                out["Origin"] = effectiveOrigin!!
             }
 
-            val effectiveCookie = cookie ?: runCatching {
-                val target = thumbnailUrl?.takeIf { it.startsWith("http", ignoreCase = true) }
-                    ?: effectiveReferer
-                if (target != null) CookieManager.getInstance().getCookie(target) else null
-            }.getOrNull()?.takeIf { it.isNotBlank() }
+            val cookieFromManager = runCatching {
+                val cm = CookieManager.getInstance()
+                val thumbCookie = thumbnailUrl?.takeIf { it.startsWith("http", ignoreCase = true) }
+                    ?.let { cm.getCookie(UrlUtils.encodeNonAsciiUrl(it)) }
+                    ?.takeIf { it.isNotBlank() }
+                thumbCookie ?: effectiveReferer?.let { cm.getCookie(it) }?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+
+            val effectiveCookie = if (isCrossDomainEmbedLeak) {
+                cookieFromManager
+            } else {
+                streamCookie ?: cookieFromManager
+            }?.let { sanitizeAsciiHeader(it) }?.takeIf { it.isNotBlank() }
+
             if (!effectiveCookie.isNullOrBlank()) {
                 out["Cookie"] = effectiveCookie
             }

@@ -575,4 +575,70 @@ class ExtractorHttp {
         410 -> MediaException(AppError.EXPIRED_LINK, "HTTP $code")
         else -> MediaException(AppError.GENERIC, "HTTP $code")
     }
+
+    companion object {
+        /**
+         * Returns ordered fallback header sets to try when a movie/embed CDN returns HTTP 401/403
+         * for the primary headers (e.g. rejecting `Origin` on non-CORS GETs or rejecting a full-path
+         * `Referer` when it expects origin-only `https://host/` or no Referer).
+         * Does NOT include the original [headers] map itself (caller tries primary first).
+         */
+        fun buildRelaxedHeaderVariants(
+            headers: Map<String, String>,
+            includeBareNoReferer: Boolean = false
+        ): List<Map<String, String>> {
+            val out = ArrayList<Map<String, String>>(3)
+            val originKey = headers.keys.firstOrNull { it.equals("Origin", ignoreCase = true) }
+            val refererKey = headers.keys.firstOrNull { it.equals("Referer", ignoreCase = true) }
+            val refererVal = refererKey?.let { headers[it] }?.trim()
+
+            // Variant 1: strip Origin while keeping Referer, Cookie, User-Agent
+            if (originKey != null) {
+                val noOrigin = LinkedHashMap(headers).apply { remove(originKey) }
+                out += noOrigin
+            }
+
+            // Variant 2: origin-only Referer (`https://host/`) without Origin
+            if (!refererVal.isNullOrBlank()) {
+                val originOnly = runCatching {
+                    val uri = java.net.URI(UrlUtils.encodeNonAsciiUrl(refererVal))
+                    val scheme = uri.scheme
+                    val host = uri.host
+                    if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
+                        val base = if (uri.port > 0) "$scheme://$host:${uri.port}/" else "$scheme://$host/"
+                        base.takeUnless { it.equals(refererVal, ignoreCase = true) }
+                    } else null
+                }.getOrNull()
+                if (originOnly != null) {
+                    val v2 = LinkedHashMap(headers).apply {
+                        if (originKey != null) remove(originKey)
+                        if (refererKey != null) remove(refererKey)
+                        put("Referer", originOnly)
+                    }
+                    if (out.none { it == v2 }) out += v2
+                }
+            }
+
+            // Variant 3 (optional): strip both Referer and Origin (keep User-Agent & Cookie)
+            if (includeBareNoReferer && (refererKey != null || originKey != null)) {
+                val v3 = LinkedHashMap(headers).apply {
+                    if (originKey != null) remove(originKey)
+                    if (refererKey != null) remove(refererKey)
+                }
+                if (out.none { it == v3 }) out += v3
+            }
+
+            return out
+        }
+
+        fun isRejectedMediaContentType(contentType: String?): Boolean {
+            val ct = contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            if (ct.isEmpty()) return false
+            return ct.startsWith("text/html") ||
+                ct.startsWith("application/xhtml") ||
+                ct.startsWith("application/json") ||
+                ct.startsWith("text/plain") ||
+                ct.startsWith("image/")
+        }
+    }
 }
