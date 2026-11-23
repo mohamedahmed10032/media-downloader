@@ -186,7 +186,7 @@ class HlsSegmentDownloader @Inject constructor(
             onProgress(DownloadProgress(initialWritten, estTotal, 0L, -1L))
         }
 
-        val progressJob = launch {
+        val progressJob = launch(Dispatchers.Default) {
             while (isActive) {
                 delay(Constants.PROGRESS_THROTTLE_MS)
                 val bytes = written.get()

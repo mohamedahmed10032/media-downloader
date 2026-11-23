@@ -6,6 +6,12 @@ import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToLong
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -49,6 +55,14 @@ class HlsExtractor @Inject constructor(
         url: String,
         headers: Map<String, String>,
         heightHint: Int? = null
+    ): ResolvedMedia? = withContext(Dispatchers.IO) {
+        extractOnIo(url, headers, heightHint)
+    }
+
+    private suspend fun extractOnIo(
+        url: String,
+        headers: Map<String, String>,
+        heightHint: Int?
     ): ResolvedMedia? {
         if (ExtractorRegistry.isConfirmedHtml(url)) return null
         val text = http.fetchString(url, headers)
@@ -102,7 +116,11 @@ class HlsExtractor @Inject constructor(
             val firstVariant = rawVariants.firstOrNull()
             val firstVariantUrl = firstVariant?.variantUrl
             val variantText = if (firstVariantUrl != null) {
-                runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
+                withTimeoutOrNull(VARIANT_PLAYLIST_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = VARIANT_PLAYLIST_TIMEOUT_MS) {
+                        runCatching { http.fetchString(firstVariantUrl, headers) }.getOrNull()
+                    }
+                }
             } else null
 
             val sanitizedFirstVariant = if (!variantText.isNullOrBlank() && firstVariantUrl != null) {
@@ -383,7 +401,7 @@ class HlsExtractor @Inject constructor(
         return ResolvedMedia(sourceUrl = url, title = title, streams = sorted, extractor = name)
     }
 
-    private fun computePeakBandwidthCalibrationScale(
+    private suspend fun computePeakBandwidthCalibrationScale(
         firstVariant: RawVariant?,
         sanitizedFirstVariant: SanitizedHlsPlaylist?,
         hasPeakOnlyVariants: Boolean,
@@ -408,7 +426,7 @@ class HlsExtractor @Inject constructor(
             }
         }
 
-        // Probe up to 2 interior segments (skipping seg[0], which is often skewed by intro/keyframe spikes)
+        // Probe up to 2 interior segments in parallel (skipping seg[0], often skewed by intro/keyframe spikes)
         val n = mediaSegments.size
         val sampleSegments = if (n >= 4) {
             listOf(mediaSegments[n / 3], mediaSegments[(n * 2) / 3]).distinctBy { it.url }
@@ -421,26 +439,34 @@ class HlsExtractor @Inject constructor(
         return (measuredBps / declaredBw.toDouble()).coerceIn(MIN_CALIBRATION_SCALE, MAX_CALIBRATION_SCALE)
     }
 
-    private fun probeAverageByteRate(
+    private suspend fun probeAverageByteRate(
         segments: List<HlsParsedSegment>,
         headers: Map<String, String>,
         useShortTimeout: Boolean
-    ): Double? {
-        var totalBytes = 0L
-        var totalDurationSec = 0.0
-        for (seg in segments) {
-            if (seg.durationSec <= 0.0) continue
-            val probe = if (useShortTimeout) {
-                runCatching { http.probe(seg.url, headers, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
-                    ?: runCatching { http.probe(seg.url, headers) }.getOrNull()
-            } else {
-                runCatching { http.probe(seg.url, headers) }.getOrNull()
+    ): Double? = coroutineScope {
+        val validSegments = segments.filter { it.durationSec > 0.0 }
+        if (validSegments.isEmpty()) return@coroutineScope null
+
+        val timeoutBudget = if (useShortTimeout) SEGMENT_PROBE_TIMEOUT_MS else DIRECT_SEGMENT_PROBE_TIMEOUT_MS
+        val samples = withTimeoutOrNull(timeoutBudget + 250L) {
+            withCancellableHttpCalls(timeoutMs = timeoutBudget) {
+                validSegments.map { seg ->
+                    async(Dispatchers.IO) {
+                        val probe = if (useShortTimeout) {
+                            runCatching { http.probe(seg.url, headers, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
+                        } else {
+                            runCatching { http.probe(seg.url, headers) }.getOrNull()
+                        }
+                        val len = probe?.contentLength?.takeIf { it > 0L }
+                        if (len != null) len to seg.durationSec else null
+                    }
+                }.awaitAll()
             }
-            val len = probe?.contentLength?.takeIf { it > 0L } ?: continue
-            totalBytes += len
-            totalDurationSec += seg.durationSec
-        }
-        return if (totalBytes > 0L && totalDurationSec > 0.0) {
+        }.orEmpty().filterNotNull()
+
+        val totalBytes = samples.sumOf { it.first }
+        val totalDurationSec = samples.sumOf { it.second }
+        if (totalBytes > 0L && totalDurationSec > 0.0) {
             totalBytes.toDouble() / totalDurationSec
         } else {
             null
@@ -490,7 +516,9 @@ class HlsExtractor @Inject constructor(
     )
 
     private companion object {
-        const val SEGMENT_PROBE_TIMEOUT_MS = 1_500L
+        const val VARIANT_PLAYLIST_TIMEOUT_MS = 2_500L
+        const val SEGMENT_PROBE_TIMEOUT_MS = 1_200L
+        const val DIRECT_SEGMENT_PROBE_TIMEOUT_MS = 1_800L
         const val TS_TO_MP4_CONTAINER_FACTOR = 0.94
         const val MIN_CALIBRATION_SCALE = 0.85
         const val MAX_CALIBRATION_SCALE = 1.35

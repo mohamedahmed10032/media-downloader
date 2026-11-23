@@ -8,9 +8,15 @@ import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.intercept.AdBlocker
 import com.melmeligy.mediadownloader.intercept.MediaSniffer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -102,22 +108,26 @@ class HtmlMediaExtractor @Inject constructor(
         url: String,
         customHeaders: Map<String, String> = emptyMap(),
         allowHeadlessFallback: Boolean = true
-    ): ResolvedMedia? = coroutineScope {
+    ): ResolvedMedia? = withContext(Dispatchers.IO) {
         progressTracker.update(ExtractionProgressTracker.STAGE_FETCHING)
         val pageHeaders = buildPageHeaders(url, customHeaders)
         val html = try {
-            http.fetchString(url, pageHeaders)
-        } catch (ce: kotlinx.coroutines.CancellationException) {
+            withTimeoutOrNull(INITIAL_PAGE_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = INITIAL_PAGE_TIMEOUT_MS) {
+                    http.fetchString(url, pageHeaders)
+                }
+            }.orEmpty()
+        } catch (ce: CancellationException) {
             throw ce
         } catch (_: Exception) {
             ""
         }
         if (html.isBlank()) {
-            return@coroutineScope if (allowHeadlessFallback) {
+            return@withContext if (allowHeadlessFallback) {
                 progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
                 try {
                     headlessWebExtractor.extract(url)
-                } catch (ce: kotlinx.coroutines.CancellationException) {
+                } catch (ce: CancellationException) {
                     throw ce
                 } catch (_: Exception) {
                     null
@@ -135,7 +145,7 @@ class HtmlMediaExtractor @Inject constructor(
             it.type == MediaType.VIDEO || it.type == MediaType.AUDIO
         } == true
         if (parsed != null && hasVideoOrAudio) {
-            return@coroutineScope parsed
+            return@withContext parsed
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
@@ -145,9 +155,10 @@ class HtmlMediaExtractor @Inject constructor(
             } ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractTitle(it, url) }
             val fallbackThumb = parsed?.thumbnailUrl?.takeIf { it.isNotBlank() }
                 ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractThumbnail(it, url, html) }
+            HeadlessWebExtractor.hintPageMetadata(url, fallbackTitle, fallbackThumb)
             val headless = try {
                 headlessWebExtractor.extract(url)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
+            } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
                 null
@@ -162,7 +173,7 @@ class HtmlMediaExtractor @Inject constructor(
                     headless.title
                 }
                 val mergedThumb = headless.thumbnailUrl?.takeIf { it.isNotBlank() } ?: fallbackThumb
-                return@coroutineScope headless.copy(
+                return@withContext headless.copy(
                     title = mergedTitle,
                     thumbnailUrl = mergedThumb
                 )
@@ -892,22 +903,63 @@ class HtmlMediaExtractor @Inject constructor(
                 .distinct()
                 .take(4)
                 .toList()
-            for (hlsUrl in hlsUrls) {
-                addExpandedHls(hlsUrl)
-            }
-
             val mpdUrls = mpdRegex.findAll(unescapedScripts)
                 .map { it.value }
                 .filterNot { MediaSniffer.isPreviewOrAdUrl(it) }
                 .distinct()
                 .take(2)
                 .toList()
-            for (mpdUrl in mpdUrls) {
-                val expanded = runCatching { dashExtractor.extract(mpdUrl, effectiveHeaders()) }.getOrNull()
-                expanded?.streams?.forEach { variant ->
-                    val k = MediaSniffer.dedupeKey(variant.url)
-                    if (!found.containsKey(k)) {
-                        found[k] = variant.copy(id = "html-${counter++}", headers = effectiveHeaders() + variant.headers)
+
+            if (hlsUrls.isNotEmpty() || mpdUrls.isNotEmpty()) {
+                val headersSnapshot = effectiveHeaders()
+                val (expandedHlsList, expandedMpdList) = withTimeoutOrNull(IFRAME_FALLBACK_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = IFRAME_FALLBACK_TIMEOUT_MS) {
+                        val hlsJobs = hlsUrls.map { rawHlsUrl ->
+                            async(Dispatchers.IO) {
+                                val trimmedRaw = unescapeUrl(rawHlsUrl.trim())
+                                if (MediaSniffer.isHexCipherUrl(trimmedRaw)) return@async rawHlsUrl to null
+                                val cleaned = MediaSniffer.cleanMediaUrl(UrlUtils.resolveUrl(pageUrl, trimmedRaw))
+                                if (!cleaned.startsWith("http") || MediaSniffer.isHexCipherUrl(cleaned) || MediaSniffer.isPreviewOrAdUrl(cleaned)) {
+                                    return@async cleaned to null
+                                }
+                                cleaned to runCatching { hlsExtractor.extract(cleaned, headersSnapshot, null) }.getOrNull()
+                            }
+                        }
+                        val mpdJobs = mpdUrls.map { mpdUrl ->
+                            async(Dispatchers.IO) {
+                                runCatching { dashExtractor.extract(mpdUrl, headersSnapshot) }.getOrNull()
+                            }
+                        }
+                        hlsJobs.awaitAll() to mpdJobs.awaitAll()
+                    }
+                } ?: (emptyList<Pair<String, ResolvedMedia?>>() to emptyList<ResolvedMedia?>())
+
+                for ((cleanedHls, expanded) in expandedHlsList) {
+                    if (!cleanedHls.startsWith("http") || MediaSniffer.isHexCipherUrl(cleanedHls) || MediaSniffer.isPreviewOrAdUrl(cleanedHls)) continue
+                    if (expanded != null && expanded.streams.isNotEmpty()) {
+                        expanded.streams.forEach { variant ->
+                            val k = MediaSniffer.dedupeKey(variant.url)
+                            if (!found.containsKey(k)) {
+                                found[k] = variant.copy(id = "html-${counter++}", headers = headersSnapshot + variant.headers)
+                            }
+                        }
+                    } else {
+                        addStream(
+                            rawUrl = cleanedHls,
+                            type = MediaType.VIDEO,
+                            container = "ts",
+                            label = "HLS (auto)",
+                            isHls = true
+                        )
+                    }
+                }
+
+                for (expanded in expandedMpdList) {
+                    expanded?.streams?.forEach { variant ->
+                        val k = MediaSniffer.dedupeKey(variant.url)
+                        if (!found.containsKey(k)) {
+                            found[k] = variant.copy(id = "html-${counter++}", headers = headersSnapshot + variant.headers)
+                        }
                     }
                 }
             }
@@ -962,6 +1014,7 @@ class HtmlMediaExtractor @Inject constructor(
                     val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
                         doc = doc,
                         pageUrl = pageUrl,
+                        rawHtml = html,
                         preferredThumb = customThumb,
                         jsonLdThumb = jsonLdThumb,
                         playerPoster = portalRes.posterUrl
@@ -981,7 +1034,7 @@ class HtmlMediaExtractor @Inject constructor(
                 }
             }
 
-            // Fallback for specialized tube embeds (KVS/Pornhub/XVideos inside an iframe) with proper embed Referer/Origin
+            // Fallback for specialized tube embeds (KVS/Pornhub/XVideos inside an iframe) raced in parallel
             val iframeUrls = doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src]")
                 .mapNotNull { el ->
                     val raw = el.absUrl("src")
@@ -998,40 +1051,70 @@ class HtmlMediaExtractor @Inject constructor(
                 .distinct()
                 .take(2)
 
-            for (iframeUrl in iframeUrls) {
-                val fetchHeaders = buildPageHeaders(iframeUrl, baseHeaders + ("Referer" to pageUrl))
-                val iframeHtml = runCatching { http.fetchString(iframeUrl, fetchHeaders) }.getOrNull().orEmpty()
-                if (iframeHtml.isNotBlank()) {
-                    // Use the iframe's own URL as Referer & Origin for streams extracted inside the iframe
-                    val iframeStreamHeaders = buildPageHeaders(iframeUrl, emptyMap())
-                    val embedded = parseHtml(iframeUrl, iframeHtml, iframeStreamHeaders, allowEmbedFollow = false)
-                    if (embedded != null && embedded.streams.isNotEmpty()) {
-                        val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
-                            doc = doc,
-                            pageUrl = pageUrl,
-                            preferredThumb = customThumb,
-                            jsonLdThumb = jsonLdThumb,
-                            playerPoster = embedded.thumbnailUrl
-                        )
-                        val title = HtmlThumbnailExtractor.extractTitle(
-                            doc = doc,
-                            pageUrl = pageUrl,
-                            preferredTitle = customTitle ?: jsonLdTitle
-                        ).let { extracted ->
-                            if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extracted, pageUrl) &&
-                                !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(embedded.title, pageUrl)
-                            ) {
-                                embedded.title
-                            } else {
-                                extracted
+            if (iframeUrls.isNotEmpty()) {
+                val iframeCh = Channel<ResolvedMedia?>(capacity = iframeUrls.size)
+                val iframeJobs = iframeUrls.map { iframeUrl ->
+                    launch(Dispatchers.IO) {
+                        val res = try {
+                            withTimeoutOrNull(IFRAME_FALLBACK_TIMEOUT_MS) {
+                                withCancellableHttpCalls(timeoutMs = IFRAME_FALLBACK_TIMEOUT_MS) {
+                                    val fetchHeaders = buildPageHeaders(iframeUrl, baseHeaders + ("Referer" to pageUrl))
+                                    val iframeHtml = runCatching { http.fetchString(iframeUrl, fetchHeaders) }.getOrNull().orEmpty()
+                                    if (iframeHtml.isNotBlank()) {
+                                        val iframeStreamHeaders = buildPageHeaders(iframeUrl, emptyMap())
+                                        parseHtml(iframeUrl, iframeHtml, iframeStreamHeaders, allowEmbedFollow = false)
+                                    } else null
+                                }
                             }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Exception) {
+                            null
                         }
-                        return@coroutineScope embedded.copy(
-                            sourceUrl = pageUrl,
-                            title = title,
-                            thumbnailUrl = thumbnail
-                        )
+                        iframeCh.trySend(res)
                     }
+                }
+                var winningEmbedded: ResolvedMedia? = null
+                try {
+                    for (i in iframeUrls.indices) {
+                        val candidate = iframeCh.receiveCatching().getOrNull() ?: continue
+                        if (candidate.streams.isNotEmpty()) {
+                            winningEmbedded = candidate
+                            break
+                        }
+                    }
+                } finally {
+                    iframeJobs.forEach { it.cancel() }
+                    iframeCh.close()
+                }
+                if (winningEmbedded != null) {
+                    val embedded = winningEmbedded!!
+                    val thumbnail = HtmlThumbnailExtractor.extractThumbnail(
+                        doc = doc,
+                        pageUrl = pageUrl,
+                        rawHtml = html,
+                        preferredThumb = customThumb,
+                        jsonLdThumb = jsonLdThumb,
+                        playerPoster = embedded.thumbnailUrl
+                    )
+                    val title = HtmlThumbnailExtractor.extractTitle(
+                        doc = doc,
+                        pageUrl = pageUrl,
+                        preferredTitle = customTitle ?: jsonLdTitle
+                    ).let { extracted ->
+                        if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extracted, pageUrl) &&
+                            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(embedded.title, pageUrl)
+                        ) {
+                            embedded.title
+                        } else {
+                            extracted
+                        }
+                    }
+                    return@coroutineScope embedded.copy(
+                        sourceUrl = pageUrl,
+                        title = title,
+                        thumbnailUrl = thumbnail
+                    )
                 }
             }
         }
@@ -1063,60 +1146,64 @@ class HtmlMediaExtractor @Inject constructor(
             preferredTitle = customTitle ?: jsonLdTitle
         )
 
-        // ---- 11. Probe direct streams concurrently for exact sizeBytes & reject dead/HTML/image/tiny bumpers ----
+        // ---- 11. Probe direct streams concurrently with bounded fast timeout to reject dead/HTML/image/tiny bumpers ----
         val rawStreams = found.values.toList()
-        val probeResults = rawStreams.mapIndexed { i, stream ->
-            async(kotlinx.coroutines.Dispatchers.IO) {
-                if (!stream.isHls && stream.type != MediaType.IMAGE && i < MAX_SIZE_PROBES) {
-                    try {
-                        val info = http.probe(stream.url, stream.headers)
-                        if (info.code !in 200..299) {
-                            null to null
-                        } else {
-                            val ct = info.contentType?.lowercase().orEmpty()
-                            if (ct.startsWith("text/html") ||
-                                ct.startsWith("application/xhtml") ||
-                                ct.startsWith("application/json") ||
-                                ct.startsWith("image/")
-                            ) {
-                                null to null
-                            } else if (info.contentLength in 1..40_000L) {
+        val probeResults = withCancellableHttpCalls(timeoutMs = DIRECT_PROBE_TIMEOUT_MS) {
+            rawStreams.mapIndexed { i, stream ->
+                async(Dispatchers.IO) {
+                    if (!stream.isHls && stream.type != MediaType.IMAGE && i < MAX_SIZE_PROBES) {
+                        try {
+                            val info = http.probe(stream.url, stream.headers)
+                            if (info.code !in 200..299) {
                                 null to null
                             } else {
-                                val updatedHeaders = if (info.acceptsRanges) {
-                                    stream.headers + ("X-Internal-Accepts-Ranges" to "true")
+                                val ct = info.contentType?.lowercase().orEmpty()
+                                if (ct.startsWith("text/html") ||
+                                    ct.startsWith("application/xhtml") ||
+                                    ct.startsWith("application/json") ||
+                                    ct.startsWith("image/")
+                                ) {
+                                    null to null
+                                } else if (info.contentLength in 1..40_000L) {
+                                    null to null
                                 } else {
-                                    stream.headers
+                                    val updatedHeaders = if (info.acceptsRanges) {
+                                        stream.headers + ("X-Internal-Accepts-Ranges" to "true")
+                                    } else {
+                                        stream.headers
+                                    }
+                                    val finalUrl = info.finalUrl.takeIf { it.startsWith("http") }
+                                        ?.let { MediaSniffer.cleanMediaUrl(it) }
+                                        ?: stream.url
+                                    val finalStream = stream.copy(
+                                        url = finalUrl,
+                                        sizeBytes = info.contentLength.takeIf { it > 0 } ?: stream.sizeBytes,
+                                        headers = updatedHeaders
+                                    )
+                                    finalStream to null
                                 }
-                                val finalUrl = info.finalUrl.takeIf { it.startsWith("http") }
-                                    ?.let { MediaSniffer.cleanMediaUrl(it) }
-                                    ?: stream.url
-                                val finalStream = stream.copy(
-                                    url = finalUrl,
-                                    sizeBytes = info.contentLength.takeIf { it > 0 } ?: stream.sizeBytes,
-                                    headers = updatedHeaders
-                                )
-                                finalStream to null
                             }
-                        }
-                    } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
-                        if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
-                            e.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK ||
-                            e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
-                        ) {
-                            null to null
-                        } else {
-                            // Transient network/timeout error -> keep only if zero live streams survive
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+                            if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                                e.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK ||
+                                e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+                            ) {
+                                null to null
+                            } else {
+                                // Transient network/timeout error -> keep only if zero live streams survive
+                                null to stream
+                            }
+                        } catch (_: Exception) {
                             null to stream
                         }
-                    } catch (_: Exception) {
-                        null to stream
+                    } else {
+                        stream to null
                     }
-                } else {
-                    stream to null
                 }
-            }
-        }.awaitAll()
+            }.awaitAll()
+        }
 
         val liveProbed = probeResults.mapNotNull { it.first }
         val probedStreams = if (liveProbed.isNotEmpty()) {
@@ -1408,5 +1495,8 @@ class HtmlMediaExtractor @Inject constructor(
 
     private companion object {
         const val MAX_SIZE_PROBES = 10
+        const val INITIAL_PAGE_TIMEOUT_MS = 6_000L
+        const val IFRAME_FALLBACK_TIMEOUT_MS = 3_500L
+        const val DIRECT_PROBE_TIMEOUT_MS = 2_000L
     }
 }

@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import javax.inject.Inject
@@ -83,7 +84,11 @@ class InterceptedMediaExtractor : MediaExtractor {
         val isAuthoritative: Boolean = false
     )
 
-    override suspend fun extract(url: String): ResolvedMedia? = coroutineScope {
+    override suspend fun extract(url: String): ResolvedMedia? = withContext(Dispatchers.IO) {
+        extractOnIo(url)
+    }
+
+    private suspend fun extractOnIo(url: String): ResolvedMedia? = coroutineScope {
         val rawCandidates = engine.payloadsFor(url)
             .filter { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
             .filterNot { MediaSniffer.isHexCipherUrl(it.url) || MediaSniffer.isPreviewOrAdUrl(it.url) }
@@ -113,59 +118,61 @@ class InterceptedMediaExtractor : MediaExtractor {
             }
         }
 
-        // Probe all candidates concurrently on IO (OkHttp probeClient enforces real wall-clock timeouts)
-        val outcomes = rawCandidates.take(16).mapIndexed { idx, payload ->
-            async(Dispatchers.IO) {
-                val cleanUrl = MediaSniffer.cleanMediaUrl(payload.url)
-                val sanitizedHint = payload.qualityHint?.takeIf { it > 0 }
-                val headers = LinkedHashMap<String, String>().apply {
-                    putAll(bestHeaders)
-                    putAll(payload.headersMap)
-                    remove("X-Internal-Default")
-                    if (payload.durationSeconds != null && payload.durationSeconds > 0L) {
-                        put("X-Internal-Duration-Seconds", payload.durationSeconds.toString())
+        // Probe all candidates concurrently on IO with bounded fast timeout
+        val outcomes = withCancellableHttpCalls(timeoutMs = CANDIDATE_PROBE_TIMEOUT_MS) {
+            rawCandidates.take(16).mapIndexed { idx, payload ->
+                async(Dispatchers.IO) {
+                    val cleanUrl = MediaSniffer.cleanMediaUrl(payload.url)
+                    val sanitizedHint = payload.qualityHint?.takeIf { it > 0 }
+                    val headers = LinkedHashMap<String, String>().apply {
+                        putAll(bestHeaders)
+                        putAll(payload.headersMap)
+                        remove("X-Internal-Default")
+                        if (payload.durationSeconds != null && payload.durationSeconds > 0L) {
+                            put("X-Internal-Duration-Seconds", payload.durationSeconds.toString())
+                        }
+                        if (payload.isAuthoritativePlayer) {
+                            put("X-Internal-Authoritative", "true")
+                        }
                     }
-                    if (payload.isAuthoritativePlayer) {
-                        put("X-Internal-Authoritative", "true")
+                    when (payload.streamType) {
+                        StreamType.HLS -> {
+                            val list = runCatching {
+                                val res = if (sanitizedHint != null) {
+                                    hlsExtractor.extract(cleanUrl, headers, sanitizedHint)
+                                } else {
+                                    hlsExtractor.extract(cleanUrl, headers)
+                                }
+                                res?.streams?.map { s ->
+                                    val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                    if (payload.isAuthoritativePlayer) {
+                                        s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
+                                    } else {
+                                        s.copy(headers = cleanH)
+                                    }
+                                }
+                            }.getOrNull().orEmpty()
+                            ProbeOutcome(list, null, payload.isAuthoritativePlayer)
+                        }
+                        StreamType.DASH -> {
+                            val list = runCatching {
+                                dashExtractor.extract(cleanUrl, headers)?.streams?.map { s ->
+                                    val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                    if (payload.isAuthoritativePlayer) {
+                                        s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
+                                    } else {
+                                        s.copy(headers = cleanH)
+                                    }
+                                }
+                            }.getOrNull().orEmpty()
+                            ProbeOutcome(list, null, payload.isAuthoritativePlayer)
+                        }
+                        StreamType.PROGRESSIVE -> probeProgressive(idx, payload.copy(url = cleanUrl, qualityHint = sanitizedHint), headers)
+                        StreamType.BLOB, StreamType.UNKNOWN -> ProbeOutcome(emptyList())
                     }
                 }
-                when (payload.streamType) {
-                    StreamType.HLS -> {
-                        val list = runCatching {
-                            val res = if (sanitizedHint != null) {
-                                hlsExtractor.extract(cleanUrl, headers, sanitizedHint)
-                            } else {
-                                hlsExtractor.extract(cleanUrl, headers)
-                            }
-                            res?.streams?.map { s ->
-                                val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
-                                if (payload.isAuthoritativePlayer) {
-                                    s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
-                                } else {
-                                    s.copy(headers = cleanH)
-                                }
-                            }
-                        }.getOrNull().orEmpty()
-                        ProbeOutcome(list, null, payload.isAuthoritativePlayer)
-                    }
-                    StreamType.DASH -> {
-                        val list = runCatching {
-                            dashExtractor.extract(cleanUrl, headers)?.streams?.map { s ->
-                                val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
-                                if (payload.isAuthoritativePlayer) {
-                                    s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
-                                } else {
-                                    s.copy(headers = cleanH)
-                                }
-                            }
-                        }.getOrNull().orEmpty()
-                        ProbeOutcome(list, null, payload.isAuthoritativePlayer)
-                    }
-                    StreamType.PROGRESSIVE -> probeProgressive(idx, payload.copy(url = cleanUrl, qualityHint = sanitizedHint), headers)
-                    StreamType.BLOB, StreamType.UNKNOWN -> ProbeOutcome(emptyList())
-                }
-            }
-        }.awaitAll()
+            }.awaitAll()
+        }
 
         val liveStreamsAll = outcomes.flatMap { it.streams }
         val timedOutFallbacks = outcomes.mapNotNull { it.timedOutFallback }
@@ -199,9 +206,13 @@ class InterceptedMediaExtractor : MediaExtractor {
 
         var htmlResolved: ResolvedMedia? = null
         if (isWebPage && htmlMediaExtractor != null && distinctAuthHeights.size < 2) {
-            htmlResolved = runCatching {
-                htmlMediaExtractor.extractWithHeaders(url, bestHeaders, allowHeadlessFallback = false)
-            }.getOrNull()
+            htmlResolved = withTimeoutOrNull(HTML_ENRICH_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = HTML_ENRICH_TIMEOUT_MS) {
+                    runCatching {
+                        htmlMediaExtractor.extractWithHeaders(url, bestHeaders, allowHeadlessFallback = false)
+                    }.getOrNull()
+                }
+            }
         }
 
         if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url) &&
@@ -217,24 +228,28 @@ class InterceptedMediaExtractor : MediaExtractor {
             (pageThumb.isNullOrBlank() || HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url))
         ) {
             // Recover artwork & title directly from page HTML even when static HTML had zero direct video streams
-            runCatching {
-                val htmlText = http.fetchString(url, bestHeaders)
-                if (htmlText.isNotBlank()) {
-                    val doc = Jsoup.parse(htmlText, url)
-                    if (pageThumb.isNullOrBlank()) {
-                        val playerPoster = JsUnpacker.extractPlayerConfigs(htmlText).posterUrl
-                        val extractedThumb = HtmlThumbnailExtractor.extractThumbnail(
-                            doc = doc,
-                            pageUrl = url,
-                            rawHtml = htmlText,
-                            playerPoster = playerPoster
-                        )
-                        if (!extractedThumb.isNullOrBlank()) pageThumb = extractedThumb
-                    }
-                    if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url)) {
-                        val extractedTitle = HtmlThumbnailExtractor.extractTitle(doc, url)
-                        if (!HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extractedTitle, url)) {
-                            pageTitle = extractedTitle
+            withTimeoutOrNull(METADATA_FETCH_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = METADATA_FETCH_TIMEOUT_MS) {
+                    runCatching {
+                        val htmlText = http.fetchString(url, bestHeaders)
+                        if (htmlText.isNotBlank()) {
+                            val doc = Jsoup.parse(htmlText, url)
+                            if (pageThumb.isNullOrBlank()) {
+                                val playerPoster = JsUnpacker.extractPlayerConfigs(htmlText).posterUrl
+                                val extractedThumb = HtmlThumbnailExtractor.extractThumbnail(
+                                    doc = doc,
+                                    pageUrl = url,
+                                    rawHtml = htmlText,
+                                    playerPoster = playerPoster
+                                )
+                                if (!extractedThumb.isNullOrBlank()) pageThumb = extractedThumb
+                            }
+                            if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url)) {
+                                val extractedTitle = HtmlThumbnailExtractor.extractTitle(doc, url)
+                                if (!HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(extractedTitle, url)) {
+                                    pageTitle = extractedTitle
+                                }
+                            }
                         }
                     }
                 }
@@ -520,5 +535,11 @@ class InterceptedMediaExtractor : MediaExtractor {
         val clean = host?.lowercase()?.removePrefix("www.")?.trimEnd('.') ?: return null
         val parts = clean.split('.')
         return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else clean
+    }
+
+    private companion object {
+        const val CANDIDATE_PROBE_TIMEOUT_MS = 2_200L
+        const val HTML_ENRICH_TIMEOUT_MS = 3_000L
+        const val METADATA_FETCH_TIMEOUT_MS = 2_500L
     }
 }

@@ -233,11 +233,10 @@ class TikTokExtractionAuditTest {
         assertEquals(3_288_875L, videos[1].sizeBytes)
         assertEquals(2, audios.size)
 
-        // Verify Cookie + Referer + Accepts-Ranges were wired into MediaStream.headers & CDN probe returned 206
+        // Verify Cookie + Referer were wired into MediaStream.headers & JSON DataSize skipped redundant video probes
         assertTrue(videos[0].headers["Cookie"]?.contains("tt_chain_token=xyz789") == true)
         assertEquals("https://www.tiktok.com/", videos[0].headers["Referer"])
-        assertEquals("true", videos[0].headers["X-Internal-Accepts-Ranges"])
-        assertTrue(rangeVideoProbes.get() >= 2)
+        assertEquals(0, rangeVideoProbes.get())
 
         // Confirm unauthenticated direct probe without headers gets 403
         val rawNoAuthClient = OkHttpClient.Builder()
@@ -415,11 +414,73 @@ class TikTokExtractionAuditTest {
         assertEquals(1, resolved.streams.size)
         val stream = resolved.streams.first()
         assertEquals(720, stream.height)
+        assertEquals(2_250_000L, stream.sizeBytes)
         assertEquals("ttwid=fresh1; tt_chain_token=fresh2", stream.headers["Cookie"])
         assertEquals("https://www.tiktok.com/", stream.headers["Referer"])
-        assertEquals("true", stream.headers["X-Internal-Accepts-Ranges"])
 
-        // Must NOT perform redundant full-body resolveFinalUrl GET when probe already resolved the short URL
+        // Must NOT perform redundant full-body resolveFinalUrl GET or redundant video probe when DataSize is present
         verify(exactly = 0) { mockHttp.resolveFinalUrl(any(), any()) }
+        verify(exactly = 0) { mockHttp.probe(match { it.contains("webapp-prime") }, any()) }
+    }
+
+    @Test
+    fun hydrationJson_probesVideoOnlyWhenDataSizeMissing_andPopulatesSizeAndRangeHeader() = runBlocking {
+        val mockHttp = mockk<ExtractorHttp>()
+        val mockHeadless = mockk<HeadlessWebExtractor>(relaxed = true)
+        val canonicalUrl = "https://www.tiktok.com/@creator/video/7106594312292453999"
+
+        every { mockHttp.cookieHeaderFor(any()) } returns null
+        coEvery { mockHttp.fetchString(match { it.contains("tikwm.com") }, any()) } throws
+            MediaException(AppError.GEO_BLOCKED, "HTTP 403")
+        val missingSizeJson = """
+            {
+              "__DEFAULT_SCOPE__": {
+                "webapp.video-detail": {
+                  "itemInfo": {
+                    "itemStruct": {
+                      "id": "7106594312292453999",
+                      "desc": "Missing Size Video",
+                      "video": {
+                        "duration": 10,
+                        "cover": "https://p16.tiktokcdn.com/missing-size-thumb.jpg",
+                        "bitrateInfo": [
+                          {
+                            "GearName": "normal_1080_0",
+                            "Bitrate": 2000000,
+                            "PlayAddr": {
+                              "Width": 1080,
+                              "Height": 1920,
+                              "UrlList": ["https://v16-webapp-prime.us.tiktok.com/video/tos/no-size-1080/?mime_type=video_mp4"]
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        coEvery { mockHttp.fetchHtmlWithCookies(canonicalUrl, any()) } returns ExtractorHttp.HtmlFetchResult(
+            html = "<html><script id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\">$missingSizeJson</script></html>",
+            cookieHeader = "ttwid=c1; tt_chain_token=c2",
+            finalUrl = canonicalUrl
+        )
+        every { mockHttp.probe(match { it.contains("no-size-1080") }, any()) } returns HeadInfo(
+            code = 206,
+            contentType = "video/mp4",
+            contentLength = 4_812_345L,
+            acceptsRanges = true,
+            finalUrl = "https://v16-webapp-prime.us.tiktok.com/video/tos/no-size-1080/?mime_type=video_mp4"
+        )
+
+        val resolved = SocialMediaExtractor(mockHttp, mockHeadless).extract(canonicalUrl)
+        assertNotNull(resolved)
+        val stream = resolved!!.streams.single()
+        assertEquals(1080, stream.height)
+        assertEquals(4_812_345L, stream.sizeBytes)
+        assertEquals("true", stream.headers["X-Internal-Accepts-Ranges"])
+        assertEquals("ttwid=c1; tt_chain_token=c2", stream.headers["Cookie"])
+        verify(exactly = 1) { mockHttp.probe(match { it.contains("no-size-1080") }, any()) }
     }
 }

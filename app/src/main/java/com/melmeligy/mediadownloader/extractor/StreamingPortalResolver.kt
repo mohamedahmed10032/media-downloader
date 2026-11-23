@@ -6,10 +6,13 @@ import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.intercept.AdBlocker
 import com.melmeligy.mediadownloader.intercept.MediaSniffer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -126,7 +129,9 @@ class StreamingPortalResolver(
             progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
             val subHeaders = buildHopHeaders(subUrl, pageUrl, baseHeaders)
             val subHtml = withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
-                runCatching { http.fetchString(subUrl, subHeaders) }.getOrNull()
+                withCancellableHttpCalls(timeoutMs = PAGE_FETCH_TIMEOUT_MS) {
+                    runCatching { http.fetchString(subUrl, subHeaders) }.getOrNull()
+                }
             }.orEmpty()
             if (subHtml.isBlank()) continue
 
@@ -316,64 +321,112 @@ class StreamingPortalResolver(
         visitedEmbeds: MutableSet<String>,
         idCounter: AtomicInteger
     ): Pair<List<MediaStream>, String?> = coroutineScope {
-        val semaphore = Semaphore(MAX_CONCURRENT_SERVERS)
-        val posterRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        if (jobs.isEmpty()) return@coroutineScope emptyList<MediaStream>() to null
 
-        val results = withTimeoutOrNull(PORTAL_TOTAL_BUDGET_MS) {
-            jobs.map { job ->
-                async(Dispatchers.IO) {
+        val semaphore = Semaphore(MAX_CONCURRENT_SERVERS)
+        val outcomeChannel = Channel<PortalExtractionResult>(capacity = jobs.size)
+
+        val runningJobs = jobs.map { job ->
+            launch(Dispatchers.IO) {
+                var outcome = PortalExtractionResult(emptyList())
+                try {
                     semaphore.withPermit {
-                        withTimeoutOrNull(SERVER_PROBE_TIMEOUT_MS) {
-                            when (job) {
-                                is ServerJob.DirectEmbed -> {
-                                    progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS)
-                                    val res = resolveEmbedRecursive(
-                                        embedUrl = job.embedUrl,
-                                        parentUrl = job.parentPageUrl,
-                                        baseHeaders = baseHeaders,
-                                        serverName = job.serverName,
-                                        depth = 1,
-                                        visited = visitedEmbeds,
-                                        idCounter = idCounter
-                                    )
-                                    if (res.posterUrl != null) posterRef.compareAndSet(null, res.posterUrl)
-                                    res.streams
-                                }
-                                is ServerJob.AjaxServer -> {
-                                    val ajaxHeaders = LinkedHashMap<String, String>(baseHeaders).apply {
-                                        put("Referer", job.parentPageUrl)
-                                        originOf(job.parentPageUrl)?.let { put("Origin", it) }
-                                        put("X-Requested-With", "XMLHttpRequest")
+                        outcome = withTimeoutOrNull(SERVER_PROBE_TIMEOUT_MS) {
+                            withCancellableHttpCalls(timeoutMs = SERVER_PROBE_TIMEOUT_MS) {
+                                when (job) {
+                                    is ServerJob.DirectEmbed -> {
+                                        progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS)
+                                        resolveEmbedRecursive(
+                                            embedUrl = job.embedUrl,
+                                            parentUrl = job.parentPageUrl,
+                                            baseHeaders = baseHeaders,
+                                            serverName = job.serverName,
+                                            depth = 1,
+                                            visited = visitedEmbeds,
+                                            idCounter = idCounter
+                                        )
                                     }
-                                    val resp = runCatching {
-                                        withContext(Dispatchers.IO) {
-                                            http.postForm(job.endpointUrl, job.formBody, ajaxHeaders)
+                                    is ServerJob.AjaxServer -> {
+                                        val ajaxHeaders = LinkedHashMap<String, String>(baseHeaders).apply {
+                                            put("Referer", job.parentPageUrl)
+                                            originOf(job.parentPageUrl)?.let { put("Origin", it) }
+                                            put("X-Requested-With", "XMLHttpRequest")
                                         }
-                                    }.getOrNull().orEmpty()
-                                    val embedUrl = extractEmbedUrlFromAjaxResponse(resp, job.parentPageUrl)
-                                        ?: return@withTimeoutOrNull emptyList()
-                                    if (isBlockedOrNonPlayerEmbed(embedUrl)) return@withTimeoutOrNull emptyList()
-                                    progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS)
-                                    val res = resolveEmbedRecursive(
-                                        embedUrl = embedUrl,
-                                        parentUrl = job.parentPageUrl,
-                                        baseHeaders = baseHeaders,
-                                        serverName = job.serverName,
-                                        depth = 1,
-                                        visited = visitedEmbeds,
-                                        idCounter = idCounter
-                                    )
-                                    if (res.posterUrl != null) posterRef.compareAndSet(null, res.posterUrl)
-                                    res.streams
+                                        val resp = try {
+                                            http.postForm(job.endpointUrl, job.formBody, ajaxHeaders)
+                                        } catch (ce: CancellationException) {
+                                            throw ce
+                                        } catch (_: Exception) {
+                                            ""
+                                        }
+                                        val embedUrl = extractEmbedUrlFromAjaxResponse(resp, job.parentPageUrl)
+                                            ?: return@withCancellableHttpCalls PortalExtractionResult(emptyList())
+                                        if (isBlockedOrNonPlayerEmbed(embedUrl)) {
+                                            return@withCancellableHttpCalls PortalExtractionResult(emptyList())
+                                        }
+                                        progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS)
+                                        resolveEmbedRecursive(
+                                            embedUrl = embedUrl,
+                                            parentUrl = job.parentPageUrl,
+                                            baseHeaders = baseHeaders,
+                                            serverName = job.serverName,
+                                            depth = 1,
+                                            visited = visitedEmbeds,
+                                            idCounter = idCounter
+                                        )
+                                    }
                                 }
                             }
-                        }.orEmpty()
+                        } ?: PortalExtractionResult(emptyList())
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    outcome = PortalExtractionResult(emptyList())
+                } finally {
+                    outcomeChannel.trySend(outcome)
+                }
+            }
+        }
+
+        val collectedStreams = mutableListOf<MediaStream>()
+        var discoveredPoster: String? = null
+        val totalDeadlineMs = System.currentTimeMillis() + PORTAL_TOTAL_BUDGET_MS
+        var firstWinDeadlineMs: Long? = null
+        var remaining = jobs.size
+
+        try {
+            while (remaining > 0) {
+                val activeDeadline = if (firstWinDeadlineMs != null) {
+                    minOf(totalDeadlineMs, firstWinDeadlineMs)
+                } else {
+                    totalDeadlineMs
+                }
+                val waitMs = activeDeadline - System.currentTimeMillis()
+                if (waitMs <= 0L) break
+
+                val outcome = withTimeoutOrNull(waitMs) {
+                    outcomeChannel.receiveCatching().getOrNull()
+                } ?: break
+
+                remaining--
+                if (outcome.posterUrl != null && discoveredPoster == null) {
+                    discoveredPoster = outcome.posterUrl
+                }
+                if (outcome.streams.isNotEmpty()) {
+                    collectedStreams += outcome.streams
+                    if (firstWinDeadlineMs == null) {
+                        if (remaining == 0) break
+                        firstWinDeadlineMs = System.currentTimeMillis() + SIBLING_MERGE_GRACE_MS
                     }
                 }
-            }.awaitAll().flatten()
-        }.orEmpty()
+            }
+        } finally {
+            runningJobs.forEach { it.cancel() }
+            outcomeChannel.close()
+        }
 
-        results to posterRef.get()
+        collectedStreams to discoveredPoster
     }
 
     internal fun extractEmbedUrlFromAjaxResponse(responseBody: String, pageUrl: String): String? {
@@ -433,7 +486,9 @@ class StreamingPortalResolver(
 
         val fetchHeaders = buildHopHeaders(embedUrl, parentUrl, baseHeaders)
         val embedHtml = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
-            runCatching { http.fetchString(embedUrl, fetchHeaders) }.getOrNull()
+            withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
+                runCatching { http.fetchString(embedUrl, fetchHeaders) }.getOrNull()
+            }
         }.orEmpty()
         if (embedHtml.isBlank()) return@coroutineScope PortalExtractionResult(emptyList())
 
@@ -550,9 +605,10 @@ class StreamingPortalResolver(
                 }
             }
 
-            for (nested in nestedUrls.take(2)) {
+            val nestedList = nestedUrls.take(2)
+            if (nestedList.size == 1) {
                 val deeper = resolveEmbedRecursive(
-                    embedUrl = nested,
+                    embedUrl = nestedList.first(),
                     parentUrl = embedUrl,
                     baseHeaders = baseHeaders,
                     serverName = serverName,
@@ -563,6 +619,48 @@ class StreamingPortalResolver(
                 if (deeper.streams.isNotEmpty()) {
                     return@coroutineScope deeper.copy(
                         posterUrl = deeper.posterUrl ?: resolvedPoster
+                    )
+                }
+            } else if (nestedList.size > 1) {
+                val nestedCh = Channel<PortalExtractionResult>(capacity = nestedList.size)
+                val nestedJobs = nestedList.map { nested ->
+                    launch(Dispatchers.IO) {
+                        val res = try {
+                            withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
+                                resolveEmbedRecursive(
+                                    embedUrl = nested,
+                                    parentUrl = embedUrl,
+                                    baseHeaders = baseHeaders,
+                                    serverName = serverName,
+                                    depth = depth + 1,
+                                    visited = visited,
+                                    idCounter = idCounter
+                                )
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Exception) {
+                            PortalExtractionResult(emptyList())
+                        }
+                        nestedCh.trySend(res)
+                    }
+                }
+                var winner: PortalExtractionResult? = null
+                try {
+                    for (i in nestedList.indices) {
+                        val res = nestedCh.receiveCatching().getOrNull() ?: break
+                        if (res.streams.isNotEmpty()) {
+                            winner = res
+                            break
+                        }
+                    }
+                } finally {
+                    nestedJobs.forEach { it.cancel() }
+                    nestedCh.close()
+                }
+                if (winner != null) {
+                    return@coroutineScope winner!!.copy(
+                        posterUrl = winner!!.posterUrl ?: resolvedPoster
                     )
                 }
             }
@@ -612,7 +710,7 @@ class StreamingPortalResolver(
         }
 
         // Progressive direct video (.mp4, .mkv, .webm, Streamtape get_video)
-        val probe = runCatching { http.probe(url, taggedHeaders, 4_000L) }.getOrNull()
+        val probe = runCatching { http.probe(url, taggedHeaders, PROGRESSIVE_PROBE_TIMEOUT_MS) }.getOrNull()
             ?: return emptyList()
         if (probe.code !in 200..299) return emptyList()
 
@@ -749,10 +847,12 @@ class StreamingPortalResolver(
     companion object {
         const val MAX_EMBED_HOPS = 3
         const val MAX_SERVERS = 8
-        const val MAX_CONCURRENT_SERVERS = 4
-        const val PAGE_FETCH_TIMEOUT_MS = 6_000L
-        const val SERVER_PROBE_TIMEOUT_MS = 6_500L
-        const val EMBED_HOP_TIMEOUT_MS = 5_000L
-        const val PORTAL_TOTAL_BUDGET_MS = 14_000L
+        const val MAX_CONCURRENT_SERVERS = 6
+        const val PAGE_FETCH_TIMEOUT_MS = 4_500L
+        const val SERVER_PROBE_TIMEOUT_MS = 4_000L
+        const val EMBED_HOP_TIMEOUT_MS = 3_500L
+        const val PROGRESSIVE_PROBE_TIMEOUT_MS = 2_200L
+        const val PORTAL_TOTAL_BUDGET_MS = 8_500L
+        const val SIBLING_MERGE_GRACE_MS = 180L
     }
 }

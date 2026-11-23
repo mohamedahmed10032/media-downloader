@@ -1,6 +1,8 @@
 package com.melmeligy.mediadownloader.extractor
 
 import android.util.Base64
+import com.melmeligy.mediadownloader.core.AppError
+import com.melmeligy.mediadownloader.core.MediaException
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
@@ -8,9 +10,14 @@ import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.intercept.MediaSniffer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,6 +28,7 @@ import org.xml.sax.InputSource
 import java.io.StringReader
 import java.math.BigInteger
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 import javax.xml.parsers.DocumentBuilderFactory
@@ -30,8 +38,8 @@ import javax.xml.parsers.DocumentBuilderFactory
  * multi-image carousels/albums/slideshows, and mixed photo+video carousels):
  * 1. Instagram (Reels, Posts, Carousels, TV) via FastDL + Polaris GraphQL + doc_id + Embed JSON.
  * 2. Facebook (Videos, Watch, Reels, fb.watch, Single & Multi-Photo Albums).
- * 3. TikTok (Videos, Photo Mode Slideshows, Audio) via tikwm API + Hydration JSON.
- * 4. X / Twitter (Single/Multi-Image, Mixed, Videos) via vxtwitter + fxtwitter + syndication.
+ * 3. TikTok (Videos, Photo Mode Slideshows, Audio) via tikwm API + Hydration JSON racing.
+ * 4. X / Twitter (Single/Multi-Image, Mixed, Videos) via parallel vxtwitter + fxtwitter + syndication.
  * 5. Pinterest (Single Pins, Carousel Pins, Idea/Story Pins, Pin Videos, pin.it).
  * 6. Threads (Single/Multi-Image, Mixed Carousels, Videos).
  * 7. Reddit (Image Galleries, Single Images, Crossposts, Reddit Videos, redd.it).
@@ -44,6 +52,18 @@ class SocialMediaExtractor @Inject constructor(
 
     override val name = "Social Media"
     override val priority = 95
+
+    private data class CachedRedirect(
+        val resolvedUrl: String,
+        val cachedAtMs: Long
+    )
+
+    private val redirectCache = ConcurrentHashMap<String, CachedRedirect>()
+
+    @Volatile
+    private var tikwmBlockedUntilMs: Long = 0L
+
+    internal var clockMs: () -> Long = { System.currentTimeMillis() }
 
     private val igShortcodeRegex =
         Regex("(?:reel|reels|p|tv|share/reel|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
@@ -72,16 +92,16 @@ class SocialMediaExtractor @Inject constructor(
             host.contains("redd.it")
     }
 
-    override suspend fun extract(url: String): ResolvedMedia? {
-        if (!canHandle(url) && !UrlUtils.isShortOrRedirectUrl(url)) return null
+    override suspend fun extract(url: String): ResolvedMedia? = withContext(Dispatchers.IO) {
+        if (!canHandle(url) && !UrlUtils.isShortOrRedirectUrl(url)) return@withContext null
         val workingUrl = if (UrlUtils.isShortOrRedirectUrl(url)) {
             resolveRedirectUrl(url)
         } else {
             url
         }
-        if (!canHandle(workingUrl) && !canHandle(url)) return null
+        if (!canHandle(workingUrl) && !canHandle(url)) return@withContext null
         val host = UrlUtils.host(workingUrl)?.lowercase().orEmpty()
-        val timeoutMs = if (host.contains("pinterest.") || host.contains("pin.it")) 16_000L else 12_000L
+        val timeoutMs = if (host.contains("pinterest.") || host.contains("pin.it")) 14_000L else 10_000L
         val fastResult = try {
             withTimeoutOrNull(timeoutMs) {
                 when {
@@ -95,14 +115,14 @@ class SocialMediaExtractor @Inject constructor(
                     else -> null
                 }
             }
-        } catch (ce: kotlinx.coroutines.CancellationException) {
+        } catch (ce: CancellationException) {
             throw ce
         } catch (_: Exception) {
             null
         }
 
         if (fastResult != null && (fastResult.streams.isNotEmpty() || fastResult.gallerySlides.isNotEmpty())) {
-            return fastResult
+            return@withContext fastResult
         }
 
         // For Instagram, Pinterest, Threads, Reddit do NOT fall back to video-only Headless WebView
@@ -111,29 +131,61 @@ class SocialMediaExtractor @Inject constructor(
             host.contains("threads.net") || host.contains("threads.com") ||
             host.contains("reddit.com") || host.contains("redd.it")
         ) {
-            return null
+            return@withContext null
         }
 
         // Fallback to Headless WebView to execute JS/GraphQL and intercept live CDN streams
-        return try {
+        try {
             headlessWebExtractor.extract(workingUrl)
-        } catch (ce: kotlinx.coroutines.CancellationException) {
+        } catch (ce: CancellationException) {
             throw ce
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun resolveRedirectUrl(rawUrl: String): String {
-        val probeFinal = runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
-        if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http") && probeFinal != rawUrl) {
-            return UrlUtils.cleanSocialUrl(probeFinal)
+    internal suspend fun resolveRedirectUrl(rawUrl: String): String = withContext(Dispatchers.IO) {
+        val cacheKey = rawUrl.trim()
+        val now = clockMs()
+        redirectCache[cacheKey]?.let { entry ->
+            if (now - entry.cachedAtMs < REDIRECT_CACHE_TTL_MS) {
+                return@withContext entry.resolvedUrl
+            } else {
+                redirectCache.remove(cacheKey, entry)
+            }
         }
-        val getFinal = runCatching { http.resolveFinalUrl(rawUrl) }.getOrNull()
-        if (!getFinal.isNullOrBlank() && getFinal.startsWith("http") && getFinal != rawUrl) {
-            return UrlUtils.cleanSocialUrl(getFinal)
+
+        val probeFinal = withTimeoutOrNull(REDIRECT_PROBE_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = REDIRECT_PROBE_TIMEOUT_MS) {
+                runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
+            }
         }
-        return UrlUtils.cleanSocialUrl(probeFinal?.takeIf { it.startsWith("http") } ?: rawUrl)
+        val resolved = if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http") && probeFinal != rawUrl) {
+            UrlUtils.cleanSocialUrl(probeFinal)
+        } else {
+            val getFinal = withTimeoutOrNull(REDIRECT_GET_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = REDIRECT_GET_TIMEOUT_MS) {
+                    runCatching { http.resolveFinalUrl(rawUrl) }.getOrNull()
+                }
+            }
+            if (!getFinal.isNullOrBlank() && getFinal.startsWith("http") && getFinal != rawUrl) {
+                UrlUtils.cleanSocialUrl(getFinal)
+            } else {
+                UrlUtils.cleanSocialUrl(probeFinal?.takeIf { it.startsWith("http") } ?: rawUrl)
+            }
+        }
+
+        if (resolved != rawUrl) {
+            if (redirectCache.size >= MAX_REDIRECT_CACHE_ENTRIES) {
+                val cutoff = now - REDIRECT_CACHE_TTL_MS
+                redirectCache.entries.removeIf { it.value.cachedAtMs < cutoff }
+                if (redirectCache.size >= MAX_REDIRECT_CACHE_ENTRIES) {
+                    redirectCache.clear()
+                }
+            }
+            redirectCache[cacheKey] = CachedRedirect(resolved, now)
+        }
+        resolved
     }
 
     private fun buildGalleryResolvedMedia(
@@ -299,75 +351,123 @@ class SocialMediaExtractor @Inject constructor(
                 "https://www.instagram.com/reel/$shortcode/"
             }
             val postBody = "q=" + URLEncoder.encode(canonicalUrl, "UTF-8") + "&t=media&lang=en&v=v2"
-            val respJson = http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
-            val jsonRoot = JSONObject(respJson)
-            if (jsonRoot.optString("status") == "ok") {
-                val dataHtml = jsonRoot.optString("data")
-                if (dataHtml.isNotBlank()) {
-                    val parsedFastDl = SocialMediaGalleryParsers.parseInstagramFastDlHtml(
-                        dataHtml = dataHtml,
-                        shortcode = shortcode,
-                        headers = defaultHeaders
-                    )
-                    if (parsedFastDl != null) {
-                        if (parsedFastDl.slides.isNotEmpty()) {
-                            return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedFastDl)
-                        }
-                        if (capturedThumb == null && !parsedFastDl.thumbnailUrl.isNullOrBlank()) {
-                            capturedThumb = parsedFastDl.thumbnailUrl
-                        }
-                        parsedFastDl.videoStreams.forEach { v ->
-                            addCandidate(v.url, MediaType.VIDEO, v.container, v.label, v.width, v.height)
+            val respJson = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                    http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
+                }
+            }.orEmpty()
+            if (respJson.isNotBlank()) {
+                val jsonRoot = JSONObject(respJson)
+                if (jsonRoot.optString("status") == "ok") {
+                    val dataHtml = jsonRoot.optString("data")
+                    if (dataHtml.isNotBlank()) {
+                        val parsedFastDl = SocialMediaGalleryParsers.parseInstagramFastDlHtml(
+                            dataHtml = dataHtml,
+                            shortcode = shortcode,
+                            headers = defaultHeaders
+                        )
+                        if (parsedFastDl != null) {
+                            if (parsedFastDl.slides.isNotEmpty()) {
+                                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedFastDl)
+                            }
+                            if (capturedThumb == null && !parsedFastDl.thumbnailUrl.isNullOrBlank()) {
+                                capturedThumb = parsedFastDl.thumbnailUrl
+                            }
+                            parsedFastDl.videoStreams.forEach { v ->
+                                addCandidate(v.url, MediaType.VIDEO, v.container, v.label, v.width, v.height)
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Method 1: Polaris LoggedOut Desktop GraphQL API (full carousel_media / edge_sidecar_to_children + DASH)
-        if (rawStreams.isEmpty() && mediaId != null) {
-            runCatching {
-                val polarisHeaders = mapOf(
-                    "X-IG-App-ID" to "1217981644879628",
-                    "X-ASBD-ID" to "198387",
-                    "Origin" to "https://www.instagram.com",
-                    "Referer" to "https://www.instagram.com/",
-                    "User-Agent" to "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-                )
-                val polarisBody = "av=0&__d=www&__user=0&dpr=1&lsd=AVqb_dummy&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisLoggedOutDesktopWWWPostRootContentQuery&variables=" +
-                    URLEncoder.encode("{\"media_id\":\"$mediaId\"}", "UTF-8") +
-                    "&doc_id=27130156389949648"
-                val polarisJson = http.postForm("https://www.instagram.com/api/graphql", polarisBody, polarisHeaders)
-                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(polarisJson, shortcode, defaultHeaders)
-                if (parsed != null && parsed.slides.isNotEmpty()) {
-                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsed)
-                }
-                parseMediaPayload(polarisJson)
-            }
-        }
-
-        // Method 2: GraphQL query with doc_id 8845758582119845
+        // Methods 1 & 2 in parallel: Polaris LoggedOut Desktop GraphQL + doc_id query
         if (rawStreams.isEmpty()) {
-            runCatching {
-                val docHeaders = mapOf(
-                    "X-IG-App-ID" to "1217981644879628",
-                    "Referer" to "https://www.instagram.com/"
-                )
-                val docUrl = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" +
-                    URLEncoder.encode("{\"shortcode\":\"$shortcode\"}", "UTF-8")
-                val docJson = http.fetchString(docUrl, docHeaders)
-                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(docJson, shortcode, defaultHeaders)
-                if (parsed != null && parsed.slides.isNotEmpty()) {
-                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsed)
+            val gqlChannel = Channel<Pair<String, SocialMediaGalleryParsers.ParsedPost?>>(capacity = 2)
+            val gqlJobs = buildList {
+                if (mediaId != null) {
+                    add(launch(Dispatchers.IO) {
+                        val res = try {
+                            withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                                    val polarisHeaders = mapOf(
+                                        "X-IG-App-ID" to "1217981644879628",
+                                        "X-ASBD-ID" to "198387",
+                                        "Origin" to "https://www.instagram.com",
+                                        "Referer" to "https://www.instagram.com/",
+                                        "User-Agent" to "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+                                    )
+                                    val polarisBody = "av=0&__d=www&__user=0&dpr=1&lsd=AVqb_dummy&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisLoggedOutDesktopWWWPostRootContentQuery&variables=" +
+                                        URLEncoder.encode("{\"media_id\":\"$mediaId\"}", "UTF-8") +
+                                        "&doc_id=27130156389949648"
+                                    val polarisJson = http.postForm("https://www.instagram.com/api/graphql", polarisBody, polarisHeaders)
+                                    val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(polarisJson, shortcode, defaultHeaders)
+                                    polarisJson to parsed
+                                }
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Exception) {
+                            null
+                        }
+                        gqlChannel.trySend(res ?: ("" to null))
+                    })
                 }
-                parseMediaPayload(docJson)
+                add(launch(Dispatchers.IO) {
+                    val res = try {
+                        withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                            withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                                val docHeaders = mapOf(
+                                    "X-IG-App-ID" to "1217981644879628",
+                                    "Referer" to "https://www.instagram.com/"
+                                )
+                                val docUrl = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" +
+                                    URLEncoder.encode("{\"shortcode\":\"$shortcode\"}", "UTF-8")
+                                val docJson = http.fetchString(docUrl, docHeaders)
+                                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(docJson, shortcode, defaultHeaders)
+                                docJson to parsed
+                            }
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        null
+                    }
+                    gqlChannel.trySend(res ?: ("" to null))
+                })
+            }
+
+            var winningGallery: SocialMediaGalleryParsers.ParsedPost? = null
+            try {
+                for (i in gqlJobs.indices) {
+                    val (jsonPayload, parsed) = gqlChannel.receiveCatching().getOrNull() ?: break
+                    if (parsed != null && parsed.slides.isNotEmpty()) {
+                        winningGallery = parsed
+                        break
+                    }
+                    if (jsonPayload.isNotBlank()) {
+                        parseMediaPayload(jsonPayload)
+                        if (rawStreams.isNotEmpty()) break
+                    }
+                }
+            } finally {
+                gqlJobs.forEach { it.cancel() }
+                gqlChannel.close()
+            }
+            if (winningGallery != null) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", winningGallery)
             }
         }
 
         // Method 3: Embed page captioned (supports embedded sidecar JSON, single photos & videos)
         if (rawStreams.isEmpty()) {
             val embedUrl = "https://www.instagram.com/p/$shortcode/embed/captioned/"
-            val html = runCatching { http.fetchString(embedUrl, defaultHeaders) }.getOrNull().orEmpty()
+            val html = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                    runCatching { http.fetchString(embedUrl, defaultHeaders) }.getOrNull()
+                }
+            }.orEmpty()
             if (html.isNotBlank()) {
                 val parsedEmbed = SocialMediaGalleryParsers.parseInstagramEmbedHtml(html, shortcode, defaultHeaders)
                 if (parsedEmbed != null && parsedEmbed.slides.isNotEmpty()) {
@@ -390,15 +490,17 @@ class SocialMediaExtractor @Inject constructor(
 
         if (rawStreams.isEmpty()) return@coroutineScope null
 
-        // Probe exact file sizes in parallel
-        val probed = rawStreams.values.take(10).map { stream ->
-            async {
-                runCatching {
-                    val info = http.probe(stream.url, defaultHeaders)
-                    if (info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
-                }.getOrDefault(stream)
-            }
-        }.awaitAll().filter { (it.sizeBytes ?: Long.MAX_VALUE) > 10_000L }
+        // Probe exact file sizes in parallel with bounded timeout
+        val probed = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
+            rawStreams.values.take(10).map { stream ->
+                async(Dispatchers.IO) {
+                    runCatching {
+                        val info = http.probe(stream.url, defaultHeaders)
+                        if (info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
+                    }.getOrDefault(stream)
+                }
+            }.awaitAll()
+        }.filter { (it.sizeBytes ?: Long.MAX_VALUE) > 10_000L }
 
         if (probed.isEmpty()) return@coroutineScope null
 
@@ -713,7 +815,7 @@ class SocialMediaExtractor @Inject constructor(
     }
 
     // =========================================================================
-    // 3. TIKTOK (Canonical Redirect + tikwm API + Universal Hydration JSON)
+    // 3. TIKTOK (Parallel Race: tikwm API vs Universal Hydration JSON)
     // =========================================================================
 
     private suspend fun extractTikTok(rawUrl: String): ResolvedMedia? = coroutineScope {
@@ -737,225 +839,359 @@ class SocialMediaExtractor @Inject constructor(
             http.cookieHeaderFor(canonicalUrl)?.takeIf { it.isNotBlank() }?.let { put("Cookie", it) }
         }
 
-        // Try Method 1: tikwm API with HD enabled
+        // If tikwm recently returned Cloudflare 403/429, go straight to HTML Hydration with 0ms API wait
+        if (clockMs() < tikwmBlockedUntilMs) {
+            return@coroutineScope extractTikTokViaHtmlHydration(
+                rawUrl = rawUrl,
+                canonicalUrl = canonicalUrl,
+                desktopHeaders = desktopHeaders,
+                tikTokBaseCdnHeaders = tikTokBaseCdnHeaders
+            )
+        }
+
+        // Parallel race: start tikwm API (short timeout) and HTML Hydration simultaneously.
+        // First healthy winner returns immediately and cancels the losing branch + socket.
+        val raceChannel = Channel<ResolvedMedia?>(capacity = 2)
+        val apiJob = launch(Dispatchers.IO) {
+            val res = try {
+                extractTikTokViaTikwmApi(rawUrl, canonicalUrl)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            raceChannel.trySend(res)
+        }
+        val htmlJob = launch(Dispatchers.IO) {
+            val res = try {
+                extractTikTokViaHtmlHydration(
+                    rawUrl = rawUrl,
+                    canonicalUrl = canonicalUrl,
+                    desktopHeaders = desktopHeaders,
+                    tikTokBaseCdnHeaders = tikTokBaseCdnHeaders
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            raceChannel.trySend(res)
+        }
+
+        var winner: ResolvedMedia? = null
+        try {
+            for (i in 0 until 2) {
+                val candidate = raceChannel.receiveCatching().getOrNull() ?: continue
+                if (candidate.streams.isNotEmpty() || candidate.gallerySlides.isNotEmpty()) {
+                    winner = candidate
+                    break
+                }
+            }
+        } finally {
+            apiJob.cancel()
+            htmlJob.cancel()
+            raceChannel.close()
+        }
+
+        winner
+    }
+
+    private suspend fun extractTikTokViaTikwmApi(
+        rawUrl: String,
+        canonicalUrl: String
+    ): ResolvedMedia? = coroutineScope {
         val encoded = URLEncoder.encode(canonicalUrl, "UTF-8")
         val apiUrl = "https://www.tikwm.com/api/?url=$encoded&hd=1"
-        val jsonText = runCatching { http.fetchString(apiUrl) }.getOrNull()
-        if (!jsonText.isNullOrBlank()) {
-            val root = runCatching { JSONObject(jsonText) }.getOrNull()
-            val data = root?.optJSONObject("data")
-            if (data != null) {
-                val apiMusicUrl = data.optString("music").takeIf { it.startsWith("http") }
-                val apiMusicProbe = if (apiMusicUrl != null) {
-                    withTimeoutOrNull(4_500L) { runCatching { http.probe(apiMusicUrl) }.getOrNull() }
-                } else null
-
-                // Photo Mode slideshow (`data.images[]`) -> Multi-Image Bottom Sheet (with accompanying audio)
-                val parsedPhotos = SocialMediaGalleryParsers.parseTikTokPhotoFromApiData(
-                    data = data,
-                    postId = UrlUtils.extractPostId(canonicalUrl),
-                    musicProbe = apiMusicProbe,
-                    headers = mapOf("Referer" to "https://www.tiktok.com/")
-                )
-                if (parsedPhotos != null && parsedPhotos.slides.isNotEmpty()) {
-                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "TikTok", parsedPhotos)
-                }
-
-                val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
-                val play = data.optString("play").takeIf { it.startsWith("http") }
-                val apiHdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
-                val apiPlaySize = data.optLong("size", 0L).takeIf { it > 0L }
-                val knownSameApiSize = apiHdSize != null && apiPlaySize != null && apiHdSize == apiPlaySize
-
-                val hdProbeDef = if (hdPlay != null && !knownSameApiSize && (apiHdSize == null || play != null)) {
-                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(hdPlay) }.getOrNull() } }
-                } else null
-                val playProbeDef = if (play != null && !knownSameApiSize && (apiPlaySize == null || hdPlay != null)) {
-                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(play) }.getOrNull() } }
-                } else null
-
-                val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
-                    data = data,
-                    hdProbe = hdProbeDef?.await(),
-                    playProbe = playProbeDef?.await(),
-                    musicProbe = apiMusicProbe
-                )
-
-                if (streams.isNotEmpty()) {
-                    val title = data.optString("title").takeIf { it.isNotBlank() } ?: "TikTok Video"
-                    val cover = data.optString("cover").takeIf { it.startsWith("http") }
-                    return@coroutineScope ResolvedMedia(
-                        sourceUrl = rawUrl,
-                        title = title,
-                        thumbnailUrl = cover,
-                        streams = streams,
-                        extractor = "TikTok"
-                    )
+        val jsonText = withTimeoutOrNull(TIKWM_API_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = TIKWM_API_TIMEOUT_MS) {
+                try {
+                    http.fetchString(apiUrl)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (me: MediaException) {
+                    if (me.error == AppError.GEO_BLOCKED || me.message?.contains("429") == true) {
+                        tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
+                    }
+                    null
+                } catch (_: Exception) {
+                    null
                 }
             }
         }
+        if (jsonText.isNullOrBlank()) return@coroutineScope null
+        if (jsonText.trimStart().startsWith("<")) {
+            tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
+            return@coroutineScope null
+        }
 
-        // Method 2: Independent HTML __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON + session Cookie + Referer
-        val fetchedHtml = runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
-        val html = fetchedHtml?.html
-            ?: runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
-        if (html.isNotBlank()) {
-            val cdnHeaders = LinkedHashMap<String, String>(tikTokBaseCdnHeaders).apply {
-                val cookie = fetchedHtml?.cookieHeader?.takeIf { it.isNotBlank() }
-                    ?: http.cookieHeaderFor(fetchedHtml?.finalUrl ?: canonicalUrl)
-                if (!cookie.isNullOrBlank()) {
-                    put("Cookie", cookie)
-                }
-            }
+        val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: return@coroutineScope null
+        val data = root.optJSONObject("data") ?: return@coroutineScope null
 
-            // Photo Mode Slideshow from Hydration JSON (desc title, cover, all slides + music audio, CDN headers)
-            val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
-                html = html,
-                postId = UrlUtils.extractPostId(canonicalUrl),
-                headers = cdnHeaders
-            )
-            if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
-                val probedAudio = if (parsedPhotoHtml.audioStreams.isNotEmpty()) {
-                    val primaryAudioUrl = parsedPhotoHtml.audioStreams.first().url
-                    val musicDuration = parsedPhotoHtml.audioStreams.first().headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-                    val mProbe = withTimeoutOrNull(4_500L) { runCatching { http.probe(primaryAudioUrl, cdnHeaders) }.getOrNull() }
-                    if (mProbe != null) {
-                        SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
-                            musicUrl = primaryAudioUrl,
-                            musicDurationSec = musicDuration,
-                            musicProbe = mProbe,
-                            baseHeaders = cdnHeaders,
-                            idPrefix = "tt-photo-a"
-                        )
-                    } else parsedPhotoHtml.audioStreams
-                } else emptyList()
-                return@coroutineScope buildGalleryResolvedMedia(
-                    rawUrl = rawUrl,
-                    extractorName = "TikTok",
-                    parsed = parsedPhotoHtml.copy(audioStreams = probedAudio)
-                )
-            }
-
-            // Full structured __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON video + multi-quality bitrateInfo + music
-            val parsedVideoPost = SocialMediaGalleryParsers.parseTikTokVideoFromHydrationHtml(html, cdnHeaders)
-            if (parsedVideoPost != null) {
-                val videoProbeDefs = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
-                    if (idx < 3 && (stream.sizeBytes == null || !stream.headers.containsKey("X-Internal-Accepts-Ranges"))) {
-                        async { withTimeoutOrNull(4_500L) { runCatching { http.probe(stream.url, cdnHeaders) }.getOrNull() } }
-                    } else null
-                }
-                val firstAudio = parsedVideoPost.audioStreams.firstOrNull()
-                val audioProbeDef = if (firstAudio != null) {
-                    async { withTimeoutOrNull(4_500L) { runCatching { http.probe(firstAudio.url, cdnHeaders) }.getOrNull() } }
-                } else null
-
-                val probedVideos = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
-                    val info = videoProbeDefs[idx]?.await()
-                    if (info != null) {
-                        val updatedHeaders = LinkedHashMap<String, String>(stream.headers).apply {
-                            if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
-                        }
-                        stream.copy(
-                            url = info.finalUrl.takeIf { it.startsWith("http") } ?: stream.url,
-                            sizeBytes = info.contentLength.takeIf { it > 0L } ?: stream.sizeBytes,
-                            headers = updatedHeaders
-                        )
-                    } else {
-                        stream
+        val apiMusicUrl = data.optString("music").takeIf { it.startsWith("http") }
+        val hasImages = (data.optJSONArray("images")?.length() ?: 0) > 0
+        if (hasImages) {
+            val apiMusicProbe = if (apiMusicUrl != null) {
+                withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                        runCatching { http.probe(apiMusicUrl) }.getOrNull()
                     }
                 }
-                val probedAudios = if (firstAudio != null) {
-                    val mProbe = audioProbeDef?.await()
-                    if (mProbe != null) {
-                        val dur = firstAudio.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-                        SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
-                            musicUrl = firstAudio.url,
-                            musicDurationSec = dur,
-                            musicProbe = mProbe,
-                            baseHeaders = cdnHeaders,
-                            idPrefix = "tt-page-a"
-                        )
-                    } else parsedVideoPost.audioStreams
-                } else emptyList()
+            } else null
+            val parsedPhotos = SocialMediaGalleryParsers.parseTikTokPhotoFromApiData(
+                data = data,
+                postId = UrlUtils.extractPostId(canonicalUrl),
+                musicProbe = apiMusicProbe,
+                headers = mapOf("Referer" to "https://www.tiktok.com/")
+            )
+            if (parsedPhotos != null && parsedPhotos.slides.isNotEmpty()) {
+                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "TikTok", parsedPhotos)
+            }
+        }
 
-                val allStreams = probedVideos + probedAudios
-                if (allStreams.isNotEmpty()) {
-                    return@coroutineScope ResolvedMedia(
-                        sourceUrl = rawUrl,
-                        title = parsedVideoPost.title ?: "TikTok Video",
-                        thumbnailUrl = parsedVideoPost.thumbnailUrl,
-                        streams = allStreams,
-                        extractor = "TikTok",
-                        postId = parsedVideoPost.postId ?: UrlUtils.extractPostId(canonicalUrl)
+        val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
+        val play = data.optString("play").takeIf { it.startsWith("http") }
+        val apiHdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
+        val apiPlaySize = data.optLong("size", 0L).takeIf { it > 0L }
+        val knownSameApiSize = apiHdSize != null && apiPlaySize != null && apiHdSize == apiPlaySize
+
+        // Only probe video streams when JSON size is actually missing; run music & video probes in parallel
+        val (hdProbe, playProbe, musicProbe) = withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
+            val hdDef = if (hdPlay != null && !knownSameApiSize && apiHdSize == null) {
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(hdPlay) }.getOrNull() }
+                }
+            } else null
+            val playDef = if (play != null && !knownSameApiSize && apiPlaySize == null) {
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(play) }.getOrNull() }
+                }
+            } else null
+            val musicDef = if (apiMusicUrl != null) {
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(apiMusicUrl) }.getOrNull() }
+                }
+            } else null
+            Triple(hdDef?.await(), playDef?.await(), musicDef?.await())
+        }
+
+        val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
+            data = data,
+            hdProbe = hdProbe,
+            playProbe = playProbe,
+            musicProbe = musicProbe
+        )
+        if (streams.isEmpty()) return@coroutineScope null
+
+        val title = data.optString("title").takeIf { it.isNotBlank() } ?: "TikTok Video"
+        val cover = data.optString("cover").takeIf { it.startsWith("http") }
+        ResolvedMedia(
+            sourceUrl = rawUrl,
+            title = title,
+            thumbnailUrl = cover,
+            streams = streams,
+            extractor = "TikTok"
+        )
+    }
+
+    private suspend fun extractTikTokViaHtmlHydration(
+        rawUrl: String,
+        canonicalUrl: String,
+        desktopHeaders: Map<String, String>,
+        tikTokBaseCdnHeaders: Map<String, String>
+    ): ResolvedMedia? = coroutineScope {
+        val fetchedHtml = withTimeoutOrNull(TIKTOK_HTML_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = TIKTOK_HTML_TIMEOUT_MS) {
+                runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
+            }
+        }
+        val html = fetchedHtml?.html
+            ?: withTimeoutOrNull(TIKTOK_HTML_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = TIKTOK_HTML_TIMEOUT_MS) {
+                    runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull()
+                }
+            }.orEmpty()
+        if (html.isBlank()) return@coroutineScope null
+
+        val cdnHeaders = LinkedHashMap<String, String>(tikTokBaseCdnHeaders).apply {
+            val cookie = fetchedHtml?.cookieHeader?.takeIf { it.isNotBlank() }
+                ?: http.cookieHeaderFor(fetchedHtml?.finalUrl ?: canonicalUrl)
+            if (!cookie.isNullOrBlank()) {
+                put("Cookie", cookie)
+            }
+        }
+
+        // Photo Mode Slideshow from Hydration JSON (desc title, cover, all slides + music audio, CDN headers)
+        val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
+            html = html,
+            postId = UrlUtils.extractPostId(canonicalUrl),
+            headers = cdnHeaders
+        )
+        if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
+            val probedAudio = if (parsedPhotoHtml.audioStreams.isNotEmpty()) {
+                val primaryAudioUrl = parsedPhotoHtml.audioStreams.first().url
+                val musicDuration = parsedPhotoHtml.audioStreams.first().headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                val mProbe = withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                        runCatching { http.probe(primaryAudioUrl, cdnHeaders) }.getOrNull()
+                    }
+                }
+                if (mProbe != null) {
+                    SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
+                        musicUrl = primaryAudioUrl,
+                        musicDurationSec = musicDuration,
+                        musicProbe = mProbe,
+                        baseHeaders = cdnHeaders,
+                        idPrefix = "tt-photo-a"
                     )
+                } else parsedPhotoHtml.audioStreams
+            } else emptyList()
+            return@coroutineScope buildGalleryResolvedMedia(
+                rawUrl = rawUrl,
+                extractorName = "TikTok",
+                parsed = parsedPhotoHtml.copy(audioStreams = probedAudio)
+            )
+        }
+
+        // Full structured __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON video + multi-quality bitrateInfo + music.
+        // Rely directly on JSON DataSize/Width/Height without redundant probes unless sizeBytes is missing.
+        val parsedVideoPost = SocialMediaGalleryParsers.parseTikTokVideoFromHydrationHtml(html, cdnHeaders)
+        if (parsedVideoPost != null) {
+            val firstAudio = parsedVideoPost.audioStreams.firstOrNull()
+            val needsVideoProbe = parsedVideoPost.videoStreams.take(3).any { it.sizeBytes == null || it.sizeBytes <= 0L }
+            val (probedVideos, audioProbe) = if (needsVideoProbe || firstAudio != null) {
+                withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                    val videoProbeDefs = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
+                        if (idx < 3 && (stream.sizeBytes == null || stream.sizeBytes <= 0L)) {
+                            async(Dispatchers.IO) {
+                                withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                                    runCatching { http.probe(stream.url, cdnHeaders) }.getOrNull()
+                                }
+                            }
+                        } else null
+                    }
+                    val audioProbeDef = if (firstAudio != null) {
+                        async(Dispatchers.IO) {
+                            withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
+                                runCatching { http.probe(firstAudio.url, cdnHeaders) }.getOrNull()
+                            }
+                        }
+                    } else null
+
+                    val updatedVideos = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
+                        val info = videoProbeDefs[idx]?.await()
+                        if (info != null) {
+                            val updatedHeaders = LinkedHashMap<String, String>(stream.headers).apply {
+                                if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
+                            }
+                            stream.copy(
+                                url = info.finalUrl.takeIf { it.startsWith("http") } ?: stream.url,
+                                sizeBytes = info.contentLength.takeIf { it > 0L } ?: stream.sizeBytes,
+                                headers = updatedHeaders
+                            )
+                        } else {
+                            stream
+                        }
+                    }
+                    updatedVideos to audioProbeDef?.await()
                 }
+            } else {
+                parsedVideoPost.videoStreams to null
             }
 
-            // Legacy surface fallback when __UNIVERSAL_DATA_FOR_REHYDRATION__ wrapper is absent
-            val playAddrRegex = Regex("\"playAddr\"\\s*:\\s*\"([^\"]+)\"")
-            val playUrl = playAddrRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
-            val musicRegex = Regex("\"playUrl\"\\s*:\\s*\"([^\"]+)\"")
-            val musicUrl = musicRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
-            val descRegex = Regex("\"desc\"\\s*:\\s*\"([^\"]{1,200})\"")
-            val descTitle = descRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }?.trim()
-                ?.takeIf { it.isNotBlank() }
-            val titleRegex = Regex("<title>([^<]+)</title>")
-            val htmlTitle = titleRegex.find(html)?.groupValues?.getOrNull(1)?.trim()
-                ?.takeUnless { it.equals("TikTok", ignoreCase = true) || it.startsWith("TikTok - Make Your Day", ignoreCase = true) }
-            val title = descTitle ?: htmlTitle ?: "TikTok Video"
+            val probedAudios = if (firstAudio != null) {
+                if (audioProbe != null) {
+                    val dur = firstAudio.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                    SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
+                        musicUrl = firstAudio.url,
+                        musicDurationSec = dur,
+                        musicProbe = audioProbe,
+                        baseHeaders = cdnHeaders,
+                        idPrefix = "tt-page-a"
+                    )
+                } else parsedVideoPost.audioStreams
+            } else emptyList()
 
-            val videoProbeDef = if (playUrl != null && playUrl.startsWith("http")) {
-                async { withTimeoutOrNull(4_500L) { runCatching { http.probe(playUrl, cdnHeaders) }.getOrNull() } }
-            } else null
-            val musicProbeDef = if (musicUrl != null && musicUrl.startsWith("http")) {
-                async { withTimeoutOrNull(4_500L) { runCatching { http.probe(musicUrl, cdnHeaders) }.getOrNull() } }
-            } else null
-
-            val vInfo = videoProbeDef?.await()
-            val mInfo = musicProbeDef?.await()
-
-            val streams = mutableListOf<MediaStream>()
-            if (playUrl != null && playUrl.startsWith("http")) {
-                val streamHeaders = LinkedHashMap<String, String>(cdnHeaders).apply {
-                    if (vInfo?.acceptsRanges == true) put("X-Internal-Accepts-Ranges", "true")
-                }
-                streams += MediaStream(
-                    id = "tt-page-v",
-                    url = vInfo?.finalUrl?.takeIf { it.startsWith("http") } ?: playUrl,
-                    type = MediaType.VIDEO,
-                    container = "mp4",
-                    label = "High quality (720p HD)",
-                    height = 720,
-                    sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
-                    isHls = false,
-                    headers = streamHeaders
-                )
-            }
-            if (musicUrl != null && musicUrl.startsWith("http")) {
-                streams += SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
-                    musicUrl = musicUrl,
-                    musicProbe = mInfo,
-                    baseHeaders = cdnHeaders,
-                    idPrefix = "tt-page-a"
-                )
-            }
-
-            if (streams.isNotEmpty()) {
+            val allStreams = probedVideos + probedAudios
+            if (allStreams.isNotEmpty()) {
                 return@coroutineScope ResolvedMedia(
                     sourceUrl = rawUrl,
-                    title = title,
-                    thumbnailUrl = null,
-                    streams = streams,
-                    extractor = "TikTok"
+                    title = parsedVideoPost.title ?: "TikTok Video",
+                    thumbnailUrl = parsedVideoPost.thumbnailUrl,
+                    streams = allStreams,
+                    extractor = "TikTok",
+                    postId = parsedVideoPost.postId ?: UrlUtils.extractPostId(canonicalUrl)
                 )
             }
+        }
+
+        // Legacy surface fallback when __UNIVERSAL_DATA_FOR_REHYDRATION__ wrapper is absent
+        val playAddrRegex = Regex("\"playAddr\"\\s*:\\s*\"([^\"]+)\"")
+        val playUrl = playAddrRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
+        val musicRegex = Regex("\"playUrl\"\\s*:\\s*\"([^\"]+)\"")
+        val musicUrl = musicRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
+        val descRegex = Regex("\"desc\"\\s*:\\s*\"([^\"]{1,200})\"")
+        val descTitle = descRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }?.trim()
+            ?.takeIf { it.isNotBlank() }
+        val titleRegex = Regex("<title>([^<]+)</title>")
+        val htmlTitle = titleRegex.find(html)?.groupValues?.getOrNull(1)?.trim()
+            ?.takeUnless { it.equals("TikTok", ignoreCase = true) || it.startsWith("TikTok - Make Your Day", ignoreCase = true) }
+        val title = descTitle ?: htmlTitle ?: "TikTok Video"
+
+        val (vInfo, mInfo) = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
+            val videoProbeDef = if (playUrl != null && playUrl.startsWith("http")) {
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(FAST_PROBE_TIMEOUT_MS) { runCatching { http.probe(playUrl, cdnHeaders) }.getOrNull() }
+                }
+            } else null
+            val musicProbeDef = if (musicUrl != null && musicUrl.startsWith("http")) {
+                async(Dispatchers.IO) {
+                    withTimeoutOrNull(FAST_PROBE_TIMEOUT_MS) { runCatching { http.probe(musicUrl, cdnHeaders) }.getOrNull() }
+                }
+            } else null
+            videoProbeDef?.await() to musicProbeDef?.await()
+        }
+
+        val streams = mutableListOf<MediaStream>()
+        if (playUrl != null && playUrl.startsWith("http")) {
+            val streamHeaders = LinkedHashMap<String, String>(cdnHeaders).apply {
+                if (vInfo?.acceptsRanges == true) put("X-Internal-Accepts-Ranges", "true")
+            }
+            streams += MediaStream(
+                id = "tt-page-v",
+                url = vInfo?.finalUrl?.takeIf { it.startsWith("http") } ?: playUrl,
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = "High quality (720p HD)",
+                height = 720,
+                sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
+                isHls = false,
+                headers = streamHeaders
+            )
+        }
+        if (musicUrl != null && musicUrl.startsWith("http")) {
+            streams += SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
+                musicUrl = musicUrl,
+                musicProbe = mInfo,
+                baseHeaders = cdnHeaders,
+                idPrefix = "tt-page-a"
+            )
+        }
+
+        if (streams.isNotEmpty()) {
+            return@coroutineScope ResolvedMedia(
+                sourceUrl = rawUrl,
+                title = title,
+                thumbnailUrl = null,
+                streams = streams,
+                extractor = "TikTok"
+            )
         }
 
         null
     }
 
     // =========================================================================
-    // 4. X / TWITTER (vxtwitter + fxtwitter + syndication — Photos, Mixed & Videos)
+    // 4. X / TWITTER (Parallel Race: vxtwitter + fxtwitter + syndication)
     // =========================================================================
 
     private suspend fun extractTwitter(rawUrl: String): ResolvedMedia? = coroutineScope {
@@ -969,30 +1205,61 @@ class SocialMediaExtractor @Inject constructor(
             "https://cdn.syndication.twimg.com/tweet-result?id=$statusId&token=a"
         )
 
-        for (apiUrl in apis) {
-            val jsonText = runCatching { http.fetchString(apiUrl) }.getOrNull() ?: continue
-            val parsed = SocialMediaGalleryParsers.parseTwitterApiJson(jsonText, user, statusId) ?: continue
-
-            if (parsed.slides.isNotEmpty()) {
-                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "X / Twitter", parsed)
+        val ch = Channel<SocialMediaGalleryParsers.ParsedPost?>(capacity = apis.size)
+        val jobs = apis.map { apiUrl ->
+            launch(Dispatchers.IO) {
+                val parsed = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            val jsonText = runCatching { http.fetchString(apiUrl) }.getOrNull()
+                            if (jsonText != null) SocialMediaGalleryParsers.parseTwitterApiJson(jsonText, user, statusId) else null
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                ch.trySend(parsed)
             }
+        }
 
-            if (parsed.videoStreams.isNotEmpty()) {
-                val probedVideos = parsed.videoStreams.map { stream ->
-                    async {
+        var winningParsed: SocialMediaGalleryParsers.ParsedPost? = null
+        try {
+            for (i in apis.indices) {
+                val candidate = ch.receiveCatching().getOrNull() ?: continue
+                if (candidate.slides.isNotEmpty() || candidate.videoStreams.isNotEmpty()) {
+                    winningParsed = candidate
+                    break
+                }
+            }
+        } finally {
+            jobs.forEach { it.cancel() }
+            ch.close()
+        }
+
+        val parsed = winningParsed ?: return@coroutineScope null
+        if (parsed.slides.isNotEmpty()) {
+            return@coroutineScope buildGalleryResolvedMedia(rawUrl, "X / Twitter", parsed)
+        }
+
+        if (parsed.videoStreams.isNotEmpty()) {
+            val probedVideos = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
+                parsed.videoStreams.map { stream ->
+                    async(Dispatchers.IO) {
                         val info = runCatching { http.probe(stream.url) }.getOrNull()
                         if (info != null && info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
                     }
                 }.awaitAll()
-                return@coroutineScope ResolvedMedia(
-                    sourceUrl = rawUrl,
-                    title = parsed.title ?: "X Video (@$user)",
-                    thumbnailUrl = parsed.thumbnailUrl,
-                    streams = probedVideos,
-                    extractor = "X / Twitter",
-                    postId = statusId
-                )
             }
+            return@coroutineScope ResolvedMedia(
+                sourceUrl = rawUrl,
+                title = parsed.title ?: "X Video (@$user)",
+                thumbnailUrl = parsed.thumbnailUrl,
+                streams = probedVideos,
+                extractor = "X / Twitter",
+                postId = statusId
+            )
         }
 
         null
@@ -1097,8 +1364,8 @@ class SocialMediaExtractor @Inject constructor(
             return cur.slides.size <= 1 && cur.videoStreams.isEmpty()
         }
 
-        // Tier 2: PinResource/get API fallback — ALWAYS runs when HTML yielded <= 1 image
-        // because top-level og:image / images.orig on Carousel & Story Pins only carry the 1 cover.
+        // Tier 2 & 3 in parallel: PinResource/get + v3/pins fallback when HTML yielded <= 1 image.
+        // Cancels remaining API calls as soon as a multi-slide or video result is discovered.
         if (needsMultiSlideUpgrade() && !pinId.isNullOrBlank()) {
             val fieldSets = listOf("detailed", "unauth_react_main_pin", "auth_web_main_pin")
             val apiHeaders = desktopHeaders + mapOf(
@@ -1108,30 +1375,47 @@ class SocialMediaExtractor @Inject constructor(
                 "Referer" to canonicalUrl,
                 "Accept" to "application/json, text/javascript, */*, q=0.01"
             )
-            for (fieldSet in fieldSets) {
-                if (!needsMultiSlideUpgrade()) break
-                runCatching {
-                    val dataJson = "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"$fieldSet\"}}"
-                    val dataParam = URLEncoder.encode(dataJson, "UTF-8")
-                    val apiUrl = "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam"
-                    val apiJson = http.fetchString(apiUrl, apiHeaders)
-                    val apiParsed = SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
-                    bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, apiParsed)
+            val v3Headers = desktopHeaders + mapOf(
+                "Accept" to "application/json",
+                "Referer" to canonicalUrl
+            )
+            val targets: List<Pair<String, Map<String, String>>> = fieldSets.map { fieldSet ->
+                val dataJson = "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"$fieldSet\"}}"
+                val dataParam = URLEncoder.encode(dataJson, "UTF-8")
+                "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam" to apiHeaders
+            } + ("https://api.pinterest.com/v3/pins/$pinId/?fields=pin.id,pin.title,pin.images,pin.carousel_data,pin.story_pin_data,pin.videos" to v3Headers)
+
+            val pinCh = Channel<SocialMediaGalleryParsers.ParsedPost?>(capacity = targets.size)
+            val pinJobs = targets.map { (targetUrl, reqHeaders) ->
+                launch(Dispatchers.IO) {
+                    val parsed = try {
+                        withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                            withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                                val apiJson = runCatching { http.fetchString(targetUrl, reqHeaders) }.getOrNull()
+                                if (!apiJson.isNullOrBlank()) {
+                                    SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
+                                } else null
+                            }
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        null
+                    }
+                    pinCh.trySend(parsed)
                 }
             }
-        }
-
-        // Tier 3: Pinterest v3/pins endpoint fallback when PinResource omits carousel/story slots
-        if (needsMultiSlideUpgrade() && !pinId.isNullOrBlank()) {
-            runCatching {
-                val v3Headers = desktopHeaders + mapOf(
-                    "Accept" to "application/json",
-                    "Referer" to canonicalUrl
-                )
-                val v3Url = "https://api.pinterest.com/v3/pins/$pinId/?fields=pin.id,pin.title,pin.images,pin.carousel_data,pin.story_pin_data,pin.videos"
-                val v3Json = http.fetchString(v3Url, v3Headers)
-                val v3Parsed = SocialMediaGalleryParsers.parsePinterestHtml(v3Json, pinId, desktopHeaders)
-                bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, v3Parsed)
+            try {
+                for (i in targets.indices) {
+                    val apiParsed = pinCh.receiveCatching().getOrNull()
+                    if (apiParsed != null) {
+                        bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, apiParsed)
+                        if (!needsMultiSlideUpgrade()) break
+                    }
+                }
+            } finally {
+                pinJobs.forEach { it.cancel() }
+                pinCh.close()
             }
         }
 
@@ -1470,5 +1754,15 @@ class SocialMediaExtractor @Inject constructor(
     companion object {
         private const val TIKTOK_DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        private const val REDIRECT_CACHE_TTL_MS = 120_000L
+        private const val MAX_REDIRECT_CACHE_ENTRIES = 128
+        private const val REDIRECT_PROBE_TIMEOUT_MS = 2_200L
+        private const val REDIRECT_GET_TIMEOUT_MS = 2_800L
+        private const val TIKWM_API_TIMEOUT_MS = 2_000L
+        private const val TIKWM_COOLDOWN_MS = 60_000L
+        private const val TIKTOK_HTML_TIMEOUT_MS = 5_500L
+        private const val SOCIAL_API_TIMEOUT_MS = 2_800L
+        private const val FAST_PROBE_TIMEOUT_MS = 1_800L
+        private const val FAST_AUDIO_PROBE_TIMEOUT_MS = 1_200L
     }
 }

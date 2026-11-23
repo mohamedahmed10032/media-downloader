@@ -11,4 +11,8 @@ class MediaRepositoryImpl @Inject constructor(
     private val registry: ExtractorRegistry
 ) : MediaRepository {
     override suspend fun resolve(url: String): ResolvedMedia = registry.resolve(url)
+
+    fun invalidateCache(url: String) = registry.invalidate(url)
+
+    fun updateCached(media: ResolvedMedia) = registry.updateCache(media)
 }

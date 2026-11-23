@@ -30,7 +30,8 @@ class BrowserViewModel @Inject constructor(
     private val blobImporter: BlobImporter,
     private val mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository,
     private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager,
-    private val settingsRepository: SettingsRepository
+    private val settingsRepository: SettingsRepository,
+    private val streamSizeRefiner: com.melmeligy.mediadownloader.extractor.StreamSizeRefiner
 ) : ViewModel() {
 
     private var nextId = 2L
@@ -51,6 +52,8 @@ class BrowserViewModel @Inject constructor(
     val blobMessage: StateFlow<String?> = _blobMessage.asStateFlow()
 
     private var resolveJob: kotlinx.coroutines.Job? = null
+    private var sizeRefineJob: kotlinx.coroutines.Job? = null
+    private var currentSheetUrl: String = ""
 
     init {
         viewModelScope.launch {
@@ -63,15 +66,21 @@ class BrowserViewModel @Inject constructor(
 
     fun prepareSheetLoading() {
         resolveJob?.cancel()
+        sizeRefineJob?.cancel()
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
 
     fun resolveForSheet(targetUrl: String) {
+        currentSheetUrl = targetUrl
         resolveJob?.cancel()
+        sizeRefineJob?.cancel()
+        if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
+            (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
+        }
         resolveJob = viewModelScope.launch {
             _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
             runCatching { settingsRepository.current() }
-            _formatState.value = try {
+            val nextState = try {
                 com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -82,6 +91,22 @@ class BrowserViewModel @Inject constructor(
                     com.melmeligy.mediadownloader.core.AppError.GENERIC,
                     e.message
                 )
+            }
+            _formatState.value = nextState
+            if (nextState is com.melmeligy.mediadownloader.core.Resource.Success &&
+                streamSizeRefiner.needsRefinement(nextState.data)
+            ) {
+                val resolved = nextState.data
+                sizeRefineJob = viewModelScope.launch {
+                    val refined = runCatching { streamSizeRefiner.refineMissingSizes(resolved) }.getOrNull()
+                        ?: return@launch
+                    if (currentSheetUrl == targetUrl &&
+                        _formatState.value is com.melmeligy.mediadownloader.core.Resource.Success
+                    ) {
+                        _formatState.value = com.melmeligy.mediadownloader.core.Resource.Success(refined)
+                        (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.updateCached(refined)
+                    }
+                }
             }
         }
     }
