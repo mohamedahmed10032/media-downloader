@@ -90,9 +90,7 @@ class DownloadRepositoryImpl @Inject constructor(
 
     override suspend fun claimNextQueued(limit: Int): List<DownloadItem> = withContext(dispatchers.io) {
         if (limit <= 0) return@withContext emptyList()
-        val next = dao.nextQueued(limit)
-        next.forEach { dao.updateStatus(it.id, DownloadStatus.RUNNING.name, now()) }
-        next.map { it.toDomain().copy(status = DownloadStatus.RUNNING) }
+        dao.claimNextQueued(limit, now()).map { it.toDomain() }
     }
 
     override suspend fun resetInterrupted() = withContext(dispatchers.io) {

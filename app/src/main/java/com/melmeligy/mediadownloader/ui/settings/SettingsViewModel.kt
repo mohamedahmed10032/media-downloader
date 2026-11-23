@@ -12,6 +12,7 @@ import com.melmeligy.mediadownloader.domain.model.AudioBitrate
 import com.melmeligy.mediadownloader.domain.model.ThemeMode
 import com.melmeligy.mediadownloader.domain.model.VideoQuality
 import com.melmeligy.mediadownloader.domain.repository.SettingsRepository
+import com.melmeligy.mediadownloader.download.DownloadManager
 import com.melmeligy.mediadownloader.download.MediaStoreWriter
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -37,6 +38,7 @@ enum class CustomFolderStatus {
 class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val mediaStoreWriter: MediaStoreWriter,
+    private val downloadManager: DownloadManager,
     private val dispatchers: DispatcherProvider,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
@@ -122,6 +124,7 @@ class SettingsViewModel @Inject constructor(
             runCatching { context.cacheDir?.deleteRecursively() }
             runCatching { context.externalCacheDir?.deleteRecursively() }
         }
+        runCatching { downloadManager.cleanupOrphanedCacheFiles() }
         onDone()
     }
 

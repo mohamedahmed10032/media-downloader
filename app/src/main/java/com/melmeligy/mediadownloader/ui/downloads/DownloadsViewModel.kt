@@ -3,11 +3,13 @@ package com.melmeligy.mediadownloader.ui.downloads
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.melmeligy.mediadownloader.domain.model.DownloadItem
+import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.repository.DownloadRepository
 import com.melmeligy.mediadownloader.download.DownloadManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -22,8 +24,16 @@ class DownloadsViewModel @Inject constructor(
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
+    val activeDownloads = downloads
+
+    val completedDownloads = downloadRepository.observeAll()
+        .map { items -> items.filter { it.status == DownloadStatus.COMPLETED } }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
+
     fun pause(id: Long) = viewModelScope.launch { downloadManager.pause(id) }
     fun resume(id: Long) = viewModelScope.launch { downloadManager.resume(id) }
     fun cancel(id: Long) = viewModelScope.launch { downloadManager.cancel(id) }
     fun retry(id: Long) = viewModelScope.launch { downloadManager.retry(id) }
+    fun clearCompleted() = viewModelScope.launch { downloadManager.clearCompleted() }
 }

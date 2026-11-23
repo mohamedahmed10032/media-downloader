@@ -257,9 +257,10 @@ class DownloadsSettingsAuditTest {
             dest.writeBytes(ByteArray(1024) { 1 })
         }
         val capturedBitrate = AtomicInteger(-1)
-        every { muxer.extractAudioOnly(any(), any(), any(), any()) } answers {
+        every { muxer.extractAudioOnly(any(), any(), any(), any(), any()) } answers {
             val out = arg<File>(1)
             capturedBitrate.set(arg<Int>(3))
+            arg<((Float) -> Unit)?>(4)?.invoke(1f)
             out.parentFile?.mkdirs()
             out.writeBytes(ByteArray(512) { 2 })
             true
@@ -577,8 +578,9 @@ class DownloadsSettingsAuditTest {
             dest.parentFile?.mkdirs()
             dest.writeBytes(ByteArray(256) { 5 })
         }
-        every { muxer.extractAudioOnly(any(), any(), any(), any()) } answers {
+        every { muxer.extractAudioOnly(any(), any(), any(), any(), any()) } answers {
             val out = arg<File>(1)
+            arg<((Float) -> Unit)?>(4)?.invoke(1f)
             out.parentFile?.mkdirs()
             out.writeBytes(ByteArray(256) { 6 })
             true

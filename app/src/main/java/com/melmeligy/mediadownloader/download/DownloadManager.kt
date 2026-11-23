@@ -35,6 +35,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -45,6 +46,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -70,6 +73,7 @@ class DownloadManager private constructor(
     private val notifier: DownloadNotifier,
     private val dispatchers: DispatcherProvider,
     private val thumbnailCache: DownloadThumbnailCache?,
+    private val availableBytesProvider: (File) -> Long,
     @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
 
@@ -96,6 +100,7 @@ class DownloadManager private constructor(
         notifier = notifier,
         dispatchers = dispatchers,
         thumbnailCache = thumbnailCache,
+        availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
         marker = true
     )
 
@@ -120,13 +125,45 @@ class DownloadManager private constructor(
         notifier = notifier,
         dispatchers = dispatchers,
         thumbnailCache = null,
+        availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
+        marker = false
+    )
+
+    internal constructor(
+        context: Context,
+        repository: DownloadRepository,
+        settingsRepository: SettingsRepository,
+        segmentedDownloader: SegmentedDownloader,
+        hlsDownloader: HlsSegmentDownloader,
+        videoAudioMuxer: VideoAudioMuxer,
+        mediaStoreWriter: MediaStoreWriter,
+        notifier: DownloadNotifier,
+        dispatchers: DispatcherProvider,
+        thumbnailCache: DownloadThumbnailCache?,
+        availableBytesProvider: (File) -> Long
+    ) : this(
+        context = context,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        segmentedDownloader = segmentedDownloader,
+        hlsDownloader = hlsDownloader,
+        videoAudioMuxer = videoAudioMuxer,
+        mediaStoreWriter = mediaStoreWriter,
+        notifier = notifier,
+        dispatchers = dispatchers,
+        thumbnailCache = thumbnailCache,
+        availableBytesProvider = availableBytesProvider,
         marker = false
     )
 
     private val runningJobs = ConcurrentHashMap<Long, Job>()
     private val retryingJobs = ConcurrentHashMap<Long, Job>()
     private val intents = ConcurrentHashMap<Long, ControlIntent>()
+    private val jobIntents = ConcurrentHashMap<Job, ControlIntent>()
+    private val controlLocks = ConcurrentHashMap<Long, Mutex>()
     private val queueSignal = Channel<Unit>(Channel.CONFLATED)
+
+    private fun lockFor(id: Long): Mutex = controlLocks.computeIfAbsent(id) { Mutex() }
 
     // ---- Public API used by the UI ----
 
@@ -207,51 +244,108 @@ class DownloadManager private constructor(
     }
 
     suspend fun pause(id: Long) {
-        intents[id] = ControlIntent.PAUSE
-        val activeJob = runningJobs[id] ?: retryingJobs[id]
-        // Update status immediately so Home/Downloads UI reflects PAUSED without waiting for socket/muxer teardown.
-        repository.updateStatus(id, DownloadStatus.PAUSED)
-        if (activeJob != null) {
-            activeJob.cancel()
-        } else {
-            intents.remove(id)
+        lockFor(id).withLock {
+            intents[id] = ControlIntent.PAUSE
+            val activeJob = runningJobs[id] ?: retryingJobs[id]
+            if (activeJob != null) {
+                jobIntents[activeJob] = ControlIntent.PAUSE
+            } else {
+                intents.remove(id)
+            }
+            // Update status immediately so Home/Downloads UI reflects PAUSED without waiting for socket/muxer teardown.
+            repository.updateStatus(id, DownloadStatus.PAUSED)
+            activeJob?.cancel()
+            queueSignal.trySend(Unit)
         }
-        queueSignal.trySend(Unit)
     }
 
     suspend fun resume(id: Long) {
-        intents.remove(id)
-        (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
-        if (repository.getById(id) == null) return
-        repository.requeue(id, resetRetryCount = false)
-        queueSignal.trySend(Unit)
-        schedule()
+        lockFor(id).withLock {
+            val activeJob = runningJobs[id] ?: retryingJobs[id]
+            activeJob?.cancelAndJoin()
+            intents.remove(id)
+            if (repository.getById(id) == null) return@withLock
+            repository.requeue(id, resetRetryCount = false)
+            queueSignal.trySend(Unit)
+            schedule()
+        }
     }
 
     suspend fun retry(id: Long) {
-        intents.remove(id)
-        (runningJobs[id] ?: retryingJobs[id])?.cancelAndJoin()
-        if (repository.getById(id) == null) return
-        repository.requeue(id, resetRetryCount = true)
-        queueSignal.trySend(Unit)
-        schedule()
+        lockFor(id).withLock {
+            val activeJob = runningJobs[id] ?: retryingJobs[id]
+            activeJob?.cancelAndJoin()
+            intents.remove(id)
+            if (repository.getById(id) == null) return@withLock
+            repository.requeue(id, resetRetryCount = true)
+            queueSignal.trySend(Unit)
+            schedule()
+        }
     }
 
     suspend fun cancel(id: Long) {
-        intents[id] = ControlIntent.CANCEL
-        val activeJob = runningJobs[id] ?: retryingJobs[id]
-        // Remove the item immediately so Home/Downloads cards disappear without blocking on I/O cleanup.
-        repository.delete(id)
-        if (activeJob != null) {
-            activeJob.cancel()
-        } else {
-            withContext(dispatchers.io) { cleanupStaging(id) }
-            intents.remove(id)
+        lockFor(id).withLock {
+            intents[id] = ControlIntent.CANCEL
+            val activeJob = runningJobs[id] ?: retryingJobs[id]
+            if (activeJob != null) {
+                jobIntents[activeJob] = ControlIntent.CANCEL
+            }
+            // Remove the item immediately so Home/Downloads cards disappear without blocking on I/O cleanup.
+            repository.delete(id)
+            if (activeJob != null) {
+                activeJob.cancel()
+            } else {
+                withContext(dispatchers.io) { cleanupStaging(id) }
+                intents.remove(id)
+            }
+            queueSignal.trySend(Unit)
         }
-        queueSignal.trySend(Unit)
     }
 
-    suspend fun clearCompleted() = repository.clearCompleted()
+    suspend fun clearCompleted() {
+        repository.clearCompleted()
+        runCatching {
+            val cache = thumbnailCache ?: return@runCatching
+            val keepIds = repository.observeAll().first().mapTo(HashSet()) { it.id }
+            withContext(dispatchers.io) {
+                cache.clearUnusedThumbnails(keepIds)
+            }
+        }
+    }
+
+    /**
+     * Deletes unused thumbnail cache files (not belonging to any row in [DownloadRepository]) and
+     * orphaned staging files (`.part`, `.idx`, `hls_parts_*`) whose download ID is not active/paused.
+     */
+    suspend fun cleanupOrphanedCacheFiles(): Pair<Int, Int> {
+        val allItems = runCatching { repository.observeAll().first() }.getOrDefault(emptyList())
+        val allKnownIds = allItems.mapTo(HashSet()) { it.id }
+        val activeOrPausedIds = allItems
+            .asSequence()
+            .filter {
+                it.status == DownloadStatus.QUEUED ||
+                    it.status == DownloadStatus.RUNNING ||
+                    it.status == DownloadStatus.FINALIZING ||
+                    it.status == DownloadStatus.PAUSED
+            }
+            .mapTo(HashSet()) { it.id }
+
+        return withContext(dispatchers.io) {
+            val removedThumbnails = thumbnailCache?.clearUnusedThumbnails(allKnownIds) ?: 0
+            val dir = stagingDir()
+            var removedStaging = 0
+            dir.listFiles()?.forEach { entry ->
+                val itemId = extractStagingItemId(entry.name)
+                if (itemId != null && itemId !in activeOrPausedIds) {
+                    val deleted = runCatching {
+                        if (entry.isDirectory) entry.deleteRecursively() else entry.delete()
+                    }.getOrDefault(false)
+                    if (deleted) removedStaging++
+                }
+            }
+            removedThumbnails to removedStaging
+        }
+    }
 
     suspend fun deleteById(id: Long) {
         cancel(id)
@@ -291,6 +385,7 @@ class DownloadManager private constructor(
             }
             runningJobs[item.id] = job
             job.invokeOnCompletion {
+                jobIntents.remove(job)
                 runningJobs.remove(item.id, job)
                 queueSignal.trySend(Unit)
             }
@@ -329,14 +424,18 @@ class DownloadManager private constructor(
 
     private suspend fun runOne(item: DownloadItem, queueScope: CoroutineScope) {
         val staging = stagingFile(item)
+        val currentJob = currentCoroutineContext()[Job]
         var lastProgressWriteMs = 0L
         var highWaterDownloaded = 0L
         var highWaterTotal = item.totalBytes.coerceAtLeast(0L)
         var isFinalizing = false
         var midDownloadFrameStage = 0
 
+        fun currentControlIntent(): ControlIntent? =
+            (currentJob?.let { jobIntents[it] }) ?: intents[item.id]
+
         suspend fun persistCachedThumbnail(file: File?) {
-            if (file == null || intents[item.id] == ControlIntent.CANCEL) return
+            if (file == null || currentControlIntent() == ControlIntent.CANCEL) return
             if (repository.getById(item.id) != null) {
                 repository.updateThumbnail(item.id, file.absolutePath)
             }
@@ -350,7 +449,7 @@ class DownloadManager private constructor(
             capBeforeFinalizing: Boolean = true,
             force: Boolean = false
         ) {
-            if (intents[item.id] != null || !currentCoroutineContext().isActive) return
+            if (currentControlIntent() != null || !currentCoroutineContext().isActive) return
             if (item.type == MediaType.VIDEO &&
                 thumbnailCache != null &&
                 !thumbnailCache.hasCachedThumbnail(item.id)
@@ -366,7 +465,7 @@ class DownloadManager private constructor(
                     if (firstSeg != null) {
                         midDownloadFrameStage = 1
                         queueScope.launch(dispatchers.io) {
-                            if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                            if (currentControlIntent() != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
                                 val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, firstSeg)
                                 persistCachedThumbnail(extracted)
                             }
@@ -388,7 +487,7 @@ class DownloadManager private constructor(
                         if (candidate != null) {
                             midDownloadFrameStage = nextStage
                             queueScope.launch(dispatchers.io) {
-                                if (intents[item.id] != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                                if (currentControlIntent() != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
                                     val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, candidate)
                                     persistCachedThumbnail(extracted)
                                 }
@@ -427,7 +526,7 @@ class DownloadManager private constructor(
             }
         }
 
-        suspend fun enterFinalizing(currentBytes: Long) {
+        suspend fun enterFinalizing(currentBytes: Long, resetProgressForMux: Boolean = false) {
             if (!isFinalizing) {
                 isFinalizing = true
                 // Switch status BEFORE clearing speed/eta so UI never flashes RUNNING + "--"
@@ -435,13 +534,61 @@ class DownloadManager private constructor(
             }
             val safeBytes = if (currentBytes > 0L) currentBytes else highWaterDownloaded
             if (safeBytes > 0L) {
-                repository.updateProgress(item.id, safeBytes, safeBytes, 0L, 0L)
+                val initialDone = if (resetProgressForMux) 0L else safeBytes
+                repository.updateProgress(item.id, initialDone, safeBytes, 0L, 0L)
             }
             queueSignal.trySend(Unit)
         }
 
+        suspend fun runMuxWithProgress(
+            stageTotalBytes: Long,
+            baseFraction: Float = 0f,
+            fractionSpan: Float = 1f,
+            block: ((Float) -> Unit) -> Boolean
+        ): Boolean = coroutineScope {
+            val safeTotal = stageTotalBytes.coerceAtLeast(100L)
+            val progressCh = Channel<Pair<Float, Long>>(
+                capacity = 64,
+                onBufferOverflow = BufferOverflow.DROP_OLDEST
+            )
+            val reporter = launch {
+                var lastScaled = -1f
+                var lastWriteMs = 0L
+                for ((raw, sentAtMs) in progressCh) {
+                    val scaled = (baseFraction + raw.coerceIn(0f, 1f) * fractionSpan).coerceIn(0f, 1f)
+                    if (scaled >= 1f || lastScaled < 0f || (scaled - lastScaled >= 0.01f && sentAtMs - lastWriteMs >= 150L)) {
+                        lastScaled = scaled
+                        lastWriteMs = sentAtMs
+                        if (currentControlIntent() == null) {
+                            val doneBytes = (safeTotal.toDouble() * scaled.toDouble()).toLong().coerceIn(0L, safeTotal)
+                            repository.updateProgress(item.id, doneBytes, safeTotal, 0L, 0L)
+                        }
+                    }
+                }
+            }
+            try {
+                withContext(dispatchers.io) {
+                    block { pct -> progressCh.trySend(pct to System.currentTimeMillis()) }
+                }
+            } finally {
+                progressCh.close()
+                reporter.join()
+            }
+        }
+
+        val initialIntent = currentControlIntent()
+        if (initialIntent == ControlIntent.PAUSE || initialIntent == ControlIntent.CANCEL) {
+            withContext(NonCancellable + dispatchers.io) {
+                handleCancellation(item, staging, currentJob)
+            }
+            return
+        }
+
         try {
             val headers = JsonUtils.jsonToMap(item.headersJson)
+            val preProbedAcceptsRanges = headers["X-Internal-Accepts-Ranges"]?.equals("true", ignoreCase = true) == true
+            val companionAcceptsRanges = headers["X-Internal-Companion-Accepts-Ranges"]?.equals("true", ignoreCase = true) == true
+
             if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
                 // Cache remote thumbnail (or extract a remote video frame if no poster URL exists / fetch fails)
                 // on queueScope so it finishes even if the user pauses right after starting.
@@ -478,6 +625,16 @@ class DownloadManager private constructor(
                 ?: Regex("""\((\d{2,3})K\)""", RegexOption.IGNORE_CASE)
                     .find(item.qualityLabel)?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?: settingsRepository.current().defaultAudioBitrate.kbps
+
+            val upfrontVideoBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+            val upfrontAudioBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+            val upfrontExpectedBytes = when {
+                upfrontVideoBytes > 0L && upfrontAudioBytes > 0L -> upfrontVideoBytes + upfrontAudioBytes
+                upfrontVideoBytes > 0L -> upfrontVideoBytes
+                item.totalBytes > 0L -> item.totalBytes
+                else -> 0L
+            }
+            ensureSufficientStorage(stagingDir(), upfrontExpectedBytes)
 
             if (item.isHls) {
                 val stagingTs = File(stagingDir(), "dl_${item.id}_raw.ts.part")
@@ -546,7 +703,7 @@ class DownloadManager private constructor(
                                 headers = headers,
                                 dest = stagingAudioTs,
                                 knownTotal = audioKnownBytes,
-                                acceptsRanges = false,
+                                acceptsRanges = companionAcceptsRanges,
                                 segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                                 onProgress = { p ->
                                     val total = if (p.total > 0L) videoActual + p.total else -1L
@@ -554,21 +711,32 @@ class DownloadManager private constructor(
                                 }
                             )
                         }
-                        enterFinalizing(videoActual + stagingAudioTs.length())
-                        val ok = withContext(dispatchers.io) {
-                            val vOk = videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4)
-                            val aOk = videoAudioMuxer.extractM4a(stagingAudioTs, stagingAudioM4a)
-                            vOk && aOk && videoAudioMuxer.mux(stagingVideoMp4, stagingAudioM4a, staging)
+                        val finalizingBytes = (videoActual + stagingAudioTs.length()).coerceAtLeast(1L)
+                        ensureSufficientStorage(stagingDir(), finalizingBytes)
+                        enterFinalizing(finalizingBytes, resetProgressForMux = true)
+                        val vOk = runMuxWithProgress(finalizingBytes, baseFraction = 0f, fractionSpan = 0.45f) { onP ->
+                            videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4, onP)
+                        }
+                        val aOk = if (vOk) {
+                            runMuxWithProgress(finalizingBytes, baseFraction = 0.45f, fractionSpan = 0.25f) { onP ->
+                                videoAudioMuxer.extractM4a(stagingAudioTs, stagingAudioM4a, onProgress = onP)
+                            }
+                        } else false
+                        val ok = vOk && aOk && runMuxWithProgress(finalizingBytes, baseFraction = 0.70f, fractionSpan = 0.30f) { onP ->
+                            videoAudioMuxer.mux(stagingVideoMp4, stagingAudioM4a, staging, onP)
                         }
                         if (!ok) throw MediaException(AppError.GENERIC, "Failed to mux split HLS streams")
                     } else {
-                        val finalizingBytes = if (targetAudioTotal > 0L) targetAudioTotal else stagingTs.length()
-                        enterFinalizing(finalizingBytes)
-                        val ok = withContext(dispatchers.io) {
-                            if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
-                                videoAudioMuxer.extractAudioOnly(stagingTs, staging, item.container, targetBitrateKbps)
-                            } else {
-                                videoAudioMuxer.remuxTsToMp4(stagingTs, staging)
+                        val finalizingBytes = (if (targetAudioTotal > 0L) targetAudioTotal else stagingTs.length()).coerceAtLeast(1L)
+                        ensureSufficientStorage(stagingDir(), finalizingBytes)
+                        enterFinalizing(finalizingBytes, resetProgressForMux = true)
+                        val ok = if (item.type == MediaType.AUDIO || headers["X-Internal-Extract-Audio"] == "true") {
+                            runMuxWithProgress(finalizingBytes) { onP ->
+                                videoAudioMuxer.extractAudioOnly(stagingTs, staging, item.container, targetBitrateKbps, onP)
+                            }
+                        } else {
+                            runMuxWithProgress(finalizingBytes) { onP ->
+                                videoAudioMuxer.remuxTsToMp4(stagingTs, staging, onP)
                             }
                         }
                         if (!ok) throw MediaException(AppError.GENERIC, "Failed to convert HLS container")
@@ -582,8 +750,8 @@ class DownloadManager private constructor(
             } else if (companionAudioUrl != null && item.type == MediaType.VIDEO) {
                 var videoKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
                 var audioKnownBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
-                var videoAcceptsRanges = false
-                var audioAcceptsRanges = false
+                var videoAcceptsRanges = preProbedAcceptsRanges
+                var audioAcceptsRanges = companionAcceptsRanges
 
                 // Concurrent pre-probe when either track lacks upfront byte size so Phase 1 knows combined total
                 if (videoKnownBytes <= 0L || audioKnownBytes <= 0L) {
@@ -611,6 +779,7 @@ class DownloadManager private constructor(
                 } else {
                     item.totalBytes
                 }
+                ensureSufficientStorage(stagingDir(), combinedTotal.coerceAtLeast(0L))
 
                 val stagingVideo = File(stagingDir(), "dl_${item.id}_video.${item.container}.part")
                 val stagingAudio = File(stagingDir(), "dl_${item.id}_audio.part")
@@ -652,9 +821,11 @@ class DownloadManager private constructor(
                     )
 
                     // 3. Mux video + audio into final container (MP4 or WebM)
-                    enterFinalizing(videoActualBytes + stagingAudio.length())
-                    val ok = withContext(dispatchers.io) {
-                        videoAudioMuxer.mux(stagingVideo, stagingAudio, staging)
+                    val finalizingBytes = (videoActualBytes + stagingAudio.length()).coerceAtLeast(1L)
+                    ensureSufficientStorage(stagingDir(), finalizingBytes)
+                    enterFinalizing(finalizingBytes, resetProgressForMux = true)
+                    val ok = runMuxWithProgress(finalizingBytes) { onP ->
+                        videoAudioMuxer.mux(stagingVideo, stagingAudio, staging, onP)
                     }
                     if (!ok) throw MediaException(AppError.GENERIC, "Failed to mux video and audio tracks")
                     adaptiveMuxComplete = true
@@ -673,6 +844,8 @@ class DownloadManager private constructor(
                 val targetAudioTotal = item.totalBytes.takeIf { it > 0L } ?: 0L
                 val stagingSource = File(stagingDir(), "dl_${item.id}_src.part")
 
+                ensureSufficientStorage(stagingDir(), realSourceBytes.coerceAtLeast(0L))
+
                 var extractComplete = false
                 try {
                     segmentedDownloader.download(
@@ -680,7 +853,7 @@ class DownloadManager private constructor(
                         headers = headers,
                         dest = stagingSource,
                         knownTotal = realSourceBytes,
-                        acceptsRanges = false,
+                        acceptsRanges = preProbedAcceptsRanges,
                         segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                         onProgress = { p ->
                             if (isVideoSourceExtract && targetAudioTotal > 0L) {
@@ -700,9 +873,11 @@ class DownloadManager private constructor(
                             }
                         }
                     )
-                    enterFinalizing(targetAudioTotal.takeIf { it > 0L } ?: stagingSource.length())
-                    val ok = withContext(dispatchers.io) {
-                        videoAudioMuxer.extractAudioOnly(stagingSource, staging, item.container, targetBitrateKbps)
+                    val finalizingBytes = (targetAudioTotal.takeIf { it > 0L } ?: stagingSource.length()).coerceAtLeast(1L)
+                    ensureSufficientStorage(stagingDir(), finalizingBytes)
+                    enterFinalizing(finalizingBytes, resetProgressForMux = true)
+                    val ok = runMuxWithProgress(finalizingBytes) { onP ->
+                        videoAudioMuxer.extractAudioOnly(stagingSource, staging, item.container, targetBitrateKbps, onP)
                     }
                     if (!ok) throw MediaException(AppError.GENERIC, "Audio extraction failed")
                     extractComplete = true
@@ -715,12 +890,13 @@ class DownloadManager private constructor(
             } else {
                 val realKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
                     ?: item.totalBytes
+                ensureSufficientStorage(stagingDir(), realKnownBytes.coerceAtLeast(0L))
                 segmentedDownloader.download(
                     url = item.remoteUrl,
                     headers = headers,
                     dest = staging,
                     knownTotal = realKnownBytes,
-                    acceptsRanges = false,
+                    acceptsRanges = preProbedAcceptsRanges,
                     segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
                     onProgress = { p ->
                         reportProgress(p.downloaded, p.total, p.speed, p.eta)
@@ -732,7 +908,7 @@ class DownloadManager private constructor(
             if (bytes <= 0L) throw MediaException(AppError.GENERIC, "Downloaded file is empty")
 
             // Persist exact output size under FINALIZING state while publishing to MediaStore
-            enterFinalizing(bytes)
+            enterFinalizing(bytes, resetProgressForMux = false)
 
             if (item.type == MediaType.VIDEO && thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
                 val localFrame = thumbnailCache.extractVideoFrameThumbnail(item.id, staging)
@@ -757,21 +933,34 @@ class DownloadManager private constructor(
             repository.setCompleted(item.id, uri, bytes)
             notifier.notifyComplete(item.id, item.title)
         } catch (ce: CancellationException) {
-            withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
+            withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging, currentJob) }
             throw ce
         } catch (e: Exception) {
             // If the user cancelled or paused (which can surface as IOException on closed sockets),
             // never treat it as a failure or auto-retry.
-            if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
-                withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
+            val intent = currentControlIntent()
+            if (intent == ControlIntent.CANCEL || intent == ControlIntent.PAUSE) {
+                withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging, currentJob) }
                 return
             }
-            handleFailure(item, staging, e, queueScope)
+            val mapped = if (MediaStoreWriter.isInsufficientStorageException(e) &&
+                (e as? MediaException)?.error != AppError.INSUFFICIENT_STORAGE
+            ) {
+                MediaException(AppError.INSUFFICIENT_STORAGE, e.message, e)
+            } else {
+                e
+            }
+            handleFailure(item, staging, mapped, queueScope, currentJob)
         }
     }
 
-    private suspend fun handleCancellation(item: DownloadItem, staging: File) {
-        when (intents.remove(item.id)) {
+    private suspend fun handleCancellation(item: DownloadItem, staging: File, job: Job? = null) {
+        val jobIntent = job?.let { jobIntents.remove(it) }
+        val effectiveIntent = jobIntent ?: intents[item.id]
+        if (effectiveIntent != null) {
+            intents.remove(item.id, effectiveIntent)
+        }
+        when (effectiveIntent) {
             ControlIntent.CANCEL -> {
                 cleanupStaging(item.id)
                 runCatching { staging.delete() }
@@ -790,13 +979,15 @@ class DownloadManager private constructor(
         item: DownloadItem,
         staging: File,
         e: Exception,
-        queueScope: CoroutineScope
+        queueScope: CoroutineScope,
+        originJob: Job? = null
     ) {
         val error = (e as? MediaException)?.error ?: AppError.GENERIC
+        val activeIntent = (originJob?.let { jobIntents[it] }) ?: intents[item.id]
         val settings = settingsRepository.current()
         val maxRetries = settings.retryCount.coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES)
         val transient = error == AppError.NO_INTERNET || error == AppError.GENERIC
-        if (transient && maxRetries > 0 && item.retryCount < maxRetries && intents[item.id] == null) {
+        if (transient && maxRetries > 0 && item.retryCount < maxRetries && activeIntent == null) {
             val backoffMs = computeRetryBackoffMs(item.retryCount)
             withContext(NonCancellable) {
                 repository.incrementRetry(item.id)
@@ -804,30 +995,33 @@ class DownloadManager private constructor(
             // Schedule retry backoff in retryingJobs so this item releases its concurrency slot
             // immediately while staying cleanly cancellable if the user cancels/pauses during backoff.
             val retryJob = queueScope.launch(start = CoroutineStart.LAZY) {
+                val thisRetryJob = currentCoroutineContext()[Job]
                 try {
                     delay(backoffMs)
-                    if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
-                        withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
+                    val retryIntent = (thisRetryJob?.let { jobIntents[it] }) ?: intents[item.id]
+                    if (retryIntent == ControlIntent.CANCEL || retryIntent == ControlIntent.PAUSE) {
+                        withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging, thisRetryJob) }
                         return@launch
                     }
                     if (repository.getById(item.id) == null) return@launch
                     repository.updateStatus(item.id, DownloadStatus.QUEUED)
                     queueSignal.trySend(Unit)
                 } catch (ce: CancellationException) {
-                    withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging) }
+                    withContext(NonCancellable + dispatchers.io) { handleCancellation(item, staging, thisRetryJob) }
                     throw ce
                 }
             }
             retryingJobs[item.id] = retryJob
             retryJob.invokeOnCompletion {
+                jobIntents.remove(retryJob)
                 retryingJobs.remove(item.id, retryJob)
                 queueSignal.trySend(Unit)
             }
             retryJob.start()
         } else {
             withContext(NonCancellable) {
-                if (intents[item.id] == ControlIntent.CANCEL || intents[item.id] == ControlIntent.PAUSE) {
-                    handleCancellation(item, staging)
+                if (activeIntent == ControlIntent.CANCEL || activeIntent == ControlIntent.PAUSE) {
+                    handleCancellation(item, staging, originJob)
                 } else {
                     cleanupStaging(item.id)
                     repository.setError(item.id, error)
@@ -897,6 +1091,17 @@ class DownloadManager private constructor(
         thumbnailCache?.deleteThumbnail(id)
     }
 
+    private fun ensureSufficientStorage(target: File, requiredBytes: Long) {
+        val minRequired = if (requiredBytes > 0L) requiredBytes else MIN_FREE_STORAGE_FLOOR_BYTES
+        val available = runCatching { availableBytesProvider(target) }.getOrDefault(-1L)
+        if (available >= 0L && available < minRequired) {
+            throw MediaException(
+                AppError.INSUFFICIENT_STORAGE,
+                "Not enough free storage (required=$minRequired, available=$available)"
+            )
+        }
+    }
+
     private fun fileName(item: DownloadItem): String {
         val base = FormatUtils.sanitizeFileName(item.title)
         return "$base.${item.container}"
@@ -916,6 +1121,11 @@ class DownloadManager private constructor(
     companion object {
         private const val FOREGROUND_REFRESH_MS = 1000L
         private const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
+        private const val MIN_FREE_STORAGE_FLOOR_BYTES = 512L * 1024L
+        private val STAGING_ITEM_ID_REGEX = Regex("""^(?:hls_parts_)?dl_(\d+)(?:[._]|$)""")
+
+        internal fun extractStagingItemId(fileName: String): Long? =
+            STAGING_ITEM_ID_REGEX.find(fileName)?.groupValues?.getOrNull(1)?.toLongOrNull()
 
         /** Exponential retry backoff capped at 30 seconds (1s, 2s, 4s, 8s, 16s, 30s). */
         internal fun computeRetryBackoffMs(retryAttempt: Int): Long =

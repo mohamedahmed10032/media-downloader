@@ -64,6 +64,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.melmeligy.mediadownloader.R
+import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.Resource
 import com.melmeligy.mediadownloader.core.util.FormatUtils
 import com.melmeligy.mediadownloader.domain.model.AudioBitrate
@@ -72,6 +73,7 @@ import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.domain.model.VideoQuality
+
 import com.melmeligy.mediadownloader.ui.common.ErrorState
 import com.melmeligy.mediadownloader.ui.common.LoadingState
 import com.melmeligy.mediadownloader.ui.common.asMessage
@@ -84,6 +86,15 @@ import com.melmeligy.mediadownloader.ui.share.shouldShowMultiImageSheet
 import com.melmeligy.mediadownloader.ui.theme.Indigo
 
 private val BrandAccent = Indigo
+
+internal fun shouldShowOpenInBrowserOnError(
+    error: AppError,
+    url: String,
+    hasOpenInBrowserCallback: Boolean
+): Boolean {
+    if (!hasOpenInBrowserCallback || url.isBlank()) return false
+    return error != AppError.INVALID_LINK && error != AppError.NO_INTERNET
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -222,7 +233,7 @@ fun ChooseFormatStateContent(
                 modifier = Modifier.fillMaxWidth(),
                 onRetry = onRetry
             )
-            if (onOpenInBrowser != null && url.isNotBlank()) {
+            if (onOpenInBrowser != null && shouldShowOpenInBrowserOnError(state.error, url, hasOpenInBrowserCallback = true)) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Button(
                     onClick = { onOpenInBrowser(url) },
@@ -236,7 +247,7 @@ fun ChooseFormatStateContent(
                     shape = RoundedCornerShape(24.dp)
                 ) {
                     Text(
-                        text = "Open in Browser to Auto-Catch Stream",
+                        text = stringResource(R.string.quality_open_in_browser),
                         fontWeight = FontWeight.Bold,
                         color = Color.White
                     )

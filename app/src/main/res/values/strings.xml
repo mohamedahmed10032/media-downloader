@@ -16,9 +16,11 @@
     <string name="home_title">Media Downloader</string>
     <string name="home_paste_hint">Paste a media link here</string>
     <string name="home_detect">Detect &amp; Download</string>
+    <string name="home_paste_and_download">Paste &amp; Download</string>
     <string name="home_paste_from_clipboard">Paste from clipboard</string>
     <string name="home_open_browser">Open in-app browser</string>
     <string name="home_recent">Recent downloads</string>
+    <string name="home_quick_platforms">Quick Platforms</string>
 
     <!-- Browser -->
     <string name="browser_search_hint">Search or type a URL</string>
@@ -37,12 +39,15 @@
     <string name="quality_download">Start download</string>
     <string name="quality_estimated_size">~%1$s</string>
     <string name="quality_unknown_size">Size unknown</string>
+    <string name="quality_open_in_browser">Open in Browser to Auto-Catch Stream</string>
     <string name="sheet_download_title">Download</string>
     <string name="toast_download_started">Download started in background</string>
     <string name="toast_batch_download_started">Downloading %1$d items in background</string>
 
     <!-- Downloads -->
     <string name="downloads_title">Downloads</string>
+    <string name="downloads_active_header">Active</string>
+    <string name="downloads_completed_header">Completed</string>
     <string name="downloads_empty">No downloads yet</string>
     <string name="downloads_pause">Pause</string>
     <string name="downloads_resume">Resume</string>
@@ -61,6 +66,12 @@
     <string name="action_rename">Rename</string>
     <string name="action_delete">Delete</string>
     <string name="action_open_with">Open with</string>
+
+    <!-- Player -->
+    <string name="player_title">Player</string>
+    <string name="player_opening">Opening media…</string>
+    <string name="player_error_missing">The media file could not be found.</string>
+    <string name="player_error_playback">Unable to play this media file.</string>
 
     <!-- Settings -->
     <string name="settings_title">Settings</string>

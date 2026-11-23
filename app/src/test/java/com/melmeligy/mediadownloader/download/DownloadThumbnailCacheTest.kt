@@ -143,4 +143,61 @@ class DownloadThumbnailCacheTest {
         val audioItem = withLocal.copy(type = MediaType.AUDIO, thumbnailUrl = null)
         assertTrue("Audio should not treat contentUri as video frame thumbnail", resolveThumbnailCandidates(audioItem).isEmpty())
     }
+
+    @Test
+    fun evictsLeastRecentlyUsedEntriesWhenMaxEntriesOrMaxBytesExceeded() = runBlocking {
+        val jpegHeader = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte()) + ByteArray(64) { 0x11 }
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "image/jpeg")
+                    .body(jpegHeader.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val thumbsDir = File(tempFolder.root, "thumbnails_lru")
+        val cache = DownloadThumbnailCache(
+            thumbsDir = thumbsDir,
+            client = client,
+            frameExtractor = { _, _ -> false },
+            remoteFrameExtractor = { _, _, _ -> false },
+            maxCacheBytes = 512L,
+            maxEntries = 2
+        )
+
+        cache.cacheRemoteThumbnail(1L, "https://cdn.example/1.jpg", "https://example.com", emptyMap())
+        Thread.sleep(15)
+        cache.cacheRemoteThumbnail(2L, "https://cdn.example/2.jpg", "https://example.com", emptyMap())
+        Thread.sleep(15)
+        // Touch item 1 so item 2 becomes the least-recently-used entry
+        assertTrue(cache.hasCachedThumbnail(1L))
+        Thread.sleep(15)
+        cache.cacheRemoteThumbnail(3L, "https://cdn.example/3.jpg", "https://example.com", emptyMap())
+
+        assertTrue("Recently touched entry 1 must survive LRU eviction", cache.hasCachedThumbnail(1L))
+        assertFalse("Least recently used entry 2 should be evicted", cache.hasCachedThumbnail(2L))
+        assertTrue("Newest entry 3 must be present", cache.hasCachedThumbnail(3L))
+    }
+
+    @Test
+    fun clearUnusedThumbnails_keepsKnownIdsAndDeletesOrphans() {
+        val thumbsDir = File(tempFolder.root, "thumbnails_clean").apply { mkdirs() }
+        val valid = ByteArray(16) { 1 }
+        File(thumbsDir, "thumb_10.jpg").writeBytes(valid)
+        File(thumbsDir, "thumb_20.jpg").writeBytes(valid)
+        File(thumbsDir, "thumb_20_remote.tmp").writeBytes(valid)
+
+        val cache = DownloadThumbnailCache(thumbsDir, OkHttpClient()) { _, _ -> false }
+        val deleted = cache.clearUnusedThumbnails(keepDownloadIds = setOf(10L))
+
+        assertEquals(2, deleted)
+        assertTrue(File(thumbsDir, "thumb_10.jpg").exists())
+        assertFalse(File(thumbsDir, "thumb_20.jpg").exists())
+        assertFalse(File(thumbsDir, "thumb_20_remote.tmp").exists())
+    }
 }

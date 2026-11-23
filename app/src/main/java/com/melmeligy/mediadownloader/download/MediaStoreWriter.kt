@@ -7,6 +7,7 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.StatFs
 import android.provider.MediaStore
 import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.DispatcherProvider
@@ -28,10 +29,17 @@ import javax.inject.Singleton
  * @return the content:// URI of the published item.
  */
 @Singleton
-class MediaStoreWriter @Inject constructor(
+class MediaStoreWriter internal constructor(
     @ApplicationContext private val context: Context,
-    private val dispatchers: DispatcherProvider
+    private val dispatchers: DispatcherProvider,
+    private val availableBytesProvider: (File) -> Long
 ) {
+
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+        dispatchers: DispatcherProvider
+    ) : this(context, dispatchers, ::queryAvailableBytes)
 
     suspend fun publish(
         stagingFile: File,
@@ -56,6 +64,12 @@ class MediaStoreWriter @Inject constructor(
             else -> "$directory/$safeSub/"
         }
         val title = displayName.substringBeforeLast('.', displayName)
+
+        ensureSufficientStorage(
+            probeTarget = runCatching { Environment.getExternalStoragePublicDirectory(directory) }.getOrNull()
+                ?: stagingFile.parentFile,
+            requiredBytes = stagingFile.length()
+        )
 
         fun createValues(name: String, destDir: String, relPath: String): ContentValues =
             ContentValues().apply {
@@ -141,6 +155,9 @@ class MediaStoreWriter @Inject constructor(
             }
         } catch (e: Exception) {
             runCatching { resolver.delete(itemUri, null, null) }
+            if (isInsufficientStorageException(e)) {
+                throw MediaException(AppError.INSUFFICIENT_STORAGE, e.message, e)
+            }
             throw if (e is MediaException) e else MediaException(AppError.GENERIC, e.message, e)
         }
 
@@ -287,14 +304,69 @@ class MediaStoreWriter @Inject constructor(
 
             runCatching { stagingFile.delete() }
             docFile.uri.toString()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             runCatching { docFile.delete() }
+            if (isInsufficientStorageException(e)) {
+                throw MediaException(AppError.INSUFFICIENT_STORAGE, e.message, e)
+            }
             null
+        }
+    }
+
+    private fun ensureSufficientStorage(probeTarget: File?, requiredBytes: Long) {
+        if (probeTarget == null || requiredBytes <= 0L) return
+        val available = runCatching { availableBytesProvider(probeTarget) }.getOrDefault(-1L)
+        if (available >= 0L && available < requiredBytes) {
+            throw MediaException(
+                AppError.INSUFFICIENT_STORAGE,
+                "Not enough free storage (required=$requiredBytes, available=$available)"
+            )
         }
     }
 
     companion object {
         private const val DEFAULT_BUFFER_SIZE = 64 * 1024
+
+        internal fun queryAvailableBytes(target: File): Long {
+            var current: File? = target
+            while (current != null && !current.exists()) {
+                current = current.parentFile
+            }
+            val existing = current ?: return -1L
+            if (isAndroidRuntime()) {
+                val statFsBytes = runCatching {
+                    StatFs(existing.absolutePath).availableBytes
+                }.getOrNull()
+                if (statFsBytes != null && statFsBytes >= 0L) return statFsBytes
+            }
+            val usable = existing.usableSpace
+            return if (usable > 0L) usable else -1L
+        }
+
+        private fun isAndroidRuntime(): Boolean {
+            val vm = System.getProperty("java.vm.name").orEmpty().lowercase()
+            val vendor = System.getProperty("java.vendor").orEmpty().lowercase()
+            return vm.contains("dalvik") || vm.contains("art") || vendor.contains("android")
+        }
+
+        internal fun isInsufficientStorageException(throwable: Throwable?): Boolean {
+            var cur = throwable
+            var depth = 0
+            while (cur != null && depth < 8) {
+                if (cur is MediaException && cur.error == AppError.INSUFFICIENT_STORAGE) return true
+                val msg = cur.message?.lowercase().orEmpty()
+                if (msg.contains("enospc") ||
+                    msg.contains("no space left") ||
+                    msg.contains("not enough space") ||
+                    msg.contains("insufficient storage")
+                ) {
+                    return true
+                }
+                cur = cur.cause
+                depth++
+            }
+            return false
+        }
 
         /** Subfolder name created inside a custom SAF folder when "Organize by type" is enabled. */
         internal fun customTypeFolderName(type: MediaType): String = when (type) {

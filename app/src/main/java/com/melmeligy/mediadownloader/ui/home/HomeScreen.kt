@@ -259,7 +259,11 @@ fun HomeScreen(
                 Icon(Icons.Rounded.Download, contentDescription = null, tint = Color.White)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (input.isBlank() && hasClipboardUrl) "Paste & Download" else stringResource(R.string.home_detect),
+                    text = if (input.isBlank() && hasClipboardUrl) {
+                        stringResource(R.string.home_paste_and_download)
+                    } else {
+                        stringResource(R.string.home_detect)
+                    },
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp,
                     color = Color.White
@@ -272,8 +276,8 @@ fun HomeScreen(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(50.dp)
-                    .padding(top = 8.dp),
+                    .padding(top = 8.dp)
+                    .height(50.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Icon(Icons.Rounded.Public, contentDescription = null)
@@ -287,7 +291,7 @@ fun HomeScreen(
 
         item {
             Text(
-                text = "Quick Platforms",
+                text = stringResource(R.string.home_quick_platforms),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

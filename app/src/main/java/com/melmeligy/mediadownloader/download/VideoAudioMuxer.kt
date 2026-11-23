@@ -36,7 +36,16 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    fun mux(videoFile: File, audioFile: File, outputFile: File): Boolean {
+    fun mux(videoFile: File, audioFile: File, outputFile: File): Boolean =
+        mux(videoFile, audioFile, outputFile, onProgress = null)
+
+    @SuppressLint("WrongConstant")
+    fun mux(
+        videoFile: File,
+        audioFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)?
+    ): Boolean {
         if (!isValidInputFile(videoFile) || !isValidInputFile(audioFile)) {
             outputFile.delete()
             return false
@@ -45,9 +54,12 @@ class VideoAudioMuxer @Inject constructor() {
         if (outputFile.exists()) outputFile.delete()
 
         return if (isAndroidRuntime) {
-            muxAndroid(videoFile, audioFile, outputFile)
+            muxAndroid(videoFile, audioFile, outputFile, onProgress)
         } else {
-            muxJvmFfmpeg(videoFile, audioFile, outputFile)
+            onProgress?.invoke(0f)
+            muxJvmFfmpeg(videoFile, audioFile, outputFile).also { ok ->
+                if (ok) onProgress?.invoke(1f)
+            }
         }
     }
 
@@ -61,14 +73,27 @@ class VideoAudioMuxer @Inject constructor() {
         outputFile: File,
         targetContainer: String,
         targetBitrateKbps: Int = 160
+    ): Boolean = extractAudioOnly(sourceFile, outputFile, targetContainer, targetBitrateKbps, onProgress = null)
+
+    fun extractAudioOnly(
+        sourceFile: File,
+        outputFile: File,
+        targetContainer: String,
+        targetBitrateKbps: Int = 160,
+        onProgress: ((Float) -> Unit)?
     ): Boolean {
         return when (targetContainer.lowercase()) {
-            "mp3" -> extractMp3(sourceFile, outputFile, targetBitrateKbps)
-            else -> extractM4a(sourceFile, outputFile, targetBitrateKbps)
+            "mp3" -> extractMp3(sourceFile, outputFile, targetBitrateKbps, onProgress)
+            else -> extractM4a(sourceFile, outputFile, targetBitrateKbps, onProgress)
         }
     }
 
-    fun extractMp3(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 160): Boolean {
+    fun extractMp3(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int = 160,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         if (!isValidInputFile(sourceFile)) {
             outputFile.delete()
             return false
@@ -78,13 +103,18 @@ class VideoAudioMuxer @Inject constructor() {
 
         if (isGenuineMp3File(sourceFile)) {
             sourceFile.copyTo(outputFile, overwrite = true)
-            return outputFile.exists() && outputFile.length() > 0L && isGenuineMp3File(outputFile)
+            val ok = outputFile.exists() && outputFile.length() > 0L && isGenuineMp3File(outputFile)
+            if (ok) onProgress?.invoke(1f)
+            return ok
         }
 
         val ok = if (isAndroidRuntime) {
-            extractMp3Android(sourceFile, outputFile, targetBitrateKbps)
+            extractMp3Android(sourceFile, outputFile, targetBitrateKbps, onProgress)
         } else {
-            extractMp3JvmFfmpegAndJump3r(sourceFile, outputFile, targetBitrateKbps)
+            onProgress?.invoke(0f)
+            extractMp3JvmFfmpegAndJump3r(sourceFile, outputFile, targetBitrateKbps).also { res ->
+                if (res) onProgress?.invoke(1f)
+            }
         }
         if (!ok || !outputFile.exists() || outputFile.length() <= 0L || startsWithIsoBmffFtyp(outputFile) || !isGenuineMp3File(outputFile)) {
             runCatching { outputFile.delete() }
@@ -93,7 +123,12 @@ class VideoAudioMuxer @Inject constructor() {
         return true
     }
 
-    fun extractM4a(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 128): Boolean {
+    fun extractM4a(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int = 128,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         if (!isValidInputFile(sourceFile)) {
             outputFile.delete()
             return false
@@ -102,9 +137,12 @@ class VideoAudioMuxer @Inject constructor() {
         if (outputFile.exists()) outputFile.delete()
 
         val ok = if (isAndroidRuntime) {
-            extractM4aAndroid(sourceFile, outputFile, targetBitrateKbps)
+            extractM4aAndroid(sourceFile, outputFile, targetBitrateKbps, onProgress)
         } else {
-            extractM4aJvmFfmpeg(sourceFile, outputFile, targetBitrateKbps)
+            onProgress?.invoke(0f)
+            extractM4aJvmFfmpeg(sourceFile, outputFile, targetBitrateKbps).also { res ->
+                if (res) onProgress?.invoke(1f)
+            }
         }
         if (!ok || !outputFile.exists() || outputFile.length() <= 0L || !startsWithIsoBmffFtyp(outputFile) || isRawDashBrand(outputFile)) {
             runCatching { outputFile.delete() }
@@ -114,7 +152,15 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    fun remuxTsToMp4(tsFile: File, outputFile: File): Boolean {
+    fun remuxTsToMp4(tsFile: File, outputFile: File): Boolean =
+        remuxTsToMp4(tsFile, outputFile, onProgress = null)
+
+    @SuppressLint("WrongConstant")
+    fun remuxTsToMp4(
+        tsFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)?
+    ): Boolean {
         if (!isValidInputFile(tsFile)) {
             outputFile.delete()
             return false
@@ -123,9 +169,12 @@ class VideoAudioMuxer @Inject constructor() {
         if (outputFile.exists()) outputFile.delete()
 
         val ok = if (isAndroidRuntime) {
-            remuxTsToMp4Android(tsFile, outputFile)
+            remuxTsToMp4Android(tsFile, outputFile, onProgress)
         } else {
-            remuxTsToMp4JvmFfmpeg(tsFile, outputFile)
+            onProgress?.invoke(0f)
+            remuxTsToMp4JvmFfmpeg(tsFile, outputFile).also { res ->
+                if (res) onProgress?.invoke(1f)
+            }
         }
         if (!ok || !outputFile.exists() || outputFile.length() <= 0L || startsWithMpegTsSync(outputFile) || !startsWithIsoBmffFtyp(outputFile)) {
             runCatching { outputFile.delete() }
@@ -139,7 +188,12 @@ class VideoAudioMuxer @Inject constructor() {
     // =========================================================================
 
     @SuppressLint("WrongConstant")
-    private fun muxAndroid(videoFile: File, audioFile: File, outputFile: File): Boolean {
+    private fun muxAndroid(
+        videoFile: File,
+        audioFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         var videoExtractor: MediaExtractor? = null
         var audioExtractor: MediaExtractor? = null
         var muxer: MediaMuxer? = null
@@ -168,7 +222,7 @@ class VideoAudioMuxer @Inject constructor() {
             if (!isWebmVideo && isWebmAudio) return false
             if (!isWebmVideo && !isMp4Audio) return false
 
-            if (!isWebmVideo && Media3Mp4Remuxer.muxMp4(videoFile, audioFile, outputFile)) {
+            if (!isWebmVideo && Media3Mp4Remuxer.muxMp4(videoFile, audioFile, outputFile, onProgress)) {
                 return true
             }
 
@@ -245,7 +299,12 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    private fun extractMp3Android(sourceFile: File, outputFile: File, targetBitrateKbps: Int): Boolean {
+    private fun extractMp3Android(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         var extractor: MediaExtractor? = null
         var decoder: MediaCodec? = null
         var encoder: Jump3rMp3Encoder? = null
@@ -256,6 +315,10 @@ class VideoAudioMuxer @Inject constructor() {
             extractor.selectTrack(audioTrack)
             val format = extractor.getTrackFormat(audioTrack)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: return false
+            val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                runCatching { format.getLong(MediaFormat.KEY_DURATION) }.getOrDefault(0L)
+            } else 0L
+            var lastReportedPct = -1
 
             val audioHasAdts = format.containsKey(MediaFormat.KEY_IS_ADTS) &&
                 runCatching { format.getInteger(MediaFormat.KEY_IS_ADTS) == 1 }.getOrDefault(false)
@@ -365,6 +428,15 @@ class VideoAudioMuxer @Inject constructor() {
                                 outBuf.get(pcm)
                                 val stereoOrMonoPcm = if (channels > 2) downmixPcm16LeToStereo(pcm, channels) else pcm
                                 totalEncodedBytes += enc.encodePcm16Le(stereoOrMonoPcm, stereoOrMonoPcm.size, out)
+                                if (onProgress != null && durationUs > 0L && info.presentationTimeUs > 0L) {
+                                    val pct = ((info.presentationTimeUs.toDouble() / durationUs.toDouble()) * 100.0)
+                                        .toInt()
+                                        .coerceIn(0, 100)
+                                    if (pct > lastReportedPct) {
+                                        lastReportedPct = pct
+                                        onProgress(pct / 100f)
+                                    }
+                                }
                             }
                             decoder.releaseOutputBuffer(outIdx, false)
                             if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -375,6 +447,9 @@ class VideoAudioMuxer @Inject constructor() {
                 }
                 encoder?.let { totalEncodedBytes += it.flush(out) }
                 out.flush()
+            }
+            if (totalEncodedBytes > 0L && lastReportedPct < 100) {
+                onProgress?.invoke(1.0f)
             }
             totalEncodedBytes > 0L
         } catch (_: Exception) {
@@ -389,9 +464,14 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    private fun extractM4aAndroid(sourceFile: File, outputFile: File, targetBitrateKbps: Int = 128): Boolean {
+    private fun extractM4aAndroid(
+        sourceFile: File,
+        outputFile: File,
+        targetBitrateKbps: Int = 128,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         // Fast, standards-compliant Media3 demux + Mp4Muxer path for AAC sources (TS, fMP4, MP4)
-        if (Media3Mp4Remuxer.extractAacM4a(sourceFile, outputFile)) {
+        if (Media3Mp4Remuxer.extractAacM4a(sourceFile, outputFile, onProgress)) {
             return true
         }
 
@@ -637,10 +717,14 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     @SuppressLint("WrongConstant")
-    private fun remuxTsToMp4Android(tsFile: File, outputFile: File): Boolean {
+    private fun remuxTsToMp4Android(
+        tsFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         // Primary path: pure-Java Media3 TsExtractor/Mp4Extractor + Mp4Muxer
         // Properly splits multi-ADTS PES frames, writes clean stts/ctts for H.264 B-frames, and faststarts moov.
-        if (Media3Mp4Remuxer.remuxToMp4(tsFile, outputFile)) {
+        if (Media3Mp4Remuxer.remuxToMp4(tsFile, outputFile, onProgress)) {
             return true
         }
 

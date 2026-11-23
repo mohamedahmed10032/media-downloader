@@ -3,8 +3,10 @@ package com.melmeligy.mediadownloader.data.local.dao
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import com.melmeligy.mediadownloader.data.local.entity.DownloadEntity
+import com.melmeligy.mediadownloader.domain.model.DownloadStatus
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import kotlinx.coroutines.flow.Flow
 
@@ -75,6 +77,14 @@ interface DownloadDao {
 
     @Query("SELECT * FROM downloads WHERE status = 'QUEUED' ORDER BY createdAt ASC LIMIT :limit")
     suspend fun nextQueued(limit: Int): List<DownloadEntity>
+
+    @Transaction
+    suspend fun claimNextQueued(limit: Int, now: Long): List<DownloadEntity> {
+        if (limit <= 0) return emptyList()
+        val next = nextQueued(limit)
+        next.forEach { updateStatus(it.id, DownloadStatus.RUNNING.name, now) }
+        return next.map { it.copy(status = DownloadStatus.RUNNING, updatedAt = now) }
+    }
 
     @Query("SELECT COUNT(*) FROM downloads WHERE status IN ('RUNNING','FINALIZING')")
     suspend fun runningCount(): Int

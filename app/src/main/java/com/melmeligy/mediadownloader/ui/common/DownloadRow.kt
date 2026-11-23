@@ -63,13 +63,13 @@ fun DownloadRow(
             Spacer(Modifier.width(12.dp))
             androidx.compose.foundation.layout.Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = item.title,
+                    text = isolateBidiForDisplay(item.title),
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = formatDownloadPrimaryStatus(item),
+                    text = isolateBidiForDisplay(formatDownloadPrimaryStatus(item)),
                     style = MaterialTheme.typography.bodySmall,
                     color = if (item.status == DownloadStatus.FAILED) MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -80,7 +80,7 @@ fun DownloadRow(
                 val secondary = formatDownloadSecondaryStatus(item)
                 if (secondary != null) {
                     Text(
-                        text = secondary,
+                        text = isolateBidiForDisplay(secondary),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -90,7 +90,7 @@ fun DownloadRow(
                 }
                 if (item.isActive && item.status != DownloadStatus.QUEUED) {
                     Spacer(Modifier.height(6.dp))
-                    if (item.status == DownloadStatus.FINALIZING || item.totalBytes <= 0) {
+                    if (item.totalBytes <= 0L) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     } else {
                         LinearProgressIndicator(
@@ -230,9 +230,43 @@ internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
     }
 }
 
+internal fun isolateBidiForDisplay(text: String): String {
+    if (text.isEmpty()) return text
+    val hasRtl = text.any { ch ->
+        val dir = Character.getDirectionality(ch)
+        dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT ||
+            dir == Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC
+    }
+    val hasLtrOrDigit = text.any { ch ->
+        val dir = Character.getDirectionality(ch)
+        dir == Character.DIRECTIONALITY_LEFT_TO_RIGHT ||
+            dir == Character.DIRECTIONALITY_EUROPEAN_NUMBER ||
+            dir == Character.DIRECTIONALITY_ARABIC_NUMBER
+    }
+    if (!hasRtl && !hasLtrOrDigit) return text
+    // Isolate embedded LTR runs (metrics, extensions, speeds, filenames) cleanly in RTL contexts,
+    // and wrap mixed text in First-Strong Isolate (\u2068...\u2069).
+    val ltrRunRegex = Regex("""[A-Za-z0-9][A-Za-z0-9._:/%+\-\s]*(?<=[A-Za-z0-9%])""")
+    val isolatedRuns = if (hasRtl) {
+        ltrRunRegex.replace(text) { m -> "\u2066${m.value}\u2069" }
+    } else {
+        text
+    }
+    return "\u2068$isolatedRuns\u2069"
+}
+
 internal fun formatDownloadSecondaryStatus(item: DownloadItem): String? {
     return when (item.status) {
-        DownloadStatus.FINALIZING -> formatFinalizingStageLabel(item)
+        DownloadStatus.FINALIZING -> {
+            val stage = formatFinalizingStageLabel(item)
+            val safeDone = item.downloadedBytes.coerceAtLeast(0L)
+            val safeTotal = item.totalBytes.coerceAtLeast(0L)
+            if (safeTotal > 0L && safeDone < safeTotal) {
+                "$stage (${FormatUtils.formatPercent(item.progress)})"
+            } else {
+                stage
+            }
+        }
         DownloadStatus.RUNNING -> {
             val safeDone = item.downloadedBytes.coerceAtLeast(0L)
             val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L

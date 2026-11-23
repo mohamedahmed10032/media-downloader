@@ -13,6 +13,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+sealed interface PlayerUiState {
+    data object Loading : PlayerUiState
+    data class Ready(val item: DownloadItem, val uriString: String) : PlayerUiState
+    data object Missing : PlayerUiState
+}
+
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
     downloadRepository: DownloadRepository,
@@ -24,7 +30,19 @@ class PlayerViewModel @Inject constructor(
     private val _item = MutableStateFlow<DownloadItem?>(null)
     val item: StateFlow<DownloadItem?> = _item.asStateFlow()
 
+    private val _uiState = MutableStateFlow<PlayerUiState>(PlayerUiState.Loading)
+    val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
+
     init {
-        viewModelScope.launch { _item.value = downloadRepository.getById(id) }
+        viewModelScope.launch {
+            val loaded = downloadRepository.getById(id)
+            _item.value = loaded
+            val uri = loaded?.contentUri?.trim()?.takeIf { it.isNotEmpty() }
+            _uiState.value = if (loaded != null && uri != null) {
+                PlayerUiState.Ready(loaded, uri)
+            } else {
+                PlayerUiState.Missing
+            }
+        }
     }
 }

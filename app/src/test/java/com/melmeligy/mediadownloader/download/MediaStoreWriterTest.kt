@@ -92,4 +92,36 @@ class MediaStoreWriterTest {
         assertEquals("Music/", relativePath("Music", "///"))
         assertEquals("Movies/Sub/Folder/", relativePath("Movies", "/Sub/Folder/"))
     }
+
+    @Test
+    fun publish_rejectsWhenAvailableBytesLessThanStagingSize() = runTest {
+        val staging = tempFolder.newFile("large.mp4").apply {
+            writeBytes(ByteArray(4096) { 1 })
+        }
+        val lowSpaceWriter = MediaStoreWriter(
+            context = context,
+            dispatchers = dispatchers,
+            availableBytesProvider = { 512L }
+        )
+
+        try {
+            lowSpaceWriter.publish(staging, "large.mp4", MediaType.VIDEO, "mp4", "MediaDownloader")
+            fail("Expected INSUFFICIENT_STORAGE MediaException")
+        } catch (e: MediaException) {
+            assertEquals(com.melmeligy.mediadownloader.core.AppError.INSUFFICIENT_STORAGE, e.error)
+        }
+    }
+
+    @Test
+    fun isInsufficientStorageException_detectsEnospcAndWrappedDiskFullErrors() {
+        assertTrue(MediaStoreWriter.isInsufficientStorageException(IOException("write failed: ENOSPC (No space left on device)")))
+        assertTrue(MediaStoreWriter.isInsufficientStorageException(RuntimeException("outer", IOException("No space left"))))
+        assertTrue(
+            MediaStoreWriter.isInsufficientStorageException(
+                MediaException(com.melmeligy.mediadownloader.core.AppError.INSUFFICIENT_STORAGE, "disk full")
+            )
+        )
+        assertFalse(MediaStoreWriter.isInsufficientStorageException(IOException("Connection reset by peer")))
+        assertFalse(MediaStoreWriter.isInsufficientStorageException(null))
+    }
 }

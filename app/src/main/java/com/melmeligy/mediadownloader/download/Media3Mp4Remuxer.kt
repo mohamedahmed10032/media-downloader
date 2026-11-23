@@ -64,14 +64,19 @@ internal object Media3Mp4Remuxer {
         MimeTypes.AUDIO_AMR_WB
     )
 
-    fun remuxToMp4(sourceFile: File, outputFile: File): Boolean {
+    fun remuxToMp4(
+        sourceFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         if (!sourceFile.exists() || sourceFile.length() < 16L) return false
         val isTs = looksLikeMpegTs(sourceFile)
         val primary = remuxSingleSource(
             sourceFile = sourceFile,
             outputFile = outputFile,
             audioOnlyAac = false,
-            allowNonIdrKeyframes = false
+            allowNonIdrKeyframes = false,
+            onProgress = onProgress
         )
         if (primary) return true
 
@@ -82,23 +87,34 @@ internal object Media3Mp4Remuxer {
                 sourceFile = sourceFile,
                 outputFile = outputFile,
                 audioOnlyAac = false,
-                allowNonIdrKeyframes = true
+                allowNonIdrKeyframes = true,
+                onProgress = onProgress
             )
         }
         return false
     }
 
-    fun extractAacM4a(sourceFile: File, outputFile: File): Boolean {
+    fun extractAacM4a(
+        sourceFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         if (!sourceFile.exists() || sourceFile.length() < 16L) return false
         return remuxSingleSource(
             sourceFile = sourceFile,
             outputFile = outputFile,
             audioOnlyAac = true,
-            allowNonIdrKeyframes = false
+            allowNonIdrKeyframes = false,
+            onProgress = onProgress
         )
     }
 
-    fun muxMp4(videoFile: File, audioFile: File, outputFile: File): Boolean {
+    fun muxMp4(
+        videoFile: File,
+        audioFile: File,
+        outputFile: File,
+        onProgress: ((Float) -> Unit)? = null
+    ): Boolean {
         if (!videoFile.exists() || videoFile.length() < 16L) return false
         if (!audioFile.exists() || audioFile.length() < 16L) return false
 
@@ -124,7 +140,11 @@ internal object Media3Mp4Remuxer {
             var sawUnsupportedVideo = false
             val videoBufferInfo = MediaCodec.BufferInfo()
 
-            val videoOk = extractFile(videoFile, allowNonIdrKeyframes = false) { trackType ->
+            val videoOk = extractFile(
+                sourceFile = videoFile,
+                allowNonIdrKeyframes = false,
+                onProgress = onProgress?.let { cb -> { p -> cb((p * 0.5f).coerceIn(0f, 0.5f)) } }
+            ) { trackType ->
                 if (trackType != C.TRACK_TYPE_VIDEO && trackType != C.TRACK_TYPE_UNKNOWN) {
                     return@extractFile DiscardTrackOutput()
                 }
@@ -170,7 +190,11 @@ internal object Media3Mp4Remuxer {
             val ptsLimitUs = if (maxVideoPtsUs > 0L) maxVideoPtsUs + MAX_AUDIO_TAIL_PAST_VIDEO_US else Long.MAX_VALUE
             val audioBufferInfo = MediaCodec.BufferInfo()
 
-            val audioOk = extractFile(audioFile, allowNonIdrKeyframes = false) { trackType ->
+            val audioOk = extractFile(
+                sourceFile = audioFile,
+                allowNonIdrKeyframes = false,
+                onProgress = onProgress?.let { cb -> { p -> cb((0.5f + p * 0.5f).coerceIn(0.5f, 1.0f)) } }
+            ) { trackType ->
                 if (trackType != C.TRACK_TYPE_AUDIO && trackType != C.TRACK_TYPE_UNKNOWN) {
                     return@extractFile DiscardTrackOutput()
                 }
@@ -236,7 +260,8 @@ internal object Media3Mp4Remuxer {
         sourceFile: File,
         outputFile: File,
         audioOnlyAac: Boolean,
-        allowNonIdrKeyframes: Boolean
+        allowNonIdrKeyframes: Boolean,
+        onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
@@ -294,7 +319,7 @@ internal object Media3Mp4Remuxer {
                 activeMuxer.writeSampleData(token, ByteBuffer.wrap(payload), bufferInfo)
             }
 
-            val extracted = extractFile(sourceFile, allowNonIdrKeyframes) { trackType ->
+            val extracted = extractFile(sourceFile, allowNonIdrKeyframes, onProgress) { trackType ->
                 val wantTrack = when {
                     audioOnlyAac -> trackType == C.TRACK_TYPE_AUDIO || trackType == C.TRACK_TYPE_UNKNOWN
                     else -> trackType == C.TRACK_TYPE_VIDEO || trackType == C.TRACK_TYPE_AUDIO || trackType == C.TRACK_TYPE_UNKNOWN
@@ -476,6 +501,7 @@ internal object Media3Mp4Remuxer {
     private fun extractFile(
         sourceFile: File,
         allowNonIdrKeyframes: Boolean,
+        onProgress: ((Float) -> Unit)? = null,
         trackFactory: (trackType: Int) -> TrackOutput
     ): Boolean {
         RandomAccessFile(sourceFile, "r").use { raf ->
@@ -501,12 +527,21 @@ internal object Media3Mp4Remuxer {
 
             try {
                 var iterations = 0
+                var lastReportedPct = -1
                 while (iterations < MAX_EXTRACT_ITERATIONS) {
                     iterations++
                     val result = try {
                         extractor.read(input, positionHolder)
                     } catch (_: EOFException) {
                         Extractor.RESULT_END_OF_INPUT
+                    }
+                    if (onProgress != null && fileLength > 0L) {
+                        val pos = runCatching { raf.filePointer }.getOrDefault(0L)
+                        val pct = ((pos.toDouble() / fileLength.toDouble()) * 100.0).toInt().coerceIn(0, 100)
+                        if (pct > lastReportedPct) {
+                            lastReportedPct = pct
+                            onProgress(pct / 100f)
+                        }
                     }
                     when (result) {
                         Extractor.RESULT_CONTINUE -> Unit
@@ -519,6 +554,9 @@ internal object Media3Mp4Remuxer {
                         Extractor.RESULT_END_OF_INPUT -> break
                         else -> break
                     }
+                }
+                if (onProgress != null && lastReportedPct < 100) {
+                    onProgress(1.0f)
                 }
                 return true
             } finally {

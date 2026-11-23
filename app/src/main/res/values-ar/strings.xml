@@ -1,0 +1,119 @@
+<resources>
+    <string name="app_name">محمّل الوسائط</string>
+    <string name="developer_name">Mohamed El-Meligy</string>
+    <string name="built_by">تطوير Mohamed El-Meligy</string>
+    <string name="about_developer">عن المطوّر</string>
+    <string name="developer_credit">تصميم وتطوير Mohamed El-Meligy</string>
+
+    <!-- Navigation -->
+    <string name="nav_home">الرئيسية</string>
+    <string name="nav_browser">المتصفح</string>
+    <string name="nav_downloads">التحميلات</string>
+    <string name="nav_library">المكتبة</string>
+    <string name="nav_settings">الإعدادات</string>
+
+    <!-- Home -->
+    <string name="home_title">محمّل الوسائط</string>
+    <string name="home_paste_hint">ألصق رابط الوسائط هنا</string>
+    <string name="home_detect">فحص وتحميل</string>
+    <string name="home_paste_and_download">لصق وتحميل</string>
+    <string name="home_paste_from_clipboard">لصق من الحافظة</string>
+    <string name="home_open_browser">فتح المتصفح الداخلي</string>
+    <string name="home_recent">أحدث التحميلات</string>
+    <string name="home_quick_platforms">منصات سريعة</string>
+
+    <!-- Browser -->
+    <string name="browser_search_hint">ابحث أو اكتب رابطاً</string>
+    <string name="browser_new_tab">تبويب جديد</string>
+    <string name="browser_tabs">التبويبات</string>
+    <string name="browser_bookmarks">المفضلة</string>
+    <string name="browser_add_bookmark">إضافة إلى المفضلة</string>
+    <string name="browser_download_found">تم العثور على وسائط في هذه الصفحة</string>
+    <string name="browser_download">تحميل</string>
+
+    <!-- Quality selection -->
+    <string name="quality_title">اختر الصيغة</string>
+    <string name="quality_video">فيديو</string>
+    <string name="quality_audio">صوت فقط</string>
+    <string name="quality_image">صور</string>
+    <string name="quality_download">بدء التحميل</string>
+    <string name="quality_estimated_size">~%1$s</string>
+    <string name="quality_unknown_size">الحجم غير معروف</string>
+    <string name="quality_open_in_browser">فتح في المتصفح لالتقاط البث تلقائياً</string>
+    <string name="sheet_download_title">تحميل</string>
+    <string name="toast_download_started">بدأ التحميل في الخلفية</string>
+    <string name="toast_batch_download_started">جارٍ تحميل %1$d عناصر في الخلفية</string>
+
+    <!-- Downloads -->
+    <string name="downloads_title">التحميلات</string>
+    <string name="downloads_active_header">قيد التنفيذ</string>
+    <string name="downloads_completed_header">المكتملة</string>
+    <string name="downloads_empty">لا توجد تحميلات بعد</string>
+    <string name="downloads_pause">إيقاف مؤقت</string>
+    <string name="downloads_resume">استئناف</string>
+    <string name="downloads_cancel">إلغاء</string>
+    <string name="downloads_retry">إعادة المحاولة</string>
+    <string name="downloads_clear_completed">مسح المكتملة</string>
+
+    <!-- Library -->
+    <string name="library_title">المكتبة</string>
+    <string name="library_videos">الفيديوهات</string>
+    <string name="library_audio">الصوتيات</string>
+    <string name="library_images">الصور</string>
+    <string name="library_empty">لا يوجد محتوى هنا بعد</string>
+    <string name="action_play">تشغيل</string>
+    <string name="action_share">مشاركة</string>
+    <string name="action_rename">إعادة تسمية</string>
+    <string name="action_delete">حذف</string>
+    <string name="action_open_with">فتح باستخدام</string>
+
+    <!-- Player -->
+    <string name="player_title">المشغل</string>
+    <string name="player_opening">جارٍ فتح الوسائط…</string>
+    <string name="player_error_missing">تعذّر العثور على ملف الوسائط.</string>
+    <string name="player_error_playback">تعذّر تشغيل ملف الوسائط هذا.</string>
+
+    <!-- Settings -->
+    <string name="settings_title">الإعدادات</string>
+    <string name="settings_default_quality">جودة الفيديو الافتراضية</string>
+    <string name="settings_default_audio_bitrate">جودة الصوت الافتراضية</string>
+    <string name="settings_save_location">مكان الحفظ</string>
+    <string name="settings_max_concurrent">أقصى عدد للتحميلات المتزامنة</string>
+    <string name="settings_retry_count">محاولات إعادة المحاولة التلقائية</string>
+    <string name="settings_theme">المظهر</string>
+    <string name="settings_theme_system">اتباع النظام</string>
+    <string name="settings_theme_dark">داكن</string>
+    <string name="settings_theme_light">فاتح</string>
+    <string name="settings_clear_cache">مسح الكاش</string>
+    <string name="settings_legal">الشروط وإخلاء المسؤولية</string>
+
+    <!-- Permissions -->
+    <string name="perm_notifications_title">السماح بالإشعارات</string>
+    <string name="perm_notifications_rationale">يعرض محمّل الوسائط تقدّم التحميل وسرعته واكتماله في الإشعارات. يرجى السماح بالإشعارات لمتابعة التحميلات في الخلفية.</string>
+    <string name="perm_storage_title">السماح بالوصول إلى التخزين</string>
+    <string name="perm_storage_rationale">يلزم إذن الوصول إلى التخزين لحفظ الملفات المحمّلة على جهازك في هذا الإصدار من أندرويد.</string>
+    <string name="perm_grant">منح الإذن</string>
+    <string name="perm_not_now">ليس الآن</string>
+    <string name="perm_combined_title">الأذونات المطلوبة</string>
+    <string name="perm_combined_rationale">يحتاج محمّل الوسائط إلى إذن التخزين لحفظ التحميلات وإذن الإشعارات لعرض التقدّم. يرجى منح الأذونات للمتابعة.</string>
+
+    <!-- Errors -->
+    <string name="error_no_internet">لا يوجد اتصال بالإنترنت. تحقق من الشبكة وحاول مرة أخرى.</string>
+    <string name="error_invalid_link">يبدو أن هذا الرابط غير صالح. يرجى التحقق منه والمحاولة مجدداً.</string>
+    <string name="error_no_media_found">لم يتم العثور على وسائط قابلة للتحميل في هذا الرابط.</string>
+    <string name="error_unsupported_site">هذا المصدر غير مدعوم بعد. يمكنك لصق رابط وسائط مباشر.</string>
+    <string name="error_geo_blocked">يبدو أن هذا المحتوى غير متاح في منطقتك.</string>
+    <string name="error_expired_link">انتهت صلاحية هذا الرابط. يرجى تحديث المصدر والمحاولة مجدداً.</string>
+    <string name="error_insufficient_storage">لا توجد مساحة تخزين كافية لإكمال هذا التحميل.</string>
+    <string name="error_generic">حدث خطأ ما. يرجى المحاولة مرة أخرى.</string>
+
+    <!-- Notifications -->
+    <string name="notif_channel_downloads">التحميلات</string>
+    <string name="notif_channel_downloads_desc">يعرض تقدّم التحميلات النشطة والمكتملة.</string>
+    <string name="notif_downloading">جارٍ التحميل</string>
+    <string name="notif_download_complete">اكتمل التحميل</string>
+    <string name="notif_download_failed">فشل التحميل</string>
+
+    <!-- Legal -->
+    <string name="disclaimer_body">هذا التطبيق مدير تحميلات ومتصفح ويب للأغراض العامة. قم فقط بتحميل المحتوى الذي تملكه أو تملك حق تحميله. أنت وحدك المسؤول عن الامتثال لشروط الخدمة لأي موقع أو منصة تصل إليها ولقوانين حقوق النشر المعمول بها. لا يتجاوز هذا التطبيق أنظمة إدارة الحقوق الرقمية (DRM) أو ضوابط الوصول.</string>
+</resources>

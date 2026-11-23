@@ -30,8 +30,24 @@ class DownloadThumbnailCache internal constructor(
     private val thumbsDir: File,
     private val client: OkHttpClient,
     private val frameExtractor: (File, File) -> Boolean,
-    private val remoteFrameExtractor: (String, Map<String, String>, File) -> Boolean
+    private val remoteFrameExtractor: (String, Map<String, String>, File) -> Boolean,
+    private val maxCacheBytes: Long,
+    private val maxEntries: Int
 ) {
+
+    internal constructor(
+        thumbsDir: File,
+        client: OkHttpClient,
+        frameExtractor: (File, File) -> Boolean,
+        remoteFrameExtractor: (String, Map<String, String>, File) -> Boolean
+    ) : this(
+        thumbsDir = thumbsDir,
+        client = client,
+        frameExtractor = frameExtractor,
+        remoteFrameExtractor = remoteFrameExtractor,
+        maxCacheBytes = DEFAULT_MAX_CACHE_BYTES,
+        maxEntries = DEFAULT_MAX_ENTRIES
+    )
 
     internal constructor(
         thumbsDir: File,
@@ -41,7 +57,9 @@ class DownloadThumbnailCache internal constructor(
         thumbsDir = thumbsDir,
         client = client,
         frameExtractor = frameExtractor,
-        remoteFrameExtractor = ::extractRemoteFrameWithRetriever
+        remoteFrameExtractor = ::extractRemoteFrameWithRetriever,
+        maxCacheBytes = DEFAULT_MAX_CACHE_BYTES,
+        maxEntries = DEFAULT_MAX_ENTRIES
     )
 
     @Inject
@@ -52,14 +70,20 @@ class DownloadThumbnailCache internal constructor(
         thumbsDir = File(context.filesDir, "thumbnails"),
         client = client,
         frameExtractor = ::extractFrameWithRetriever,
-        remoteFrameExtractor = ::extractRemoteFrameWithRetriever
+        remoteFrameExtractor = ::extractRemoteFrameWithRetriever,
+        maxCacheBytes = DEFAULT_MAX_CACHE_BYTES,
+        maxEntries = DEFAULT_MAX_ENTRIES
     )
 
     fun thumbnailFile(downloadId: Long): File = File(thumbsDir, "thumb_$downloadId.jpg")
 
     fun hasCachedThumbnail(downloadId: Long): Boolean {
         val file = thumbnailFile(downloadId)
-        return file.exists() && file.length() > 0L
+        val exists = file.exists() && file.length() > 0L
+        if (exists) {
+            runCatching { file.setLastModified(System.currentTimeMillis()) }
+        }
+        return exists
     }
 
     /**
@@ -100,7 +124,9 @@ class DownloadThumbnailCache internal constructor(
         }
         val validBytes = bytes ?: return@withContext null
 
-        writeAtomically(targetFile, validBytes)
+        writeAtomically(targetFile, validBytes)?.also {
+            evictIfNeeded(protectedDownloadId = downloadId)
+        }
     }
 
     private fun extractOrigin(rawUrl: String?): String? {
@@ -163,7 +189,10 @@ class DownloadThumbnailCache internal constructor(
             ?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
             ?: return@withContext null
         val targetFile = thumbnailFile(downloadId)
-        if (targetFile.exists() && targetFile.length() > 0L) return@withContext targetFile
+        if (targetFile.exists() && targetFile.length() > 0L) {
+            runCatching { targetFile.setLastModified(System.currentTimeMillis()) }
+            return@withContext targetFile
+        }
 
         val requestHeaders = buildThumbnailHeaders(sourceUrl, headers, remoteUrl).toMutableMap().apply {
             remove("Accept")
@@ -187,7 +216,9 @@ class DownloadThumbnailCache internal constructor(
                 return@withContext null
             }
         }
-        targetFile.takeIf { it.exists() && it.length() > 0L }
+        targetFile.takeIf { it.exists() && it.length() > 0L }?.also {
+            evictIfNeeded(protectedDownloadId = downloadId)
+        }
     }
 
     /**
@@ -199,7 +230,10 @@ class DownloadThumbnailCache internal constructor(
     ): File? = withContext(Dispatchers.IO) {
         if (!videoFile.exists() || videoFile.length() <= 0L) return@withContext null
         val targetFile = thumbnailFile(downloadId)
-        if (targetFile.exists() && targetFile.length() > 0L) return@withContext targetFile
+        if (targetFile.exists() && targetFile.length() > 0L) {
+            runCatching { targetFile.setLastModified(System.currentTimeMillis()) }
+            return@withContext targetFile
+        }
 
         thumbsDir.mkdirs()
         val tmpFile = File(thumbsDir, "thumb_${downloadId}.tmp")
@@ -218,13 +252,72 @@ class DownloadThumbnailCache internal constructor(
                 return@withContext null
             }
         }
-        targetFile.takeIf { it.exists() && it.length() > 0L }
+        targetFile.takeIf { it.exists() && it.length() > 0L }?.also {
+            evictIfNeeded(protectedDownloadId = downloadId)
+        }
     }
 
     fun deleteThumbnail(downloadId: Long) {
         runCatching { thumbnailFile(downloadId).delete() }
         runCatching { File(thumbsDir, "thumb_${downloadId}.tmp").delete() }
         runCatching { File(thumbsDir, "thumb_${downloadId}_remote.tmp").delete() }
+    }
+
+    /**
+     * Enforces LRU size and entry-count bounds on [thumbsDir] by deleting oldest cached thumbnails
+     * first while preserving [protectedDownloadId] when supplied.
+     */
+    @Synchronized
+    fun evictIfNeeded(protectedDownloadId: Long? = null): Int {
+        if (!thumbsDir.exists() || !thumbsDir.isDirectory) return 0
+        val protectedName = protectedDownloadId?.let { "thumb_$it.jpg" }
+        val files = thumbsDir.listFiles { file ->
+            file.isFile && file.name.startsWith("thumb_") && file.name.endsWith(".jpg")
+        }?.toMutableList() ?: return 0
+
+        if (files.isEmpty()) return 0
+        files.sortWith(compareBy<File>({ it.lastModified() }, { it.name }))
+
+        var totalBytes = files.sumOf { it.length().coerceAtLeast(0L) }
+        var count = files.size
+        var deleted = 0
+
+        for (candidate in files) {
+            if (count <= maxEntries && totalBytes <= maxCacheBytes) break
+            if (protectedName != null && candidate.name == protectedName) continue
+            val len = candidate.length().coerceAtLeast(0L)
+            if (runCatching { candidate.delete() }.getOrDefault(false)) {
+                totalBytes = (totalBytes - len).coerceAtLeast(0L)
+                count--
+                deleted++
+            }
+        }
+        return deleted
+    }
+
+    /**
+     * Deletes any cached thumbnails in [thumbsDir] whose download ID is not in [keepDownloadIds],
+     * along with leftover `.tmp` files.
+     */
+    @Synchronized
+    fun clearUnusedThumbnails(keepDownloadIds: Set<Long>): Int {
+        if (!thumbsDir.exists() || !thumbsDir.isDirectory) return 0
+        val children = thumbsDir.listFiles() ?: return 0
+        var deleted = 0
+        for (file in children) {
+            if (!file.isFile) continue
+            val match = THUMB_ID_REGEX.matchEntire(file.name)
+            val id = match?.groupValues?.getOrNull(1)?.toLongOrNull()
+            val shouldDelete = when {
+                file.name.endsWith(".tmp") -> true
+                id != null -> id !in keepDownloadIds
+                else -> false
+            }
+            if (shouldDelete && runCatching { file.delete() }.getOrDefault(false)) {
+                deleted++
+            }
+        }
+        return deleted
     }
 
     private fun writeAtomically(targetFile: File, bytes: ByteArray): File? {
@@ -248,6 +341,9 @@ class DownloadThumbnailCache internal constructor(
     companion object {
         private const val MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024 // 8 MB safety cap
         private const val MAX_FRAME_DIM_PX = 320
+        internal const val DEFAULT_MAX_CACHE_BYTES = 50L * 1024L * 1024L
+        internal const val DEFAULT_MAX_ENTRIES = 200
+        private val THUMB_ID_REGEX = Regex("""^thumb_(\d+)\.jpg$""")
 
         fun resolveExistingLocalFile(pathOrUrl: String?): File? {
             if (pathOrUrl.isNullOrBlank()) return null
