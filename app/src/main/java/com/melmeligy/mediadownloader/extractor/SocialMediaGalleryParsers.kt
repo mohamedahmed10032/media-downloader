@@ -1556,11 +1556,14 @@ internal object SocialMediaGalleryParsers {
 
     fun parseTikTokPhotoFromApiData(
         data: JSONObject,
-        postId: String?
+        postId: String?,
+        musicProbe: HeadInfo? = null,
+        headers: Map<String, String> = emptyMap()
     ): ParsedPost? {
         val images = data.optJSONArray("images") ?: return null
         if (images.length() == 0) return null
 
+        val resolvedPostId = postId ?: data.optString("id").takeIf { it.isNotBlank() }
         val slides = mutableListOf<GallerySlide>()
         for (i in 0 until images.length()) {
             val raw = images.optString(i).trim()
@@ -1572,18 +1575,33 @@ internal object SocialMediaGalleryParsers {
                 thumbnailUrl = raw,
                 type = MediaType.IMAGE,
                 container = inferImageExt(raw),
-                postId = postId ?: data.optString("id").takeIf { it.isNotBlank() }
+                headers = headers,
+                postId = resolvedPostId
             )
         }
         if (slides.isEmpty()) return null
 
         val title = data.optString("title").takeIf { it.isNotBlank() } ?: "TikTok Photo Slideshow"
         val cover = data.optString("cover").takeIf { it.startsWith("http") } ?: slides.first().thumbnailUrl
+        val musicUrl = data.optString("music").takeIf { it.startsWith("http") }
+        val musicDuration = data.optJSONObject("music_info")?.optLong("duration", 0L)?.takeIf { it > 0L }
+            ?: data.optLong("duration", 0L).takeIf { it > 0L }
+        val audioStreams = if (musicUrl != null) {
+            buildTikTokAudioStreamsFromUrl(
+                musicUrl = musicUrl,
+                musicDurationSec = musicDuration,
+                musicProbe = musicProbe,
+                baseHeaders = headers
+            )
+        } else {
+            emptyList()
+        }
         return ParsedPost(
             title = title,
             thumbnailUrl = cover,
-            postId = postId ?: data.optString("id").takeIf { it.isNotBlank() },
-            slides = slides
+            postId = resolvedPostId,
+            slides = slides,
+            audioStreams = audioStreams
         )
     }
 
@@ -1602,7 +1620,8 @@ internal object SocialMediaGalleryParsers {
         data: JSONObject,
         hdProbe: HeadInfo? = null,
         playProbe: HeadInfo? = null,
-        musicProbe: HeadInfo? = null
+        musicProbe: HeadInfo? = null,
+        baseHeaders: Map<String, String> = emptyMap()
     ): List<MediaStream> {
         val streams = mutableListOf<MediaStream>()
 
@@ -1659,7 +1678,7 @@ internal object SocialMediaGalleryParsers {
                 height = hdHeight,
                 sizeBytes = effectiveHdSize,
                 isHls = false,
-                headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+                headers = baseHeaders + durationHeader + mapOf("X-Internal-Quick" to "true")
             )
             streams += MediaStream(
                 id = "tt-sd",
@@ -1670,7 +1689,7 @@ internal object SocialMediaGalleryParsers {
                 height = 720,
                 sizeBytes = effectivePlaySize,
                 isHls = false,
-                headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+                headers = baseHeaders + durationHeader + mapOf("X-Internal-Quick" to "true")
             )
         } else {
             val chosenUrl = play ?: hdPlay
@@ -1698,93 +1717,328 @@ internal object SocialMediaGalleryParsers {
                     height = truthfulHeight,
                     sizeBytes = chosenSize,
                     isHls = false,
-                    headers = durationHeader + mapOf("X-Internal-Quick" to "true")
+                    headers = baseHeaders + durationHeader + mapOf("X-Internal-Quick" to "true")
                 )
             }
         }
 
         if (music != null) {
-            val musicBytes = musicProbe?.contentLength?.takeIf { it > 0L }
-            val ct = musicProbe?.contentType?.lowercase().orEmpty()
-            val ext = UrlUtils.fileExtension(musicProbe?.finalUrl ?: music)?.lowercase().orEmpty()
-            val isM4aSource = ct.contains("mp4") || ct.contains("aac") || ct.contains("m4a") || ext == "m4a" || ext == "aac"
-            val isMp3Source = !isM4aSource && (ct.contains("mpeg") || ct.contains("mp3") || ext == "mp3" || ct.isBlank())
-            val inferredKbps = com.melmeligy.mediadownloader.core.util.FormatUtils.inferAudioBitrateKbps(
-                sizeBytes = musicBytes,
-                durationSeconds = musicDurationSec
+            streams += buildTikTokAudioStreamsFromUrl(
+                musicUrl = music,
+                musicDurationSec = musicDurationSec,
+                musicProbe = musicProbe,
+                baseHeaders = baseHeaders
             )
-            val audioDurHeader = if (musicDurationSec != null) {
-                mapOf("X-Internal-Duration-Seconds" to musicDurationSec.toString())
-            } else {
-                emptyMap()
-            }
-            val srcBytesHeader = if (musicBytes != null) {
-                mapOf("X-Internal-Video-Bytes" to musicBytes.toString())
-            } else {
-                emptyMap()
-            }
+        }
 
-            if (isMp3Source) {
-                // Source is already a single original MP3 track — expose the single truthful original MP3
-                // instead of fabricating a duplicate M4A row with the exact same byte size.
-                val kbpsLabel = inferredKbps?.let { "Original MP3 (${it}K), best compatibility" }
-                    ?: "Original MP3 audio, best compatibility"
-                streams += MediaStream(
-                    id = "tt-audio-mp3",
-                    url = music,
-                    type = MediaType.AUDIO,
-                    container = "mp3",
-                    label = "Classic MP3",
-                    bitrateKbps = inferredKbps ?: 128,
-                    sizeBytes = musicBytes,
-                    isHls = false,
-                    headers = audioDurHeader + srcBytesHeader + mapOf(
-                        "X-Internal-Subtitle" to kbpsLabel,
-                        "X-Internal-Quick" to "true"
-                    )
+        return streams
+    }
+
+    internal fun buildTikTokAudioStreamsFromUrl(
+        musicUrl: String,
+        musicDurationSec: Long? = null,
+        musicProbe: HeadInfo? = null,
+        baseHeaders: Map<String, String> = emptyMap(),
+        idPrefix: String = "tt-audio"
+    ): List<MediaStream> {
+        val cleanMusicUrl = unescape(musicUrl).trim()
+        if (!cleanMusicUrl.startsWith("http")) return emptyList()
+
+        val musicBytes = musicProbe?.contentLength?.takeIf { it > 0L }
+        val ct = musicProbe?.contentType?.lowercase().orEmpty()
+        val ext = UrlUtils.fileExtension(musicProbe?.finalUrl ?: cleanMusicUrl)?.lowercase().orEmpty()
+        val queryMime = MediaSniffer.queryMimeType(cleanMusicUrl).orEmpty()
+        val isM4aSource = ct.contains("mp4") || ct.contains("aac") || ct.contains("m4a") ||
+            queryMime.contains("mp4") || ext == "m4a" || ext == "aac"
+        val isMp3Source = !isM4aSource &&
+            (ct.contains("mpeg") || ct.contains("mp3") || queryMime.contains("mpeg") || queryMime.contains("mp3") || ext == "mp3" ||
+                (ct.isBlank() && ext.isBlank() && !cleanMusicUrl.contains("mime_type=video_mp4", ignoreCase = true)))
+        val inferredKbps = com.melmeligy.mediadownloader.core.util.FormatUtils.inferAudioBitrateKbps(
+            sizeBytes = musicBytes,
+            durationSeconds = musicDurationSec
+        )
+        val audioDurHeader = if (musicDurationSec != null) {
+            mapOf("X-Internal-Duration-Seconds" to musicDurationSec.toString())
+        } else {
+            emptyMap()
+        }
+        val srcBytesHeader = if (musicBytes != null) {
+            mapOf("X-Internal-Video-Bytes" to musicBytes.toString())
+        } else {
+            emptyMap()
+        }
+        val rangeHeader = if (musicProbe?.acceptsRanges == true) {
+            mapOf("X-Internal-Accepts-Ranges" to "true")
+        } else {
+            emptyMap()
+        }
+
+        val out = mutableListOf<MediaStream>()
+        if (isMp3Source) {
+            val kbpsLabel = inferredKbps?.let { "Original MP3 (${it}K), best compatibility" }
+                ?: "Original MP3 audio, best compatibility"
+            out += MediaStream(
+                id = "$idPrefix-mp3",
+                url = cleanMusicUrl,
+                type = MediaType.AUDIO,
+                container = "mp3",
+                label = "Classic MP3",
+                bitrateKbps = inferredKbps ?: 128,
+                sizeBytes = musicBytes,
+                isHls = false,
+                headers = baseHeaders + audioDurHeader + srcBytesHeader + rangeHeader + mapOf(
+                    "X-Internal-Subtitle" to kbpsLabel,
+                    "X-Internal-Quick" to "true"
                 )
-            } else {
-                // Source is AAC/M4A — offer fast M4A remux (actual size) + genuine 160K Jump3r MP3 transcode
-                val srcKbps = inferredKbps ?: 128
-                val mp3TargetKbps = if (srcKbps == 160) 192 else 160
-                val estMp3Bytes = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
-                    targetBitrateKbps = mp3TargetKbps,
-                    durationSeconds = musicDurationSec,
-                    sourceSizeBytes = musicBytes,
-                    sourceBitrateKbps = srcKbps
+            )
+        } else {
+            val srcKbps = inferredKbps ?: 128
+            val mp3TargetKbps = if (srcKbps == 160) 192 else 160
+            val estMp3Bytes = com.melmeligy.mediadownloader.core.util.FormatUtils.estimateTranscodedAudioBytes(
+                targetBitrateKbps = mp3TargetKbps,
+                durationSeconds = musicDurationSec,
+                sourceSizeBytes = musicBytes,
+                sourceBitrateKbps = srcKbps
+            )
+            out += MediaStream(
+                id = "$idPrefix-fast",
+                url = cleanMusicUrl,
+                type = MediaType.AUDIO,
+                container = "m4a",
+                label = "Fast",
+                bitrateKbps = srcKbps,
+                sizeBytes = musicBytes,
+                isHls = false,
+                headers = baseHeaders + audioDurHeader + srcBytesHeader + rangeHeader + mapOf(
+                    "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
+                    "X-Internal-Quick" to "true"
                 )
-                streams += MediaStream(
-                    id = "tt-audio-fast",
-                    url = music,
-                    type = MediaType.AUDIO,
-                    container = "m4a",
-                    label = "Fast",
-                    bitrateKbps = srcKbps,
-                    sizeBytes = musicBytes,
-                    isHls = false,
-                    headers = audioDurHeader + srcBytesHeader + mapOf(
-                        "X-Internal-Subtitle" to "M4A (${srcKbps}K), best for mobile play",
-                        "X-Internal-Quick" to "true"
-                    )
+            )
+            out += MediaStream(
+                id = "$idPrefix-mp3",
+                url = cleanMusicUrl,
+                type = MediaType.AUDIO,
+                container = "mp3",
+                label = "Classic MP3",
+                bitrateKbps = mp3TargetKbps,
+                sizeBytes = estMp3Bytes,
+                isHls = false,
+                headers = baseHeaders + audioDurHeader + srcBytesHeader + rangeHeader + mapOf(
+                    "X-Internal-Subtitle" to "MP3 (${mp3TargetKbps}K), support Bluetooth speaker, mobile phone, car, watch etc.",
+                    "X-Internal-Quick" to "true"
                 )
-                streams += MediaStream(
-                    id = "tt-audio-mp3",
-                    url = music,
-                    type = MediaType.AUDIO,
-                    container = "mp3",
-                    label = "Classic MP3",
-                    bitrateKbps = mp3TargetKbps,
-                    sizeBytes = estMp3Bytes,
-                    isHls = false,
-                    headers = audioDurHeader + srcBytesHeader + mapOf(
-                        "X-Internal-Subtitle" to "MP3 (${mp3TargetKbps}K), support Bluetooth speaker, mobile phone, car, watch etc.",
-                        "X-Internal-Quick" to "true"
-                    )
+            )
+        }
+        return out
+    }
+
+    /** Extracts TikTok's `__DEFAULT_SCOPE__["webapp.video-detail"].itemInfo.itemStruct` object from HTML. */
+    fun extractTikTokHydrationItemStruct(html: String): JSONObject? {
+        if (html.isBlank()) return null
+        val markers = listOf("__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE")
+        for (marker in markers) {
+            val markerIdx = html.indexOf(marker)
+            if (markerIdx < 0) continue
+            val tagCloseIdx = html.indexOf('>', markerIdx)
+            val searchStart = if (tagCloseIdx >= 0) tagCloseIdx + 1 else markerIdx
+            val braceStart = html.indexOf('{', searchStart)
+            if (braceStart < 0) continue
+            val block = extractBalancedJson(html, braceStart) ?: continue
+            val root = runCatching { JSONObject(block) }.getOrNull() ?: continue
+            val scope = root.optJSONObject("__DEFAULT_SCOPE__")
+            val detail = scope?.optJSONObject("webapp.video-detail")
+                ?: scope?.optJSONObject("webapp.reflow.video.detail")
+            val itemStruct = detail?.optJSONObject("itemInfo")?.optJSONObject("itemStruct")
+            if (itemStruct != null) return itemStruct
+
+            // SIGI_STATE fallback structure
+            val itemModule = root.optJSONObject("ItemModule")
+            val firstKey = itemModule?.keys()?.asSequence()?.firstOrNull()
+            if (firstKey != null) {
+                itemModule.optJSONObject(firstKey)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun pickTikTokTitle(itemStruct: JSONObject?): String? {
+        val desc = itemStruct?.optString("desc")?.trim()?.takeIf { it.isNotBlank() }
+        if (desc != null) return desc
+        val author = itemStruct?.optJSONObject("author")?.optString("uniqueId")?.trim()?.takeIf { it.isNotBlank() }
+        return author?.let { "TikTok (@$it)" }
+    }
+
+    private fun isGenericTikTokHtmlTitle(title: String?): Boolean {
+        val t = title?.trim()?.lowercase().orEmpty()
+        return t.isBlank() || t == "tiktok" || t.startsWith("tiktok - make your day") || t.startsWith("tiktok ·")
+    }
+
+    /**
+     * Parses a TikTok Video post from `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON inside HTML,
+     * surfacing real `desc` title, `video.cover` thumbnail, multi-quality `bitrateInfo` streams
+     * (plus `playAddr` fallback), and `music.playUrl` audio with CDN auth [headers].
+     */
+    fun parseTikTokVideoFromHydrationHtml(
+        html: String,
+        headers: Map<String, String>
+    ): ParsedPost? {
+        if (html.isBlank()) return null
+        val itemStruct = extractTikTokHydrationItemStruct(html) ?: return null
+        // Photo mode posts belong to parseTikTokPhotoFromHydrationHtml
+        if (itemStruct.optJSONObject("imagePost")?.optJSONArray("images")?.let { it.length() > 0 } == true) {
+            return null
+        }
+
+        val postId = itemStruct.optString("id").trim().takeIf { it.isNotBlank() }
+        val title = pickTikTokTitle(itemStruct) ?: "TikTok Video"
+        val videoObj = itemStruct.optJSONObject("video") ?: return null
+
+        val cover = listOf("cover", "originCover", "dynamicCover")
+            .firstNotNullOfOrNull { key ->
+                videoObj.optString(key).trim().takeIf { it.startsWith("http") }?.let { unescape(it) }
+            }
+        val durationSec = videoObj.optLong("duration", 0L).takeIf { it > 0L }
+        val durHeader = if (durationSec != null) mapOf("X-Internal-Duration-Seconds" to durationSec.toString()) else emptyMap()
+
+        data class BitrateCandidate(
+            val heightKey: Int,
+            val width: Int?,
+            val height: Int?,
+            val url: String,
+            val sizeBytes: Long?,
+            val bitrate: Long,
+            val isH264: Boolean
+        )
+
+        val candidates = mutableListOf<BitrateCandidate>()
+        val bitrateInfo = videoObj.optJSONArray("bitrateInfo")
+        if (bitrateInfo != null) {
+            for (i in 0 until bitrateInfo.length()) {
+                val entry = bitrateInfo.optJSONObject(i) ?: continue
+                val playAddrObj = entry.optJSONObject("PlayAddr") ?: entry.optJSONObject("playAddr") ?: continue
+                val urlList = playAddrObj.optJSONArray("UrlList") ?: playAddrObj.optJSONArray("urlList")
+                var chosenUrl: String? = null
+                if (urlList != null) {
+                    for (uIdx in 0 until urlList.length()) {
+                        val u = unescape(urlList.optString(uIdx)).trim()
+                        if (!u.startsWith("http")) continue
+                        if (chosenUrl == null || u.contains("webapp-prime") || u.contains("tiktok.com/video/tos/")) {
+                            chosenUrl = u
+                            if (u.contains("webapp-prime")) break
+                        }
+                    }
+                }
+                val finalUrl = chosenUrl ?: continue
+                val w = playAddrObj.optInt("Width", 0).takeIf { it > 0 } ?: videoObj.optInt("width", 0).takeIf { it > 0 }
+                val h = playAddrObj.optInt("Height", 0).takeIf { it > 0 } ?: videoObj.optInt("height", 0).takeIf { it > 0 }
+                val shortSide = when {
+                    w != null && h != null -> minOf(w, h)
+                    h != null -> h
+                    else -> null
+                }
+                val dataSize = playAddrObj.optLong("DataSize", 0L).takeIf { it > 0L }
+                    ?: playAddrObj.optString("DataSize").toLongOrNull()?.takeIf { it > 0L }
+                val bitrate = entry.optLong("Bitrate", 0L)
+                val gear = entry.optString("GearName").lowercase()
+                val codecType = entry.optString("CodecType").lowercase()
+                val isH264 = !gear.contains("bytevc1") && !codecType.contains("h265") && !codecType.contains("hevc")
+                candidates += BitrateCandidate(
+                    heightKey = shortSide ?: 720,
+                    width = w,
+                    height = h,
+                    url = finalUrl,
+                    sizeBytes = dataSize,
+                    bitrate = bitrate,
+                    isH264 = isH264
                 )
             }
         }
 
-        return streams
+        // Collapse duplicate codecs for the same short-side resolution, preferring H.264 compatibility then highest bitrate
+        val bestByHeight = candidates
+            .groupBy { it.heightKey }
+            .entries
+            .sortedByDescending { it.key }
+            .mapNotNull { (_, group) ->
+                group.sortedWith(
+                    compareByDescending<BitrateCandidate> { it.isH264 }
+                        .thenByDescending { it.bitrate }
+                        .thenByDescending { it.sizeBytes ?: 0L }
+                ).firstOrNull()
+            }
+
+        val videoStreams = mutableListOf<MediaStream>()
+        if (bestByHeight.isNotEmpty()) {
+            bestByHeight.forEachIndexed { idx, c ->
+                val res = c.heightKey
+                val label = when {
+                    res >= 1080 -> "1080p FHD"
+                    res >= 720 -> "720p HD"
+                    else -> "${res}p"
+                }
+                videoStreams += MediaStream(
+                    id = "tt-page-v-$idx",
+                    url = c.url,
+                    type = MediaType.VIDEO,
+                    container = "mp4",
+                    label = label,
+                    width = c.width,
+                    height = res,
+                    sizeBytes = c.sizeBytes,
+                    isHls = false,
+                    headers = headers + durHeader + mapOf("X-Internal-Quick" to "true")
+                )
+            }
+        } else {
+            val fallbackPlay = videoObj.optString("playAddr").trim().takeIf { it.startsWith("http") }?.let { unescape(it) }
+                ?: videoObj.optString("downloadAddr").trim().takeIf { it.startsWith("http") }?.let { unescape(it) }
+            if (fallbackPlay != null) {
+                val w = videoObj.optInt("width", 0).takeIf { it > 0 }
+                val h = videoObj.optInt("height", 0).takeIf { it > 0 }
+                val shortSide = if (w != null && h != null) minOf(w, h) else h ?: 720
+                val label = when {
+                    shortSide >= 1080 -> "1080p FHD"
+                    shortSide >= 720 -> "720p HD"
+                    else -> "${shortSide}p"
+                }
+                videoStreams += MediaStream(
+                    id = "tt-page-v",
+                    url = fallbackPlay,
+                    type = MediaType.VIDEO,
+                    container = "mp4",
+                    label = label,
+                    width = w,
+                    height = shortSide,
+                    sizeBytes = videoObj.optLong("size", 0L).takeIf { it > 0L },
+                    isHls = false,
+                    headers = headers + durHeader + mapOf("X-Internal-Quick" to "true")
+                )
+            }
+        }
+
+        val musicObj = itemStruct.optJSONObject("music")
+        val musicUrl = musicObj?.optString("playUrl")?.trim()?.takeIf { it.startsWith("http") }?.let { unescape(it) }
+        val musicDuration = musicObj?.optLong("duration", 0L)?.takeIf { it > 0L } ?: durationSec
+        val audioStreams = if (musicUrl != null) {
+            buildTikTokAudioStreamsFromUrl(
+                musicUrl = musicUrl,
+                musicDurationSec = musicDuration,
+                baseHeaders = headers,
+                idPrefix = "tt-page-a"
+            )
+        } else {
+            emptyList()
+        }
+
+        if (videoStreams.isEmpty() && audioStreams.isEmpty()) return null
+
+        return ParsedPost(
+            title = title,
+            thumbnailUrl = cover,
+            postId = postId,
+            videoStreams = videoStreams,
+            audioStreams = audioStreams
+        )
     }
 
     fun parseTikTokPhotoFromHydrationHtml(
@@ -1793,13 +2047,21 @@ internal object SocialMediaGalleryParsers {
         headers: Map<String, String>
     ): ParsedPost? {
         if (html.isBlank()) return null
-        val idx = html.indexOf("\"imagePost\"")
-        if (idx < 0) return null
-        val braceStart = html.indexOf('{', idx)
-        if (braceStart < 0) return null
-        val block = extractBalancedJson(html, braceStart) ?: return null
-        val imagePost = runCatching { JSONObject(block) }.getOrNull() ?: return null
+
+        val itemStruct = extractTikTokHydrationItemStruct(html)
+        val imagePost = if (itemStruct != null) {
+            itemStruct.optJSONObject("imagePost") ?: return null
+        } else {
+            val idx = html.indexOf("\"imagePost\"")
+            if (idx < 0) return null
+            val braceStart = html.indexOf('{', idx)
+            if (braceStart < 0) return null
+            val block = extractBalancedJson(html, braceStart) ?: return null
+            runCatching { JSONObject(block) }.getOrNull() ?: return null
+        }
+
         val images = imagePost.optJSONArray("images") ?: return null
+        val resolvedPostId = postId ?: itemStruct?.optString("id")?.trim()?.takeIf { it.isNotBlank() }
 
         val slides = mutableListOf<GallerySlide>()
         for (i in 0 until images.length()) {
@@ -1826,19 +2088,43 @@ internal object SocialMediaGalleryParsers {
                     width = imgObj.optInt("imageWidth", 0).takeIf { it > 0 },
                     height = imgObj.optInt("imageHeight", 0).takeIf { it > 0 },
                     headers = headers,
-                    postId = postId
+                    postId = resolvedPostId
                 )
             }
         }
         if (slides.isEmpty()) return null
 
-        val title = Regex("<title>([^<]+)</title>").find(html)?.groupValues?.getOrNull(1)?.trim()
-            ?.ifBlank { "TikTok Photo Slideshow" } ?: "TikTok Photo Slideshow"
+        val structTitle = pickTikTokTitle(itemStruct)
+        val htmlTitle = Regex("<title>([^<]+)</title>").find(html)?.groupValues?.getOrNull(1)?.trim()
+            ?.takeUnless { isGenericTikTokHtmlTitle(it) }
+        val title = structTitle ?: htmlTitle ?: "TikTok Photo Slideshow"
+
+        val cover = imagePost.optJSONObject("cover")
+            ?.optJSONObject("imageURL")?.optJSONArray("urlList")?.optString(0)
+            ?.trim()?.takeIf { it.startsWith("http") }?.let { unescape(it) }
+            ?: slides.first().thumbnailUrl
+
+        val musicObj = itemStruct?.optJSONObject("music")
+        val musicUrl = musicObj?.optString("playUrl")?.trim()?.takeIf { it.startsWith("http") }?.let { unescape(it) }
+        val musicDuration = musicObj?.optLong("duration", 0L)?.takeIf { it > 0L }
+            ?: itemStruct?.optJSONObject("video")?.optLong("duration", 0L)?.takeIf { it > 0L }
+        val audioStreams = if (musicUrl != null) {
+            buildTikTokAudioStreamsFromUrl(
+                musicUrl = musicUrl,
+                musicDurationSec = musicDuration,
+                baseHeaders = headers,
+                idPrefix = "tt-photo-a"
+            )
+        } else {
+            emptyList()
+        }
+
         return ParsedPost(
             title = title,
-            thumbnailUrl = slides.first().thumbnailUrl,
-            postId = postId,
-            slides = slides
+            thumbnailUrl = cover,
+            postId = resolvedPostId,
+            slides = slides,
+            audioStreams = audioStreams
         )
     }
 

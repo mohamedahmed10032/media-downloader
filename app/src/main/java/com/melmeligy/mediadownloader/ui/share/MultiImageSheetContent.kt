@@ -33,6 +33,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material3.Button
@@ -40,6 +41,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -69,6 +71,7 @@ import coil.request.ImageRequest
 import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
+import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
 import com.melmeligy.mediadownloader.ui.theme.Indigo
@@ -162,9 +165,11 @@ internal fun downloadCtaLabel(selectedCount: Int): String =
 fun MultiImageBottomSheetContent(
     resolved: ResolvedMedia,
     contentPadding: PaddingValues = PaddingValues(0.dp),
-    onDownloadSelected: (List<GallerySlide>) -> Unit
+    onDownloadSelected: (List<GallerySlide>) -> Unit,
+    onDownloadAudio: ((MediaStream) -> Unit)? = null
 ) {
     val slides = remember(resolved) { extractGallerySlides(resolved) }
+    val audioStreams = remember(resolved) { resolved.streams.filter { it.type == MediaType.AUDIO } }
     var selectedIds by remember(slides) {
         mutableStateOf(slides.map { it.id }.toSet())
     }
@@ -257,16 +262,47 @@ fun MultiImageBottomSheetContent(
             }
         }
 
-        // 4. Sticky Bottom Direct Download CTA Button (No Ads)
+        // 4. Optional Accompanying Slideshow Audio Options + Sticky Bottom Direct Download CTA Button
         HorizontalDivider(
             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
         )
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 14.dp)
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            if (audioStreams.isNotEmpty() && onDownloadAudio != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    audioStreams.take(2).forEach { audio ->
+                        OutlinedButton(
+                            onClick = { onDownloadAudio(audio) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp),
+                            shape = RoundedCornerShape(21.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.MusicNote,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "${audio.label} (${audio.container.uppercase()})",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+            }
             Button(
                 onClick = {
                     val orderedSelected = slides.filter { it.id in selectedIds }

@@ -165,10 +165,37 @@ object MediaSniffer {
         }
     }
 
+    private val mimeTypeQueryRegex = Regex("[?&]mime_type=([^&#]+)", RegexOption.IGNORE_CASE)
+
+    /** Extracts a normalized MIME type from query hints such as `mime_type=video_mp4` or `mime_type=audio_mp4`. */
+    internal fun queryMimeType(rawUrl: String): String? {
+        val rawVal = mimeTypeQueryRegex.find(rawUrl)?.groupValues?.getOrNull(1)?.lowercase()
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
+        val decoded = rawVal.replace("%2f", "/")
+        return when {
+            decoded.contains('/') -> decoded
+            decoded.startsWith("video_") -> "video/" + decoded.removePrefix("video_")
+            decoded.startsWith("audio_") -> "audio/" + decoded.removePrefix("audio_")
+            decoded.startsWith("image_") -> "image/" + decoded.removePrefix("image_")
+            else -> decoded
+        }
+    }
+
+    private fun isTikTokVideoCdnUrl(lowerUrl: String): Boolean {
+        val hasTikTokCdnHost = lowerUrl.contains("tiktokcdn") ||
+            (lowerUrl.contains("webapp-prime") && lowerUrl.contains("tiktok.com"))
+        if (!hasTikTokCdnHost) return false
+        if (!lowerUrl.contains("/video/tos/")) return false
+        return !lowerUrl.contains("tplv-") && !lowerUrl.contains("-p-")
+    }
+
     /** Heuristic to detect whether a CDN MP4 URL is actually an audio-only DASH track. */
     fun isAudioTrackUrl(rawUrl: String, mimeType: String? = null): Boolean {
         val mime = mimeType?.lowercase().orEmpty()
         if (mime.startsWith("audio/")) return true
+        if (queryMimeType(rawUrl)?.startsWith("audio/") == true) return true
         val lower = rawUrl.lowercase()
         if (lower.contains(".m4a") || lower.contains(".mp3") || lower.contains(".aac") || lower.contains(".ogg") || lower.contains(".opus")) {
             return true
@@ -190,17 +217,21 @@ object MediaSniffer {
         }
 
         val mime = mimeType?.lowercase()?.substringBefore(';')?.trim()
+        val queryMime = queryMimeType(cleaned)
         val path = url.substringBefore('?').substringBefore('#').trimEnd('/')
-        val ext = path.substringAfterLast('.', "")
+        val cleanPath = path.substringAfter("://").substringAfter('/', "")
+        val fileName = cleanPath.substringAfterLast('/')
+        val ext = fileName.substringAfterLast('.', "")
 
         // Never treat HTML, JSON, JS, CSS, or static images as downloadable stream manifests/files
-        if (mime != null && (
+        if ((mime != null && (
                 mime.startsWith("text/html") ||
                     mime.startsWith("application/json") ||
                     mime.contains("javascript") ||
                     mime.startsWith("image/") ||
                     mime.startsWith("text/css")
-                )
+                )) ||
+            queryMime?.startsWith("image/") == true
         ) {
             if (ext != "m3u8" && ext != "mpd") return StreamType.UNKNOWN
         }
@@ -214,6 +245,9 @@ object MediaSniffer {
             ext in PROGRESSIVE_EXT -> StreamType.PROGRESSIVE
             mime != null && (mime.startsWith("video/") || mime.startsWith("audio/")) ->
                 StreamType.PROGRESSIVE
+            queryMime != null && (queryMime.startsWith("video/") || queryMime.startsWith("audio/")) ->
+                StreamType.PROGRESSIVE
+            isTikTokVideoCdnUrl(url) -> StreamType.PROGRESSIVE
             else -> StreamType.UNKNOWN
         }
     }
@@ -222,7 +256,9 @@ object MediaSniffer {
         if (url.isBlank()) return false
         val lower = url.lowercase()
         val path = lower.substringBefore('?').substringBefore('#').trimEnd('/')
-        val ext = path.substringAfterLast('.', "")
+        val cleanPath = path.substringAfter("://").substringAfter('/', "")
+        val fileName = cleanPath.substringAfterLast('/')
+        val ext = fileName.substringAfterLast('.', "")
         if (ext == "ts" || ext == "m4s") return true
         return SEGMENT_HINTS.any { lower.contains(it) }
     }
@@ -239,12 +275,16 @@ object MediaSniffer {
         StreamType.DASH -> "mp4"
         else -> {
             val path = url.substringBefore('?').substringBefore('#').trimEnd('/')
-            val ext = path.substringAfterLast('.', "").lowercase()
+            val cleanPath = path.substringAfter("://").substringAfter('/', "")
+            val fileName = cleanPath.substringAfterLast('/')
+            val ext = fileName.substringAfterLast('.', "").lowercase()
+            val effectiveMime = mimeType?.lowercase()?.takeIf { it.isNotBlank() } ?: queryMimeType(url)
             when {
+                effectiveMime?.contains("mpeg") == true || effectiveMime?.contains("mp3") == true -> "mp3"
                 isAudioTrackUrl(url, mimeType) && (ext == "mp4" || ext.isBlank()) -> "m4a"
                 ext in PROGRESSIVE_EXT -> ext
-                mimeType?.contains("webm") == true -> "webm"
-                mimeType?.startsWith("audio/") == true -> "m4a"
+                effectiveMime?.contains("webm") == true -> "webm"
+                effectiveMime?.startsWith("audio/") == true -> "m4a"
                 else -> "mp4"
             }
         }

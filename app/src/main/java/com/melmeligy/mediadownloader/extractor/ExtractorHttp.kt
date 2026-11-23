@@ -9,6 +9,7 @@ import com.melmeligy.mediadownloader.domain.extractor.ExtractorRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -111,6 +112,86 @@ class ExtractorHttp {
             val text = body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
             markIfHtml(url, ct ?: text.take(128))
             return text
+        }
+    }
+
+    data class HtmlFetchResult(
+        val html: String,
+        val cookieHeader: String?,
+        val finalUrl: String
+    )
+
+    /** Returns formatted `name=value; ...` cookies currently stored in [client]'s [okhttp3.CookieJar] for [url]. */
+    fun cookieHeaderFor(url: String): String? = runCatching {
+        val httpUrl = UrlUtils.encodeNonAsciiUrl(url.trim()).toHttpUrlOrNull() ?: return@runCatching null
+        val cookies = client.cookieJar.loadForRequest(httpUrl)
+        cookies.takeIf { it.isNotEmpty() }?.joinToString("; ") { "${it.name}=${it.value}" }
+    }.getOrNull()
+
+    /**
+     * Fetches [url] as HTML using [client] and returns the body alongside any session cookies
+     * (`Set-Cookie` across redirects + active [okhttp3.CookieJar] cookies).
+     */
+    suspend fun fetchHtmlWithCookies(
+        url: String,
+        headers: Map<String, String> = emptyMap()
+    ): HtmlFetchResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val safeUrl = UrlUtils.encodeNonAsciiUrl(url.trim())
+        val request = buildRequest(safeUrl, headers)
+            .header("X-Internal-Download", "true")
+            .get()
+            .build()
+        try {
+            client.newCall(request).execute().use { response ->
+                val ct = response.header("Content-Type")
+                markIfHtml(url, ct)
+                if (!response.isSuccessful) throw mapHttpError(response.code)
+                val text = response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+                markIfHtml(url, ct ?: text.take(128))
+
+                val cookieMap = LinkedHashMap<String, String>()
+                // Seed from CookieJar first
+                val finalHttpUrl = response.request.url
+                runCatching {
+                    client.cookieJar.loadForRequest(finalHttpUrl).forEach { c ->
+                        cookieMap[c.name] = c.value
+                    }
+                }
+                // Walk response + redirect chain Set-Cookie headers so even CookieJar.NO_COOKIES captures session tokens
+                val chain = ArrayList<okhttp3.Response>(4)
+                var cur: okhttp3.Response? = response
+                while (cur != null) {
+                    chain.add(cur)
+                    cur = cur.priorResponse
+                }
+                for (resp in chain.asReversed()) {
+                    val reqUrl = resp.request.url
+                    for (setCookie in resp.headers("Set-Cookie")) {
+                        val parsed = okhttp3.Cookie.parse(reqUrl, setCookie)
+                        if (parsed != null && parsed.value.isNotEmpty()) {
+                            cookieMap[parsed.name] = parsed.value
+                        }
+                    }
+                }
+                val cookieHeader = cookieMap.entries
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString("; ") { "${it.key}=${it.value}" }
+                HtmlFetchResult(
+                    html = text,
+                    cookieHeader = cookieHeader,
+                    finalUrl = finalHttpUrl.toString()
+                )
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: MediaException) {
+            throw e
+        } catch (e: UnknownHostException) {
+            currentCoroutineContext().ensureActive()
+            throw MediaException(AppError.NO_INTERNET, e.message, e)
+        } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
+            throw MediaException(AppError.GENERIC, e.message, e)
         }
     }
 

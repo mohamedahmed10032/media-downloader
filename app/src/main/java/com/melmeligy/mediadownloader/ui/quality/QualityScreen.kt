@@ -260,7 +260,8 @@ fun ChooseFormatStateContent(
                 MultiImageBottomSheetContent(
                     resolved = resolved,
                     contentPadding = contentPadding,
-                    onDownloadSelected = onDownloadBatch
+                    onDownloadSelected = onDownloadBatch,
+                    onDownloadAudio = onDownload
                 )
             } else {
                 SnaptubeFormatSheetContent(

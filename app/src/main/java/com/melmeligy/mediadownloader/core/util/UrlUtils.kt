@@ -19,14 +19,17 @@ object UrlUtils {
     private val trackingQueryParams = setOf(
         "igsh", "igshid", "evlk", "utm_source", "utm_medium", "utm_campaign", "utm_term",
         "utm_content", "fbclid", "invite_code", "sender", "sfo", "epik", "share_id",
-        "mt", "nic_v3"
+        "mt", "nic_v3",
+        // TikTok share tracking parameters (never CDN signature params)
+        "_t", "_r", "is_from_webapp", "sender_device", "tt_from", "share_app_id", "share_link_id"
     )
     private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z0-9-]+\\.)?pinterest\\.[a-z.]+/pin/(?:[^/?#]*--)?(\\d+)", RegexOption.IGNORE_CASE)
     private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
-    private val tiktokIdPattern = Regex("tiktok\\.com/(?:@[^/]+/)?(?:video|photo)/(\\d+)", RegexOption.IGNORE_CASE)
+    private val tiktokIdPattern = Regex("tiktok\\.com/(?:(?:@[^/]+/)?(?:video|photo)|v)/(\\d+)", RegexOption.IGNORE_CASE)
+    private val tiktokMobileLegacyVPath = Regex("^/v/(\\d+)(?:\\.html)?/?$", RegexOption.IGNORE_CASE)
     private val redditPostPattern = Regex("(?:reddit\\.com/r/[^/]+/comments|redd\\.it)/([A-Za-z0-9]+)", RegexOption.IGNORE_CASE)
     private val threadsPostPattern = Regex("threads\\.(?:net|com)/(?:@[^/]+/)?post/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
 
@@ -96,15 +99,30 @@ object UrlUtils {
         }
         return runCatching {
             val uri = URI(withoutFrag)
-            val query = uri.rawQuery ?: return@runCatching trimmed
-            val cleanedQuery = query.split('&').filterNot { param ->
+            val hostLower = uri.host?.lowercase().orEmpty()
+            val rawPath = uri.rawPath.orEmpty()
+            val portPart = if (uri.port != -1) ":${uri.port}" else ""
+            val legacyMobileV = if (hostLower == "m.tiktok.com") {
+                tiktokMobileLegacyVPath.matchEntire(rawPath)
+            } else null
+
+            val effectiveHost = when {
+                hostLower == "m.tiktok.com" && (legacyMobileV != null || rawPath.startsWith("/@")) ->
+                    "www.tiktok.com"
+                else -> uri.rawAuthority ?: "${uri.host}$portPart"
+            }
+            val effectivePath = when {
+                legacyMobileV != null -> "/@i/video/${legacyMobileV.groupValues[1]}"
+                else -> rawPath
+            }
+
+            val query = uri.rawQuery
+            val cleanedQuery = query?.split('&')?.filterNot { param ->
                 val key = param.substringBefore('=').lowercase()
                 key in trackingQueryParams
-            }.joinToString("&")
+            }?.joinToString("&").orEmpty()
             val newQuery = if (cleanedQuery.isBlank()) "" else "?$cleanedQuery"
-            val portPart = if (uri.port != -1) ":${uri.port}" else ""
-            val hostPart = uri.rawAuthority ?: "${uri.host}$portPart"
-            "${uri.scheme}://$hostPart${uri.rawPath}$newQuery$frag"
+            "${uri.scheme}://$effectiveHost$effectivePath$newQuery$frag"
         }.getOrDefault(trimmed)
     }
 
