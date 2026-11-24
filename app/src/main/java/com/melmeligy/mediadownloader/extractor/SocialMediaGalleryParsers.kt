@@ -272,21 +272,72 @@ internal object SocialMediaGalleryParsers {
     ): ParsedPost? {
         if (html.isBlank()) return null
 
-        // Try embedded gql_data / contextJSON inside embed page scripts first
-        val gqlMatch = Regex("\"gql_data\"\\s*:\\s*(\\{[\\s\\S]*?\\})\\s*,\\s*\"(?:is_|has_|can_)").find(html)
-            ?: Regex("window\\.__additionalDataLoaded\\s*\\([^,]+,\\s*(\\{[\\s\\S]*?\\})\\s*\\);").find(html)
-        if (gqlMatch != null) {
-            parseInstagramGraphQl(gqlMatch.groupValues[1], shortcode, headers)?.let { return it }
+        // 1. Exact brace-balanced extraction for "gql_data":{...} and window.__additionalDataLoaded(...,{...})
+        val balancedMarkers = listOf("\"gql_data\"", "window.__additionalDataLoaded", "\"shortcode_media\"")
+        for (marker in balancedMarkers) {
+            var searchPos = 0
+            while (searchPos < html.length) {
+                val idx = html.indexOf(marker, searchPos)
+                if (idx < 0) break
+                val braceStart = html.indexOf('{', idx + marker.length)
+                if (braceStart >= 0 && braceStart - idx < 80) {
+                    extractBalancedJson(html, braceStart)?.let { block ->
+                        val candidateJson = if (marker == "\"shortcode_media\"") {
+                            "{\"shortcode_media\":$block}"
+                        } else {
+                            block
+                        }
+                        parseInstagramGraphQl(candidateJson, shortcode, headers)?.let { return it }
+                    }
+                }
+                searchPos = idx + marker.length
+            }
         }
 
-        // Look for escaped contextJSON="{\"context\":...}"
-        val contextJsonMatch = Regex("\\\\\"gql_data\\\\\":(\\{.*?\\})\\\\\",\\\\\"").find(html)
-        if (contextJsonMatch != null) {
-            val unescaped = unescapeJsonString(contextJsonMatch.groupValues[1])
-            parseInstagramGraphQl(unescaped, shortcode, headers)?.let { return it }
+        // 2. Decode double-escaped "contextJSON":"{\"context\":...,\"gql_data\":{...}}" string literals
+        val ctxIdx = html.indexOf("\"contextJSON\"")
+        if (ctxIdx >= 0) {
+            val colonIdx = html.indexOf(':', ctxIdx + "\"contextJSON\"".length)
+            if (colonIdx >= 0) {
+                var valueStart = colonIdx + 1
+                while (valueStart < html.length && html[valueStart].isWhitespace()) valueStart++
+                if (valueStart < html.length && html[valueStart] == '"') {
+                    val decoded = runCatching {
+                        org.json.JSONTokener(html.substring(valueStart)).nextValue() as? String
+                    }.getOrNull()
+                    if (!decoded.isNullOrBlank() && decoded.startsWith("{")) {
+                        parseInstagramGraphQl(decoded, shortcode, headers)?.let { return it }
+                        val innerGqlIdx = decoded.indexOf("\"gql_data\"")
+                        if (innerGqlIdx >= 0) {
+                            val b = decoded.indexOf('{', innerGqlIdx + "\"gql_data\"".length)
+                            if (b >= 0) {
+                                extractBalancedJson(decoded, b)?.let { gqlBlock ->
+                                    parseInstagramGraphQl(gqlBlock, shortcode, headers)?.let { return it }
+                                }
+                            }
+                        }
+                    }
+                } else if (valueStart < html.length && html[valueStart] == '{') {
+                    extractBalancedJson(html, valueStart)?.let { ctxObj ->
+                        parseInstagramGraphQl(ctxObj, shortcode, headers)?.let { return it }
+                    }
+                }
+            }
         }
 
-        // Direct sidecar JSON regex extraction when full outer object isn't cleanly bounded
+        // 3. Escaped \"gql_data\":{...} inside inline JS string literals
+        val escGqlIdx = html.indexOf("\\\"gql_data\\\"")
+        if (escGqlIdx >= 0) {
+            val braceStart = html.indexOf('{', escGqlIdx)
+            if (braceStart >= 0) {
+                extractBalancedJson(html, braceStart)?.let { rawBlock ->
+                    val unescaped = unescapeJsonString(rawBlock)
+                    parseInstagramGraphQl(unescaped, shortcode, headers)?.let { return it }
+                }
+            }
+        }
+
+        // 4. Direct sidecar JSON extraction when full outer object isn't cleanly bounded
         val sidecarIdx = html.indexOf("edge_sidecar_to_children")
         if (sidecarIdx >= 0) {
             val braceStart = html.indexOf('{', sidecarIdx)
@@ -300,7 +351,14 @@ internal object SocialMediaGalleryParsers {
 
         val doc = Jsoup.parse(html)
         val hasVideoTag = doc.select("video[src], video source[src]").isNotEmpty()
-        if (hasVideoTag) return null // Let video pipeline handle embed videos
+        val lowerHtml = html.lowercase()
+        val looksLikeVideoEmbed = hasVideoTag ||
+            lowerHtml.contains("\"is_video\":true") ||
+            lowerHtml.contains("\\\"is_video\\\":true") ||
+            lowerHtml.contains("\"video_url\"") ||
+            lowerHtml.contains("embeddedmediavideo") ||
+            lowerHtml.contains("videooverlay")
+        if (looksLikeVideoEmbed) return null // Let video pipeline / fallback extract the video stream
 
         val username = doc.select(".CaptionUsername").text().takeIf { it.isNotBlank() }
         val imgUrl = doc.select("img.EmbeddedMediaImage").attr("src")
@@ -1848,6 +1906,7 @@ internal object SocialMediaGalleryParsers {
             val scope = root.optJSONObject("__DEFAULT_SCOPE__")
             val detail = scope?.optJSONObject("webapp.video-detail")
                 ?: scope?.optJSONObject("webapp.reflow.video.detail")
+                ?: scope?.optJSONObject("webapp.photo-detail")
             val itemStruct = detail?.optJSONObject("itemInfo")?.optJSONObject("itemStruct")
             if (itemStruct != null) return itemStruct
 

@@ -6,31 +6,41 @@ import com.melmeligy.mediadownloader.domain.extractor.MediaExtractor
 import com.melmeligy.mediadownloader.domain.model.MediaStream
 import com.melmeligy.mediadownloader.domain.model.MediaType
 import com.melmeligy.mediadownloader.domain.model.ResolvedMedia
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
  * Dedicated YouTube & YouTube Shorts extractor modeled after Snaptube's InnerTube multi-client
- * extraction architecture (`ANDROID_VR`, `IOS`, `ANDROID_TESTSUITE`).
+ * extraction architecture (`VISIONOS`, `ANDROID_VR`, `IOS`, `ANDROID_TESTSUITE`).
  *
- * Queries `https://www.youtube.com/youtubei/v1/player` directly using pre-signed mobile/VR client
- * profiles so all progressive (`formats`) and adaptive (`adaptiveFormats`) streams are returned
- * with direct `googlevideo.com` URLs and exact `contentLength` byte sizes — without falling back
- * to generic web-page HTML scraping.
- *
- * Adaptive video-only resolutions (`144p`, `240p`, `480p`, `1080p`, `2K`, `4K`) are automatically
- * paired with the companion `M4A` audio stream via `X-Internal-Companion-Audio` and losslessly
- * muxed on-device by [com.melmeligy.mediadownloader.download.VideoAudioMuxer].
+ * Queries `https://www.youtube.com/youtubei/v1/player` using parallel first-valid-wins client
+ * waves (remembering the last working client for instant repeat shares) so all progressive and
+ * adaptive streams are returned with direct `googlevideo.com` URLs and exact `contentLength` byte
+ * sizes — without falling back to generic web-page HTML scraping.
  */
 @Singleton
 class YouTubeExtractor @Inject constructor(
     private val http: ExtractorHttp,
     private val hlsExtractor: HlsExtractor,
-    private val dispatchers: DispatcherProvider
+    private val dispatchers: DispatcherProvider,
+    private val progressTracker: ExtractionProgressTracker
 ) : MediaExtractor {
+
+    constructor(
+        http: ExtractorHttp,
+        hlsExtractor: HlsExtractor,
+        dispatchers: DispatcherProvider
+    ) : this(http, hlsExtractor, dispatchers, ExtractionProgressTracker())
 
     override val name = "YouTube"
     override val priority = 100
@@ -50,53 +60,99 @@ class YouTubeExtractor @Inject constructor(
 
     override suspend fun extract(url: String): ResolvedMedia? = withContext(dispatchers.io) {
         val videoId = extractVideoId(url) ?: return@withContext null
+        progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
 
-        // Primary VISIONOS clients (exempt from YouTube's 1 MB GVS PoToken cold-start cap)
-        // followed by mobile/VR fallbacks.
-        val clients = listOf(
+        val preferred = lastWorkingClient
+        val tier1 = listOfNotNull(
+            preferred,
             InnerTubeClient.VISIONOS,
-            InnerTubeClient.VISIONOS_1_04,
-            InnerTubeClient.VISIONOS_SAFARI,
-            InnerTubeClient.ANDROID_VR_LEGACY,
+            InnerTubeClient.ANDROID_VR_LEGACY
+        ).distinct().take(2)
+        val tier2 = listOf(
             InnerTubeClient.IOS,
+            InnerTubeClient.VISIONOS_1_04,
             InnerTubeClient.ANDROID_VR_UPGRADED,
-            InnerTubeClient.ANDROID_TESTSUITE
-        )
+            InnerTubeClient.ANDROID_TESTSUITE,
+            InnerTubeClient.VISIONOS_SAFARI
+        ).filterNot { it in tier1 }
 
-        var visitorData: String? = cachedVisitorData
-        for (client in clients) {
-            var resolved = runCatching {
-                fetchFromInnerTube(url, videoId, client, visitorData) { newVisitor ->
-                    if (!newVisitor.isNullOrBlank()) {
-                        visitorData = newVisitor
-                        cachedVisitorData = newVisitor
-                    }
-                }
-            }.getOrNull()
+        val lastPlayabilityReason = AtomicReference<String?>(null)
 
-            // VISIONOS requires visitorData on the request; if the first call had no visitorData
-            // and received one in responseContext.visitorData, immediately retry the same client.
-            if (resolved == null && !visitorData.isNullOrBlank() && client.name.startsWith("VISIONOS")) {
-                resolved = runCatching {
-                    fetchFromInnerTube(url, videoId, client, visitorData) { newVisitor ->
-                        if (!newVisitor.isNullOrBlank()) {
-                            visitorData = newVisitor
-                            cachedVisitorData = newVisitor
+        raceInnerTubeWave(url, videoId, tier1, lastPlayabilityReason)?.let { return@withContext it }
+        raceInnerTubeWave(url, videoId, tier2, lastPlayabilityReason)?.let { return@withContext it }
+
+        // Fallback to Piped public API instances raced in parallel if all InnerTube clients are blocked
+        extractViaPipedFallback(url, videoId)?.let { return@withContext it }
+
+        val reason = lastPlayabilityReason.get()
+        if (!reason.isNullOrBlank()) {
+            progressTracker.setDiagnosticReason("YouTube video unavailable: $reason")
+        }
+        null
+    }
+
+    private suspend fun raceInnerTubeWave(
+        sourceUrl: String,
+        videoId: String,
+        clients: List<InnerTubeClient>,
+        lastPlayabilityReason: AtomicReference<String?>
+    ): ResolvedMedia? = coroutineScope {
+        if (clients.isEmpty()) return@coroutineScope null
+        val ch = Channel<Pair<InnerTubeClient, ResolvedMedia?>?>(capacity = clients.size)
+        val jobs = clients.map { client ->
+            launch(dispatchers.io) {
+                val res = try {
+                    withTimeoutOrNull(INNERTUBE_CLIENT_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = INNERTUBE_CLIENT_TIMEOUT_MS) {
+                            var visitorData: String? = cachedVisitorData
+                            var resolved = fetchFromInnerTube(sourceUrl, videoId, client, visitorData, lastPlayabilityReason) { newVisitor ->
+                                if (!newVisitor.isNullOrBlank()) {
+                                    visitorData = newVisitor
+                                    cachedVisitorData = newVisitor
+                                }
+                            }
+                            if (resolved == null && !visitorData.isNullOrBlank() && client.name.startsWith("VISIONOS")) {
+                                resolved = fetchFromInnerTube(sourceUrl, videoId, client, visitorData, lastPlayabilityReason) { newVisitor ->
+                                    if (!newVisitor.isNullOrBlank()) {
+                                        visitorData = newVisitor
+                                        cachedVisitorData = newVisitor
+                                    }
+                                }
+                            }
+                            if (resolved != null &&
+                                resolved.streams.isNotEmpty() &&
+                                resolved.streams.any { it.type == MediaType.AUDIO }
+                            ) {
+                                resolved
+                            } else {
+                                null
+                            }
                         }
                     }
-                }.getOrNull()
-            }
-
-            if (resolved != null &&
-                resolved.streams.isNotEmpty() &&
-                resolved.streams.any { it.type == MediaType.AUDIO }
-            ) {
-                return@withContext resolved
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                ch.trySend(client to res)
             }
         }
-
-        // Fallback to Piped public API instances if all InnerTube clients are blocked on network
-        extractViaPipedFallback(url, videoId)
+        var winner: ResolvedMedia? = null
+        try {
+            for (i in jobs.indices) {
+                val pair = ch.receiveCatching().getOrNull() ?: break
+                val (winClient, media) = pair
+                if (media != null) {
+                    lastWorkingClient = winClient
+                    winner = media
+                    break
+                }
+            }
+        } finally {
+            jobs.forEach { it.cancel() }
+            ch.close()
+        }
+        winner
     }
 
     private suspend fun fetchFromInnerTube(
@@ -104,6 +160,7 @@ class YouTubeExtractor @Inject constructor(
         videoId: String,
         client: InnerTubeClient,
         visitorData: String?,
+        lastPlayabilityReason: AtomicReference<String?>,
         onVisitorData: (String?) -> Unit
     ): ResolvedMedia? {
         val payload = JSONObject().apply {
@@ -144,18 +201,25 @@ class YouTubeExtractor @Inject constructor(
             requestHeaders["X-Goog-Visitor-Id"] = visitorData
         }
 
-        val responseStr = http.postJson(
-            url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-            jsonBody = payload.toString(),
-            headers = requestHeaders
-        )
+        val responseStr = runInterruptible(dispatchers.io) {
+            http.postJson(
+                url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                jsonBody = payload.toString(),
+                headers = requestHeaders
+            )
+        }
 
         val root = JSONObject(responseStr)
         val extractedVisitor = root.optJSONObject("responseContext")?.optString("visitorData")
         onVisitorData(extractedVisitor)
 
-        val playability = root.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
+        val playabilityObj = root.optJSONObject("playabilityStatus")
+        val playability = playabilityObj?.optString("status").orEmpty()
         if (!playability.equals("OK", ignoreCase = true) && !root.has("streamingData")) {
+            val reason = playabilityObj?.optString("reason")?.trim()?.takeIf { it.isNotBlank() }
+            if (reason != null) {
+                lastPlayabilityReason.compareAndSet(null, reason)
+            }
             return null
         }
 
@@ -532,101 +596,132 @@ class YouTubeExtractor @Inject constructor(
         )
     }
 
-    private suspend fun extractViaPipedFallback(sourceUrl: String, videoId: String): ResolvedMedia? {
+    private suspend fun extractViaPipedFallback(sourceUrl: String, videoId: String): ResolvedMedia? = coroutineScope {
         val pipedInstances = listOf(
             "https://pipedapi.kavin.rocks",
             "https://pipedapi.tokhmi.xyz",
             "https://pipedapi.moomoo.me"
         )
-        for (base in pipedInstances) {
-            val jsonStr = runCatching { http.fetchString("$base/streams/$videoId") }.getOrNull() ?: continue
-            val root = runCatching { JSONObject(jsonStr) }.getOrNull() ?: continue
-            val title = root.optString("title").takeIf { it.isNotBlank() } ?: "YouTube Video"
-            val duration = root.optLong("duration", 0L)
-            val thumb = root.optString("thumbnailUrl").takeIf { it.startsWith("http") }
-                ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
-
-            val formats = mutableListOf<YtFormat>()
-            val audioArr = root.optJSONArray("audioStreams") ?: JSONArray()
-            for (i in 0 until audioArr.length()) {
-                val a = audioArr.optJSONObject(i) ?: continue
-                val u = a.optString("url").takeIf { it.startsWith("http") } ?: continue
-                val mime = a.optString("mimeType").lowercase()
-                val codec = a.optString("codec").lowercase()
-                val br = a.optLong("bitrate", 128_000L)
-                val clen = a.optLong("contentLength", 0L).takeIf { it > 0 }
-                    ?: if (duration > 0) (br * duration) / 8L else 0L
-                val isOpus = codec.contains("opus") || mime.contains("opus")
-                val isWebm = mime.contains("webm") || isOpus
-                val isMp4 = mime.contains("mp4") || mime.contains("m4a")
-                formats += YtFormat(
-                    itag = a.optInt("itag", 140),
-                    url = u,
-                    mimeType = mime,
-                    isAudio = true,
-                    isAdaptive = true,
-                    isMp4 = isMp4,
-                    isWebm = isWebm,
-                    isAvc1 = false,
-                    isVp9 = false,
-                    isAv01 = false,
-                    isMp4a = isMp4 || codec.contains("mp4a"),
-                    isOpus = isOpus,
-                    width = null,
-                    height = null,
-                    bitrate = br,
-                    contentLength = clen
-                )
+        val ch = Channel<ResolvedMedia?>(capacity = pipedInstances.size)
+        val jobs = pipedInstances.map { base ->
+            launch(dispatchers.io) {
+                val resolved = try {
+                    withTimeoutOrNull(PIPED_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = PIPED_TIMEOUT_MS) {
+                            val jsonStr = runCatching { http.fetchString("$base/streams/$videoId") }.getOrNull()
+                                ?: return@withCancellableHttpCalls null
+                            parsePipedResponse(sourceUrl, videoId, jsonStr)
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                ch.trySend(resolved)
             }
-
-            val videoArr = root.optJSONArray("videoStreams") ?: JSONArray()
-            for (i in 0 until videoArr.length()) {
-                val v = videoArr.optJSONObject(i) ?: continue
-                val u = v.optString("url").takeIf { it.startsWith("http") } ?: continue
-                val mime = v.optString("mimeType").lowercase()
-                val codec = v.optString("codec").lowercase()
-                val h = v.optInt("height", 0).takeIf { it > 0 } ?: continue
-                val w = v.optInt("width", 0).takeIf { it > 0 }
-                val br = v.optLong("bitrate", 500_000L)
-                val videoOnly = v.optBoolean("videoOnly", true)
-                val clen = v.optLong("contentLength", 0L).takeIf { it > 0 }
-                    ?: if (duration > 0) (br * duration) / 8L else 0L
-                val isAv01 = codec.contains("av01") || codec.contains("av1") || mime.contains("av01")
-                val isVp9 = codec.contains("vp9") || codec.contains("vp09") || mime.contains("vp9") || mime.contains("vp09")
-                val isWebm = mime.contains("webm") || isVp9
-                val isMp4 = mime.contains("mp4")
-                val isAvc1 = !isAv01 && !isVp9 && (codec.contains("avc1") || mime.contains("avc1") || (isMp4 && codec.isEmpty()))
-                formats += YtFormat(
-                    itag = v.optInt("itag", 0),
-                    url = u,
-                    mimeType = mime,
-                    isAudio = false,
-                    isAdaptive = videoOnly,
-                    isMp4 = isMp4,
-                    isWebm = isWebm,
-                    isAvc1 = isAvc1,
-                    isVp9 = isVp9,
-                    isAv01 = isAv01,
-                    isMp4a = false,
-                    isOpus = false,
-                    width = w,
-                    height = h,
-                    bitrate = br,
-                    contentLength = clen
-                )
-            }
-
-            val resolved = buildSnaptubeResolvedMedia(
-                sourceUrl = sourceUrl,
-                title = title,
-                thumbnail = thumb,
-                durationSec = duration,
-                formats = formats,
-                baseHeaders = emptyMap()
-            )
-            if (resolved != null) return resolved
         }
-        return null
+        var winner: ResolvedMedia? = null
+        try {
+            for (i in jobs.indices) {
+                val candidate = ch.receiveCatching().getOrNull() ?: continue
+                if (candidate.streams.isNotEmpty()) {
+                    winner = candidate
+                    break
+                }
+            }
+        } finally {
+            jobs.forEach { it.cancel() }
+            ch.close()
+        }
+        winner
+    }
+
+    private fun parsePipedResponse(sourceUrl: String, videoId: String, jsonStr: String): ResolvedMedia? {
+        val root = runCatching { JSONObject(jsonStr) }.getOrNull() ?: return null
+        val title = root.optString("title").takeIf { it.isNotBlank() } ?: "YouTube Video"
+        val duration = root.optLong("duration", 0L)
+        val thumb = root.optString("thumbnailUrl").takeIf { it.startsWith("http") }
+            ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+        val formats = mutableListOf<YtFormat>()
+        val audioArr = root.optJSONArray("audioStreams") ?: JSONArray()
+        for (i in 0 until audioArr.length()) {
+            val a = audioArr.optJSONObject(i) ?: continue
+            val u = a.optString("url").takeIf { it.startsWith("http") } ?: continue
+            val mime = a.optString("mimeType").lowercase()
+            val codec = a.optString("codec").lowercase()
+            val br = a.optLong("bitrate", 128_000L)
+            val clen = a.optLong("contentLength", 0L).takeIf { it > 0 }
+                ?: if (duration > 0) (br * duration) / 8L else 0L
+            val isOpus = codec.contains("opus") || mime.contains("opus")
+            val isWebm = mime.contains("webm") || isOpus
+            val isMp4 = mime.contains("mp4") || mime.contains("m4a")
+            formats += YtFormat(
+                itag = a.optInt("itag", 140),
+                url = u,
+                mimeType = mime,
+                isAudio = true,
+                isAdaptive = true,
+                isMp4 = isMp4,
+                isWebm = isWebm,
+                isAvc1 = false,
+                isVp9 = false,
+                isAv01 = false,
+                isMp4a = isMp4 || codec.contains("mp4a"),
+                isOpus = isOpus,
+                width = null,
+                height = null,
+                bitrate = br,
+                contentLength = clen
+            )
+        }
+
+        val videoArr = root.optJSONArray("videoStreams") ?: JSONArray()
+        for (i in 0 until videoArr.length()) {
+            val v = videoArr.optJSONObject(i) ?: continue
+            val u = v.optString("url").takeIf { it.startsWith("http") } ?: continue
+            val mime = v.optString("mimeType").lowercase()
+            val codec = v.optString("codec").lowercase()
+            val h = v.optInt("height", 0).takeIf { it > 0 } ?: continue
+            val w = v.optInt("width", 0).takeIf { it > 0 }
+            val br = v.optLong("bitrate", 500_000L)
+            val videoOnly = v.optBoolean("videoOnly", true)
+            val clen = v.optLong("contentLength", 0L).takeIf { it > 0 }
+                ?: if (duration > 0) (br * duration) / 8L else 0L
+            val isAv01 = codec.contains("av01") || codec.contains("av1") || mime.contains("av01")
+            val isVp9 = codec.contains("vp9") || codec.contains("vp09") || mime.contains("vp9") || mime.contains("vp09")
+            val isWebm = mime.contains("webm") || isVp9
+            val isMp4 = mime.contains("mp4")
+            val isAvc1 = !isAv01 && !isVp9 && (codec.contains("avc1") || mime.contains("avc1") || (isMp4 && codec.isEmpty()))
+            formats += YtFormat(
+                itag = v.optInt("itag", 0),
+                url = u,
+                mimeType = mime,
+                isAudio = false,
+                isAdaptive = videoOnly,
+                isMp4 = isMp4,
+                isWebm = isWebm,
+                isAvc1 = isAvc1,
+                isVp9 = isVp9,
+                isAv01 = isAv01,
+                isMp4a = false,
+                isOpus = false,
+                width = w,
+                height = h,
+                bitrate = br,
+                contentLength = clen
+            )
+        }
+
+        return buildSnaptubeResolvedMedia(
+            sourceUrl = sourceUrl,
+            title = title,
+            thumbnail = thumb,
+            durationSec = duration,
+            formats = formats,
+            baseHeaders = emptyMap()
+        )
     }
 
     private fun normalizeHeight(h: Int): Int = when {
@@ -670,6 +765,14 @@ class YouTubeExtractor @Inject constructor(
 
     @Volatile
     private var cachedVisitorData: String? = null
+
+    @Volatile
+    private var lastWorkingClient: InnerTubeClient? = null
+
+    companion object {
+        private const val INNERTUBE_CLIENT_TIMEOUT_MS = 3_500L
+        private const val PIPED_TIMEOUT_MS = 3_000L
+    }
 
     private data class YtFormat(
         val itag: Int,

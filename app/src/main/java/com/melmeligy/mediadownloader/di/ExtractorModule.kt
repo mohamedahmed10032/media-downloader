@@ -7,6 +7,7 @@ import com.melmeligy.mediadownloader.extractor.HlsExtractor
 import com.melmeligy.mediadownloader.extractor.InterceptedMediaExtractor
 import com.melmeligy.mediadownloader.extractor.HtmlMediaExtractor
 import com.melmeligy.mediadownloader.extractor.ImageExtractor
+import com.melmeligy.mediadownloader.extractor.MediaPlatformExtractor
 import com.melmeligy.mediadownloader.extractor.SocialMediaExtractor
 import com.melmeligy.mediadownloader.extractor.YouTubeExtractor
 import dagger.Binds
@@ -38,6 +39,10 @@ abstract class ExtractorModule {
     @Binds
     @IntoSet
     abstract fun bindSocial(extractor: SocialMediaExtractor): MediaExtractor
+
+    @Binds
+    @IntoSet
+    abstract fun bindMediaPlatform(extractor: MediaPlatformExtractor): MediaExtractor
 
     @Binds
     @IntoSet

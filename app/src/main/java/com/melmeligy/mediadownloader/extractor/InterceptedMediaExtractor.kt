@@ -220,7 +220,12 @@ class InterceptedMediaExtractor : MediaExtractor {
             (ext !in UrlUtils.VIDEO_EXTENSIONS && ext !in UrlUtils.AUDIO_EXTENSIONS && ext != "m3u8" && ext != "mpd")
 
         var htmlResolved: ResolvedMedia? = null
-        if (isWebPage && htmlMediaExtractor != null && !hasVerifiedHls && distinctAuthHeights.size < 2) {
+        if (isWebPage &&
+            htmlMediaExtractor != null &&
+            !hasVerifiedHls &&
+            distinctAuthHeights.size < 2 &&
+            !UrlUtils.isDedicatedSocialPlatformUrl(url)
+        ) {
             htmlResolved = withTimeoutOrNull(HTML_ENRICH_TIMEOUT_MS) {
                 withCancellableHttpCalls(timeoutMs = HTML_ENRICH_TIMEOUT_MS) {
                     runCatching {

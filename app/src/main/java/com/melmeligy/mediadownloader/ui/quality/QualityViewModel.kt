@@ -162,7 +162,6 @@ class QualityViewModel : ViewModel {
         _state.value = Resource.Loading
 
         val job = viewModelScope.launch {
-            runCatching { settingsRepository.current() }
             val nextState = try {
                 Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: CancellationException) {

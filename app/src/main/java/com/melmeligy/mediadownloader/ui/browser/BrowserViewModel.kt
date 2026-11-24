@@ -98,7 +98,6 @@ class BrowserViewModel @Inject constructor(
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
         }
         resolveJob = viewModelScope.launch {
-            runCatching { settingsRepository.current() }
             val nextState = try {
                 com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: kotlinx.coroutines.CancellationException) {
