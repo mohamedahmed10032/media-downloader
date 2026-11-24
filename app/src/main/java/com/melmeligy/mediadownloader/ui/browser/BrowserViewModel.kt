@@ -77,24 +77,39 @@ class BrowserViewModel @Inject constructor(
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
 
+    fun cancelResolve() {
+        resolveJob?.cancel()
+        resolveJob = null
+        sizeRefineJob?.cancel()
+        sizeRefineJob = null
+        thumbCacheJob?.cancel()
+        thumbCacheJob = null
+        progressTracker.reset()
+    }
+
     fun resolveForSheet(targetUrl: String) {
         currentSheetUrl = targetUrl
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
         progressTracker.reset()
+        _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
         }
         resolveJob = viewModelScope.launch {
-            _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
             runCatching { settingsRepository.current() }
             val nextState = try {
                 com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
-                val detail = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
+                val explicit = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
+                val detail = explicit
+                    ?: progressTracker.peekDiagnosticReason()
+                    ?: if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND) {
+                        "No playable video or audio stream was exposed by this page."
+                    } else null
                 com.melmeligy.mediadownloader.core.Resource.Error(e.error, detail)
             } catch (e: Exception) {
                 com.melmeligy.mediadownloader.core.Resource.Error(
@@ -239,5 +254,10 @@ class BrowserViewModel @Inject constructor(
         viewModelScope.launch {
             settingsRepository.setAdBlockEnabledForHost(host, enabled)
         }
+    }
+
+    override fun onCleared() {
+        cancelResolve()
+        super.onCleared()
     }
 }

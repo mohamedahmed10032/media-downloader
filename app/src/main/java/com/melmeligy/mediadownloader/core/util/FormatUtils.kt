@@ -198,5 +198,80 @@ object FormatUtils {
         if (matchedNum == normalized) return trimmed
         return trimmed.replaceRange(match.range, "${normalized}p")
     }
+
+    /**
+     * Infers a standard video quality tier (`144..2160`) from all available stream metadata:
+     * 1. Explicit `width` / `height`,
+     * 2. URL / label resolution hints (including `_h`, `_n`, `_l`, `hd`, `sd`, `fhd`),
+     * 3. Explicit `bitrateKbps` or computed `sizeBytes / durationSeconds` bitrate.
+     */
+    fun inferStandardQualityFromMetadata(
+        url: String,
+        label: String = "",
+        width: Int? = null,
+        height: Int? = null,
+        bitrateKbps: Int? = null,
+        sizeBytes: Long? = null,
+        durationSeconds: Long? = null
+    ): Int? {
+        normalizeQualityHeight(width, height)?.let { return it }
+        UrlUtils.inferResolution(url, label)?.let { inferred ->
+            normalizeQualityHeight(width, inferred)?.let { return it }
+        }
+        val effectiveKbps = bitrateKbps?.takeIf { it > 0 } ?: run {
+            if (sizeBytes != null && sizeBytes > 0L && durationSeconds != null && durationSeconds >= 10L) {
+                ((sizeBytes * 8L) / (durationSeconds * 1000L)).toInt().takeIf { it > 0 }
+            } else {
+                null
+            }
+        }
+        if (effectiveKbps != null) {
+            return when {
+                effectiveKbps >= 5_500 -> 1440
+                effectiveKbps >= 2_200 -> 1080
+                effectiveKbps >= 1_050 -> 720
+                effectiveKbps >= 550 -> 480
+                effectiveKbps >= 280 -> 360
+                else -> 240
+            }
+        }
+        return null
+    }
+
+    /**
+     * Estimates audio output size when synthesizing M4A/MP3 from a muxed video stream.
+     * Prefers exact duration-based sizing; when duration is absent, scales by realistic
+     * height/size-based video bitrate so a 2.0 GB HD movie does not claim 300+ MB of audio.
+     */
+    fun estimateSynthesizedAudioBytes(
+        targetBitrateKbps: Int,
+        durationSeconds: Long? = null,
+        videoSizeBytes: Long? = null,
+        videoHeight: Int? = null
+    ): Long? {
+        if (targetBitrateKbps <= 0) return null
+        if (durationSeconds != null && durationSeconds > 0L) {
+            return ((targetBitrateKbps.toLong() * 1000L * durationSeconds) / 8L).coerceAtLeast(16_384L)
+        }
+        val vSize = videoSizeBytes?.takeIf { it > 500_000L } ?: return null
+        if (vSize < 250_000_000L) {
+            return if (targetBitrateKbps <= 128) {
+                (vSize * 14L) / 100L
+            } else {
+                (((vSize * 18L) / 100L) * targetBitrateKbps.toLong()) / 160L
+            }
+        }
+        val assumedVideoKbps = when {
+            videoHeight != null && videoHeight >= 1440 -> 7_000.0
+            videoHeight != null && videoHeight >= 1080 -> 3_800.0
+            videoHeight != null && videoHeight >= 720 -> 2_200.0
+            videoHeight != null && videoHeight >= 480 -> 1_200.0
+            videoHeight != null && videoHeight > 0 -> 700.0
+            else -> 3_200.0
+        }
+        val ratio = (targetBitrateKbps.toDouble() / assumedVideoKbps).coerceIn(0.02, 0.14)
+        return (vSize.toDouble() * ratio).toLong().coerceAtLeast(16_384L)
+    }
 }
+
 

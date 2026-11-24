@@ -484,8 +484,17 @@ class HlsExtractor @Inject constructor(
                     }
                 }
 
+                val resolvedHeight = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
+                    url = url,
+                    height = inferredHeight,
+                    bitrateKbps = bitrateKbps,
+                    sizeBytes = sizeBytes,
+                    durationSeconds = totalDurationSeconds.takeIf { it > 0L }
+                )
+                val resolvedWidth = inferredWidth ?: resolvedHeight?.let { (it * 16) / 9 }
+
                 val label = when {
-                    inferredHeight != null -> "${inferredHeight}p"
+                    resolvedHeight != null -> "${resolvedHeight}p"
                     else -> "Auto (HLS)"
                 }
 
@@ -495,8 +504,8 @@ class HlsExtractor @Inject constructor(
                     type = MediaType.VIDEO,
                     container = "ts",
                     label = label,
-                    width = inferredWidth,
-                    height = inferredHeight,
+                    width = resolvedWidth,
+                    height = resolvedHeight,
                     bitrateKbps = bitrateKbps,
                     sizeBytes = sizeBytes,
                     isHls = true,

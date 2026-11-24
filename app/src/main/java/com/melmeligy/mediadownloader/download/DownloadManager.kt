@@ -248,13 +248,18 @@ class DownloadManager private constructor(
                 put("X-Internal-Original-Thumbnail-Url", origThumb)
             }
         }
+        val normalizedQualityLabel = if (stream.type == MediaType.VIDEO) {
+            FormatUtils.normalizeQualityLabel(stream.label, stream.width, stream.height)
+        } else {
+            stream.label
+        }
         val item = DownloadItem(
             title = resolved.title,
             sourceUrl = resolved.sourceUrl,
             remoteUrl = stream.url,
             type = stream.type,
             container = finalContainer,
-            qualityLabel = stream.label,
+            qualityLabel = normalizedQualityLabel,
             status = DownloadStatus.QUEUED,
             totalBytes = stream.sizeBytes ?: 0,
             thumbnailUrl = resolved.thumbnailUrl,
@@ -776,7 +781,10 @@ class DownloadManager private constructor(
 
             val upfrontVideoBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
             val upfrontAudioBytes = headers["X-Internal-Audio-Bytes"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+            val isExtractFromVideo = headers["X-Internal-Extract-Audio"] == "true"
             val upfrontExpectedBytes = when {
+                isExtractFromVideo && upfrontVideoBytes > 0L ->
+                    upfrontVideoBytes + item.totalBytes.coerceAtLeast(0L)
                 upfrontVideoBytes > 0L && upfrontAudioBytes > 0L -> upfrontVideoBytes + upfrontAudioBytes
                 upfrontVideoBytes > 0L -> upfrontVideoBytes
                 item.totalBytes > 0L -> item.totalBytes

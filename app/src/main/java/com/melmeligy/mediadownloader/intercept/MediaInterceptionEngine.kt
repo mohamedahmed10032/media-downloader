@@ -72,6 +72,12 @@ class MediaInterceptionEngine @Inject constructor() {
         if (!title.isNullOrBlank()) currentPageTitle = title
     }
 
+    fun isSamePage(urlA: String?, urlB: String?): Boolean {
+        val keyA = normalizePageKey(urlA)
+        val keyB = normalizePageKey(urlB)
+        return keyA != null && keyB != null && keyA == keyB
+    }
+
     fun updatePageMetadata(
         title: String?,
         thumbnailUrl: String?,
@@ -79,19 +85,22 @@ class MediaInterceptionEngine @Inject constructor() {
     ) {
         val cleanTitle = title?.trim()?.takeIf { it.isNotEmpty() }
         val cleanThumb = thumbnailUrl?.trim()?.takeIf { it.isNotEmpty() && it.startsWith("http") }
-        if (cleanTitle != null) currentPageTitle = cleanTitle
-        if (cleanThumb != null) currentPageThumbnail = cleanThumb
+        val targetPageKey = pageUrl?.takeIf { it.isNotBlank() }?.let(::normalizePageKey)
+        val activePageKey = normalizePageKey(currentPageUrl)
+        val matchesActivePage = targetPageKey == null || activePageKey == null || targetPageKey == activePageKey
+        if (matchesActivePage) {
+            if (cleanTitle != null) currentPageTitle = cleanTitle
+            if (cleanThumb != null) currentPageThumbnail = cleanThumb
+        }
         if (cleanTitle == null && cleanThumb == null) return
 
-        val targetPageKey = pageUrl?.takeIf { it.isNotBlank() }?.let(::normalizePageKey)
         val currentList = _detections.value
         var changed = false
         val updatedList = currentList.map { payload ->
+            val payloadKey = normalizePageKey(payload.pageUrl)
             val matchesPage = targetPageKey == null ||
-                payload.pageUrl.isNullOrBlank() ||
-                normalizePageKey(payload.pageUrl) == targetPageKey ||
-                com.melmeligy.mediadownloader.core.util.UrlUtils.host(payload.pageUrl) ==
-                com.melmeligy.mediadownloader.core.util.UrlUtils.host(pageUrl ?: "")
+                (payloadKey == null && matchesActivePage) ||
+                payloadKey == targetPageKey
             if (!matchesPage) {
                 payload
             } else {
@@ -123,6 +132,8 @@ class MediaInterceptionEngine @Inject constructor() {
         seen.clear()
         registry.clear()
         _detections.value = emptyList()
+        currentPageTitle = null
+        currentPageThumbnail = null
     }
 
     // ---- Ingestion ----
@@ -152,12 +163,16 @@ class MediaInterceptionEngine @Inject constructor() {
             updatePageMetadata(payload.pageTitle, payload.thumbnailUrl, payload.pageUrl ?: currentPageUrl)
         }
 
+        val canInheritActivePageMeta = payloadPageKey == null ||
+            (activePageKey != null && activePageKey == payloadPageKey)
         val sanitizedQuality = payload.qualityHint?.takeIf { it > 0 }
         val normalizedPayload = payload.copy(
             url = cleanedUrl,
             pageUrl = payload.pageUrl ?: currentPageUrl,
-            pageTitle = payload.pageTitle?.takeIf { it.isNotBlank() } ?: currentPageTitle,
-            thumbnailUrl = payload.thumbnailUrl?.takeIf { it.isNotBlank() } ?: currentPageThumbnail,
+            pageTitle = payload.pageTitle?.takeIf { it.isNotBlank() }
+                ?: if (canInheritActivePageMeta) currentPageTitle else null,
+            thumbnailUrl = payload.thumbnailUrl?.takeIf { it.isNotBlank() }
+                ?: if (canInheritActivePageMeta) currentPageThumbnail else null,
             qualityHint = sanitizedQuality
         )
 

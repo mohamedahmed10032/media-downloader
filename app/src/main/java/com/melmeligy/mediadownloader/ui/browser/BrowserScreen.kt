@@ -277,8 +277,19 @@ fun BrowserScreen(
         webView.loadUrl(target)
     }
 
-    androidx.compose.runtime.DisposableEffect(Unit) {
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, webView) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> runCatching { webView.onPause() }
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> runCatching { webView.onResume() }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.cancelResolve()
             runCatching {
                 webView.stopLoading()
                 webView.removeJavascriptInterface(BlobBridge.NAME)
@@ -480,7 +491,10 @@ fun BrowserScreen(
     if (showFormatSheet) {
         val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
-            onDismissRequest = { showFormatSheet = false },
+            onDismissRequest = {
+                viewModel.cancelResolve()
+                showFormatSheet = false
+            },
             sheetState = sheetState,
             shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
             containerColor = MaterialTheme.colorScheme.surface,
@@ -499,6 +513,10 @@ fun BrowserScreen(
                     defaultVideoQuality = appSettings.defaultVideoQuality,
                     defaultAudioBitrate = appSettings.defaultAudioBitrate,
                     onRetry = { openChooseFormatSheet() },
+                    onCancel = {
+                        viewModel.cancelResolve()
+                        showFormatSheet = false
+                    },
                     onOpenInBrowser = null,
                     onDownload = { stream ->
                         runCatching {

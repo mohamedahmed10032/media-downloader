@@ -332,7 +332,7 @@ private fun SnaptubeFormatSheetContent(
         }
     }
 
-    var showMoreFormats by rememberSaveable { mutableStateOf(false) }
+    var showMoreFormats by rememberSaveable(resolved.sourceUrl) { mutableStateOf(false) }
 
     BackHandler(enabled = showMoreFormats) {
         showMoreFormats = false
@@ -666,7 +666,7 @@ private fun CompactVideoHeader(resolved: ResolvedMedia) {
             val hasImages = resolved.streams.any { it.type == MediaType.IMAGE }
             val hasVideos = resolved.streams.any { it.type == MediaType.VIDEO }
             val icon = if (hasImages && !hasVideos) Icons.Rounded.Image else Icons.Rounded.Movie
-            var thumbLoaded by remember(resolved.thumbnailUrl) { mutableStateOf(false) }
+            var thumbLoaded by remember(resolved.sourceUrl, resolved.thumbnailUrl) { mutableStateOf(false) }
             if (!thumbLoaded) {
                 Icon(
                     imageVector = icon,
@@ -885,7 +885,16 @@ internal fun prepareSnaptubeStreams(
         .filter { it.type == MediaType.VIDEO }
         .distinctBy { it.id }
         .map { v ->
-            val normH = FormatUtils.normalizeQualityHeight(v.width, v.height)
+            val durSec = v.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+            val normH = FormatUtils.inferStandardQualityFromMetadata(
+                url = v.url,
+                label = v.label,
+                width = v.width,
+                height = v.height,
+                bitrateKbps = v.bitrateKbps,
+                sizeBytes = v.sizeBytes,
+                durationSeconds = durSec
+            )
             if (normH != null && normH != v.height) v.copy(height = normH) else v
         }
         .filter { v ->
@@ -986,17 +995,19 @@ internal fun prepareSnaptubeStreams(
             val durationSeconds = sourceVideo.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
                 ?: rawVideos.firstNotNullOfOrNull { it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() }
 
-            val estM4aSize = if (durationSeconds != null && durationSeconds > 0L) {
-                (128_000L * durationSeconds) / 8L
-            } else if (vSize > 500_000L) {
-                (vSize * 14L) / 100L
-            } else null
+            val estM4aSize = FormatUtils.estimateSynthesizedAudioBytes(
+                targetBitrateKbps = 128,
+                durationSeconds = durationSeconds,
+                videoSizeBytes = vSize,
+                videoHeight = sourceVideo.height
+            )
 
-            val estMp3Size = if (durationSeconds != null && durationSeconds > 0L) {
-                (targetMp3Kbps.toLong() * 1000L * durationSeconds) / 8L
-            } else if (vSize > 500_000L) {
-                (((vSize * 18L) / 100L) * targetMp3Kbps.toLong()) / 160L
-            } else null
+            val estMp3Size = FormatUtils.estimateSynthesizedAudioBytes(
+                targetBitrateKbps = targetMp3Kbps,
+                durationSeconds = durationSeconds,
+                videoSizeBytes = vSize,
+                videoHeight = sourceVideo.height
+            )
 
             val baseHeaders = sourceVideo.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) } + buildMap {
                 put("X-Internal-Extract-Audio", "true")

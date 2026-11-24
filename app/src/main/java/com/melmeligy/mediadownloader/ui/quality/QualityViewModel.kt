@@ -158,8 +158,10 @@ class QualityViewModel : ViewModel {
             }
         }
 
+        // Synchronously clear any previous extraction's title/thumbnail before launching the coroutine
+        _state.value = Resource.Loading
+
         val job = viewModelScope.launch {
-            _state.value = Resource.Loading
             runCatching { settingsRepository.current() }
             val nextState = try {
                 Resource.Success(mediaRepository.resolve(targetUrl))
@@ -275,5 +277,10 @@ class QualityViewModel : ViewModel {
                 _queuedCount.send(ids.size)
             }
         }
+    }
+
+    override fun onCleared() {
+        cancelResolve()
+        super.onCleared()
     }
 }

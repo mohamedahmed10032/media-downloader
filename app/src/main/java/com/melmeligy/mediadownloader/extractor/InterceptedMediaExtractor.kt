@@ -93,20 +93,32 @@ class InterceptedMediaExtractor : MediaExtractor {
             .filter { it.streamType != StreamType.BLOB && it.streamType != StreamType.UNKNOWN }
             .filterNot { MediaSniffer.isHexCipherUrl(it.url) || MediaSniffer.isPreviewOrAdUrl(it.url) }
             .distinctBy { "${it.streamType}|${MediaSniffer.dedupeKey(it.url)}|${it.qualityHint?.takeIf { q -> q > 0 } ?: 0}" }
+            .sortedWith(
+                compareByDescending<MediaStreamPayload> { it.streamType == StreamType.HLS && looksLikeMasterPlaylistUrl(it.url) }
+                    .thenByDescending { it.isAuthoritativePlayer }
+                    .thenByDescending { it.streamType == StreamType.HLS }
+            )
 
         if (rawCandidates.isEmpty()) return@coroutineScope null
 
+        val sameActivePage = runCatching {
+            engine.isSamePage(engine.currentPageUrl, url)
+        }.getOrDefault(false)
         var pageTitle: String? = rawCandidates.firstNotNullOfOrNull {
             it.pageTitle?.takeIf { t -> !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(t, url) }
-        } ?: runCatching { engine.currentPageTitle }.getOrNull()?.takeIf {
-            !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
-        }
+        } ?: if (sameActivePage) {
+            runCatching { engine.currentPageTitle }.getOrNull()?.takeIf {
+                !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
+            }
+        } else null
         var pageThumb: String? = rawCandidates.firstNotNullOfOrNull {
             HtmlThumbnailExtractor.resolveValidImageCandidate(it.thumbnailUrl, url)
-        } ?: HtmlThumbnailExtractor.resolveValidImageCandidate(
-            runCatching { engine.currentPageThumbnail }.getOrNull(),
-            url
-        )
+        } ?: if (sameActivePage) {
+            HtmlThumbnailExtractor.resolveValidImageCandidate(
+                runCatching { engine.currentPageThumbnail }.getOrNull(),
+                url
+            )
+        } else null
         val pageDurationSec: Long? = rawCandidates.firstNotNullOfOrNull { it.durationSeconds?.takeIf { d -> d > 0L } }
 
         val sharedUserAgent = rawCandidates.firstNotNullOfOrNull { p ->
@@ -262,7 +274,7 @@ class InterceptedMediaExtractor : MediaExtractor {
         if (HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(pageTitle, url)) {
             HtmlThumbnailExtractor.humanReadableTitleFromUrl(url)?.let { pageTitle = it }
         }
-        if (!pageTitle.isNullOrBlank() || !pageThumb.isNullOrBlank()) {
+        if (sameActivePage && (!pageTitle.isNullOrBlank() || !pageThumb.isNullOrBlank())) {
             runCatching { engine.updatePageMetadata(pageTitle, pageThumb, url) }
         }
 
@@ -305,8 +317,17 @@ class InterceptedMediaExtractor : MediaExtractor {
 
         val rawVideos = cleanFiltered.filter { it.type == MediaType.VIDEO }
             .map { v ->
-                val validH = v.height?.takeIf { it > 0 } ?: UrlUtils.inferResolution(v.url, v.label)?.takeIf { it > 0 }
+                val durSec = v.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() ?: pageDurationSec
                 val validW = v.width?.takeIf { it > 0 }
+                val validH = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
+                    url = v.url,
+                    label = v.label,
+                    width = validW,
+                    height = v.height,
+                    bitrateKbps = v.bitrateKbps,
+                    sizeBytes = v.sizeBytes,
+                    durationSeconds = durSec
+                )
                 v.copy(width = validW, height = validH)
             }
 
@@ -332,7 +353,16 @@ class InterceptedMediaExtractor : MediaExtractor {
             .sortedByDescending { it.height ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
 
         val videos = distinctVideos.mapIndexed { idx, s ->
-            val h = s.height?.takeIf { it > 0 } ?: UrlUtils.inferResolution(s.url, s.label)?.takeIf { it > 0 }
+            val durSec = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() ?: pageDurationSec
+            val h = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
+                url = s.url,
+                label = s.label,
+                width = s.width,
+                height = s.height,
+                bitrateKbps = s.bitrateKbps,
+                sizeBytes = s.sizeBytes,
+                durationSeconds = durSec
+            )
             val label = when {
                 h != null && h >= 2160 -> "High quality (4K)"
                 h != null && h >= 1440 -> "High quality (2K)"
@@ -604,6 +634,14 @@ class InterceptedMediaExtractor : MediaExtractor {
             val origHost = UrlUtils.host(originalUrl)?.lowercase()?.removePrefix("www.")
             val finalHost = UrlUtils.host(finalUrl)?.lowercase()?.removePrefix("www.")
             return origHost != null && finalHost != null && origHost != finalHost
+        }
+
+        internal fun looksLikeMasterPlaylistUrl(url: String): Boolean {
+            val lower = url.substringBefore('?').lowercase()
+            return lower.contains("master") ||
+                lower.contains("playlist") ||
+                lower.contains("manifest") ||
+                lower.endsWith("/index.m3u8")
         }
     }
 }

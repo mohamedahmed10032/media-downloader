@@ -485,7 +485,9 @@ class DownloadThumbnailCache internal constructor(
                 }
             }
 
-            out["User-Agent"] = sanitizeAsciiHeader(userAgent ?: Constants.DEFAULT_USER_AGENT)
+            out["User-Agent"] = sanitizeAsciiHeader(
+                userAgent ?: com.melmeligy.mediadownloader.extractor.HeadlessWebExtractor.lastWebViewUserAgent
+            )
 
             val sourceFamily = hostFamily(sourceUrl)
             val thumbFamily = hostFamily(thumbnailUrl)

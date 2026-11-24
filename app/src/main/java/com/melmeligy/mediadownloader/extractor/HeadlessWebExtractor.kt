@@ -149,7 +149,6 @@ class HeadlessWebExtractor @Inject constructor(
                             val th = capturedThumbRef.get()
                             if (!t.isNullOrBlank() || !th.isNullOrBlank()) {
                                 tempEngine.updatePageMetadata(t, th, targetUrl)
-                                sharedEngine.updatePageMetadata(t, th, targetUrl)
                             }
                         }
                     }
@@ -189,6 +188,7 @@ class HeadlessWebExtractor @Inject constructor(
         }
 
         lateinit var tempEngineRef: MediaInterceptionEngine
+        var hybridPortalJob: kotlinx.coroutines.Deferred<StreamingPortalResolver.PortalExtractionResult>? = null
 
         try {
             withContext(dispatchers.main) {
@@ -233,7 +233,6 @@ class HeadlessWebExtractor @Inject constructor(
                         payload
                     }
                     localCaptured.add(adjustedPayload)
-                    sharedEngine.submit(adjustedPayload)
                     if (!MediaSniffer.isAudioTrackUrl(adjustedPayload.url, adjustedPayload.mimeType) &&
                         adjustedPayload.streamType != StreamType.BLOB &&
                         adjustedPayload.streamType != StreamType.UNKNOWN
@@ -381,7 +380,6 @@ class HeadlessWebExtractor @Inject constructor(
 
             var triedNextServerTab = false
             var lastDomPollAtMs = 0L
-            var hybridPortalJob: kotlinx.coroutines.Deferred<StreamingPortalResolver.PortalExtractionResult>? = null
             val verifiedStreams = CopyOnWriteArrayList<MediaStream>()
             val verificationFailureReasons = CopyOnWriteArrayList<String>()
             val verifiedPayloadKeys = ConcurrentHashMap.newKeySet<String>()
@@ -703,10 +701,6 @@ class HeadlessWebExtractor @Inject constructor(
                     HtmlThumbnailExtractor.resolveValidImageCandidate(it.thumbnailUrl, targetUrl)
                 }
             }
-            if (!capturedTitle.isNullOrBlank() || !capturedThumb.isNullOrBlank()) {
-                sharedEngine.updatePageMetadata(capturedTitle, capturedThumb, targetUrl)
-            }
-
             val rawAudios = resolved.filter { it.type == MediaType.AUDIO }
                 .distinctBy { it.url.substringBefore('?') }
                 .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
@@ -718,10 +712,20 @@ class HeadlessWebExtractor @Inject constructor(
             )
             val videos = filteredVideos
                 .mapIndexed { i, s ->
+                    val durSec = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                    val normH = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
+                        url = s.url,
+                        label = s.label,
+                        width = s.width,
+                        height = s.height,
+                        bitrateKbps = s.bitrateKbps,
+                        sizeBytes = s.sizeBytes,
+                        durationSeconds = durSec
+                    )
                     val label = when {
-                        s.height != null && s.height >= 1080 -> "${s.height}p FHD"
-                        s.height != null && s.height >= 720 -> "${s.height}p HD"
-                        s.height != null -> "${s.height}p"
+                        normH != null && normH >= 1080 -> "${normH}p FHD"
+                        normH != null && normH >= 720 -> "${normH}p HD"
+                        normH != null -> "${normH}p"
                         i == 0 -> "HD Video"
                         else -> "SD Video"
                     }
@@ -731,6 +735,7 @@ class HeadlessWebExtractor @Inject constructor(
                         val combined = if (vSize > 0 && aSize > 0) vSize + aSize else s.sizeBytes
                         s.copy(
                             id = "hl-v-$i",
+                            height = normH ?: s.height,
                             label = label,
                             sizeBytes = combined,
                             headers = s.headers + mapOf(
@@ -740,7 +745,7 @@ class HeadlessWebExtractor @Inject constructor(
                             )
                         )
                     } else {
-                        s.copy(id = "hl-v-$i", label = label)
+                        s.copy(id = "hl-v-$i", height = normH ?: s.height, label = label)
                     }
                 }
 
@@ -790,8 +795,9 @@ class HeadlessWebExtractor @Inject constructor(
             )
         } finally {
             destroyed.set(true)
+            hybridPortalJob?.cancel()
             wakeSignal.close()
-            withContext(dispatchers.main) {
+            withContext(kotlinx.coroutines.NonCancellable + dispatchers.main) {
                 runCatching {
                     webViewRef?.stopLoading()
                     webViewRef?.removeJavascriptInterface(BlobBridge.NAME)
@@ -908,7 +914,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
             }
         } finally {
-            withContext(dispatchers.main) {
+            withContext(kotlinx.coroutines.NonCancellable + dispatchers.main) {
                 runCatching {
                     webViewRef?.stopLoading()
                     webViewRef?.destroy()

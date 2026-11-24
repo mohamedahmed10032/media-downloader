@@ -213,6 +213,11 @@ object UrlUtils {
         RegexOption.IGNORE_CASE
     )
 
+    private val urlQualityTagRegex = Regex(
+        "(?:[_/=-]|quality=|q=)(fhd|uhd|4k|hd|sd|low|h|n|m|l)(?:\\.(?:mp4|m3u8|webm|mkv|ts|txt)|[/?&#]|$)",
+        RegexOption.IGNORE_CASE
+    )
+
     /**
      * Infers standard video vertical resolution (e.g. 2160, 1440, 1080, 720, 480, 360, 250, 240, 144)
      * from a label or stream URL without matching random multi-digit video IDs.
@@ -226,13 +231,23 @@ object UrlUtils {
             when {
                 trimmed.contains("4k") || trimmed.contains("uhd") -> return 2160
                 trimmed.contains("2k") || trimmed.contains("qhd") -> return 1440
-                trimmed.contains("fhd") -> return 1080
+                trimmed.contains("fhd") || trimmed.contains("full hd") -> return 1080
+                trimmed == "hd" || trimmed == "high" -> return 720
+                trimmed == "sd" || trimmed == "normal" || trimmed == "medium" -> return 480
+                trimmed == "low" -> return 360
             }
         }
         if (url.isNotBlank()) {
             explicitPHeightRegex.find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
             dimensionRegex.find(url)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { return it }
             delimitedHeightRegex.find(url)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+            when (urlQualityTagRegex.find(url)?.groupValues?.getOrNull(1)?.lowercase()) {
+                "4k", "uhd" -> return 2160
+                "fhd" -> return 1080
+                "hd", "h" -> return 720
+                "sd", "n", "m" -> return 480
+                "low", "l" -> return 360
+            }
         }
         return null
     }
