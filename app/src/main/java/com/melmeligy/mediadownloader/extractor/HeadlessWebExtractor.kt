@@ -80,13 +80,18 @@ class HeadlessWebExtractor @Inject constructor(
     ): ResolvedMedia? = coroutineScope {
         val isSocialFastMode = socialEmbedFastMode || UrlUtils.isDedicatedSocialPlatformUrl(targetUrl)
         val effectiveTimeoutMs = if (isSocialFastMode) minOf(timeoutMs, SOCIAL_FAST_TIMEOUT_MS) else timeoutMs
-        progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+        val hardCeilingMs = if (isSocialFastMode) MAX_SOCIAL_TOTAL_EXTRACTION_MS else MAX_TOTAL_EXTRACTION_MS
+        progressTracker.update(
+            if (isSocialFastMode) ExtractionProgressTracker.STAGE_QUALITIES
+            else ExtractionProgressTracker.STAGE_HEADLESS
+        )
         com.melmeligy.mediadownloader.core.AppLogger.d(
             "Headless",
-            "Start extraction host=${UrlUtils.host(targetUrl)} timeoutMs=$effectiveTimeoutMs socialFast=$isSocialFastMode"
+            "Start extraction host=${UrlUtils.host(targetUrl)} timeoutMs=$effectiveTimeoutMs ceilingMs=$hardCeilingMs socialFast=$isSocialFastMode"
         )
         val localCaptured = CopyOnWriteArrayList<MediaStreamPayload>()
         val discoveredEmbedUrls = CopyOnWriteArrayList<String>()
+        val discoveredAjaxServers = CopyOnWriteArrayList<StreamingPortalResolver.AjaxServerSpec>()
         val prefetched = consumePrefetchedMetadataHint(targetUrl)
         val capturedTitleRef = AtomicReference<String?>(
             prefetched?.first?.takeIf { !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl) }
@@ -223,10 +228,27 @@ class HeadlessWebExtractor @Inject constructor(
             return list
         }
 
+        suspend fun collectDomAjaxServers(view: WebView, pageUrlForResolve: String): List<StreamingPortalResolver.AjaxServerSpec> {
+            if (destroyed.get()) return emptyList()
+            val resultCh = Channel<List<StreamingPortalResolver.AjaxServerSpec>>(Channel.CONFLATED)
+            withContext(dispatchers.main) {
+                runCatching {
+                    view.evaluateJavascript(PORTAL_AJAX_SCRAPE_JS) { jsonStr ->
+                        val parsed = parseScrapedAjaxServersJson(jsonStr, pageUrlForResolve)
+                        resultCh.trySend(parsed)
+                    }
+                }.onFailure { resultCh.trySend(emptyList()) }
+            }
+            val list = withTimeoutOrNull(450L) { resultCh.receiveCatching().getOrNull() }.orEmpty()
+            resultCh.close()
+            return list
+        }
+
         lateinit var tempEngineRef: MediaInterceptionEngine
         var hybridPortalJob: kotlinx.coroutines.Deferred<StreamingPortalResolver.PortalExtractionResult>? = null
 
         try {
+            withTimeoutOrNull(hardCeilingMs) {
             withContext(dispatchers.main) {
                 val wv = WebView(context).apply {
                     with(settings) {
@@ -441,15 +463,19 @@ class HeadlessWebExtractor @Inject constructor(
             val verifiedPayloadKeys = ConcurrentHashMap.newKeySet<String>()
             val webViewUa = lastWebViewUserAgent
 
-            fun maybeStartHybridPortal(embeds: Collection<String>) {
-                if (hybridPortalJob != null || embeds.isEmpty()) return
+            fun maybeStartHybridPortal(
+                embeds: Collection<String>,
+                ajaxServers: Collection<StreamingPortalResolver.AjaxServerSpec> = discoveredAjaxServers
+            ) {
+                if (hybridPortalJob != null || (embeds.isEmpty() && ajaxServers.isEmpty())) return
                 val promotableNow = selectPromotableEmbedUrls(
                     outerPageUrl = currentPageUrl,
                     candidates = embeds,
                     maxEmbeds = StreamingPortalResolver.MAX_SERVERS,
                     allowDirectMediaFiles = true
                 )
-                if (promotableNow.isEmpty()) return
+                val ajaxSnapshot = ajaxServers.toList()
+                if (promotableNow.isEmpty() && ajaxSnapshot.isEmpty()) return
                 cookieFlusher()
                 val hybridHeaders = LinkedHashMap<String, String>().apply {
                     put("User-Agent", webViewUa)
@@ -458,11 +484,16 @@ class HeadlessWebExtractor @Inject constructor(
                 }
                 com.melmeligy.mediadownloader.core.AppLogger.d(
                     "Headless",
-                    "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s)"
+                    "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s) + ${ajaxSnapshot.size} AJAX server(s)"
                 )
                 hybridPortalJob = async(dispatchers.io) {
                     runCatching {
-                        portalResolver.resolveDirectEmbedUrls(currentPageUrl, promotableNow, hybridHeaders)
+                        portalResolver.resolveHybridDomAndAjax(
+                            pageUrl = currentPageUrl,
+                            embedUrls = promotableNow,
+                            ajaxServers = ajaxSnapshot,
+                            baseHeaders = hybridHeaders
+                        )
                     }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
                 }
             }
@@ -542,7 +573,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
 
                 // Fast DOM-ready polling (every ~300ms once pageFinished or >= 1.2s):
-                // the instant server tabs / iframes appear in DOM, launch parallel StreamingPortalResolver!
+                // the instant server tabs / iframes or AJAX server lists appear in DOM, launch parallel StreamingPortalResolver!
                 // Never run movie-portal polling/server clicking on social platforms.
                 if (!isSocialFastMode &&
                     firstVidAt == null &&
@@ -553,19 +584,27 @@ class HeadlessWebExtractor @Inject constructor(
                 ) {
                     lastDomPollAtMs = elapsed
                     val domEmbeds = collectDomEmbedIframes(webViewRef!!)
-                    if (domEmbeds.isNotEmpty() || discoveredEmbedUrls.isNotEmpty()) {
+                    val domAjax = collectDomAjaxServers(webViewRef!!, currentPageUrl)
+                    if (domEmbeds.isNotEmpty()) {
                         domEmbeds.forEach { if (it !in discoveredEmbedUrls) discoveredEmbedUrls.add(it) }
-                        maybeStartHybridPortal(discoveredEmbedUrls)
+                    }
+                    if (domAjax.isNotEmpty()) {
+                        domAjax.forEach { if (it !in discoveredAjaxServers) discoveredAjaxServers.add(it) }
+                    }
+                    if (discoveredEmbedUrls.isNotEmpty() || discoveredAjaxServers.isNotEmpty()) {
+                        maybeStartHybridPortal(discoveredEmbedUrls, discoveredAjaxServers)
                     }
                 }
 
                 // If page finished and we already have embed URLs in DOM (no Cloudflare stall),
-                // don't wait out the full 7.5s outer timeout — move to promoted embeds after 2.2s.
+                // don't wait out the full 7.5s outer timeout — move to promoted embeds after 2.2s
+                // (or 3.4s if we just clicked a next-server AJAX tab at 1.8s so it can inject its iframe).
+                val earlyBreakThresholdMs = if (triedNextServerTab) POST_TAB_CLICK_GRACE_MS else OUTER_EMBED_READY_EARLY_BREAK_MS
                 if (!isSocialFastMode &&
                     firstVidAt == null &&
                     pageFinished.get() &&
                     discoveredEmbedUrls.isNotEmpty() &&
-                    elapsed >= OUTER_EMBED_READY_EARLY_BREAK_MS
+                    elapsed >= earlyBreakThresholdMs
                 ) {
                     break
                 }
@@ -602,11 +641,16 @@ class HeadlessWebExtractor @Inject constructor(
             val hasVerifiedOuterVideo = verifiedStreams.any { it.type == MediaType.VIDEO }
             com.melmeligy.mediadownloader.core.AppLogger.d(
                 "Headless",
-                "Outer pass finished host=${UrlUtils.host(currentPageUrl)} captured=${localCaptured.size} verified=${verifiedStreams.size} interceptedEmbeds=${discoveredEmbedUrls.size}"
+                "Outer pass finished host=${UrlUtils.host(currentPageUrl)} captured=${localCaptured.size} verified=${verifiedStreams.size} interceptedEmbeds=${discoveredEmbedUrls.size} ajaxServers=${discoveredAjaxServers.size}"
             )
             if (!isSocialFastMode && !hasVerifiedOuterVideo && webViewRef != null) {
                 val failedOuterEmbed = lastEmbedIframeUrl.get()?.substringBefore('#')?.trimEnd('/')?.lowercase()
                 var domEmbeds = collectDomEmbedIframes(webViewRef!!)
+                if (discoveredAjaxServers.isEmpty()) {
+                    collectDomAjaxServers(webViewRef!!, currentPageUrl).forEach {
+                        if (it !in discoveredAjaxServers) discoveredAjaxServers.add(it)
+                    }
+                }
                 var allEmbeds = discoveredEmbedUrls + domEmbeds
                 val rawPromotable = selectPromotableEmbedUrls(
                     outerPageUrl = currentPageUrl,
@@ -627,7 +671,7 @@ class HeadlessWebExtractor @Inject constructor(
                     domEmbeds = collectDomEmbedIframes(webViewRef!!)
                     allEmbeds = discoveredEmbedUrls + domEmbeds
                 }
-                maybeStartHybridPortal(allEmbeds)
+                maybeStartHybridPortal(allEmbeds, discoveredAjaxServers)
                 val orderedCandidates = if (failedOuterEmbed != null) {
                     val (failedOnes, freshOnes) = allEmbeds.partition {
                         it.substringBefore('#').trimEnd('/').lowercase() == failedOuterEmbed
@@ -779,7 +823,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
                 progressTracker.setDiagnosticReason(diag)
                 com.melmeligy.mediadownloader.core.AppLogger.w("Headless", "No verified streams for ${UrlUtils.host(targetUrl)}: $diag")
-                return@coroutineScope null
+                return@withTimeoutOrNull null
             }
 
             progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
@@ -881,13 +925,19 @@ class HeadlessWebExtractor @Inject constructor(
                 emptyList()
             }
 
-            return@coroutineScope ResolvedMedia(
+            return@withTimeoutOrNull ResolvedMedia(
                 sourceUrl = targetUrl,
                 title = capturedTitle ?: HtmlThumbnailExtractor.humanReadableTitleFromUrl(targetUrl) ?: "Web Video",
                 thumbnailUrl = capturedThumb,
                 streams = videos + audios,
                 extractor = "Smart Extractor"
             )
+            } ?: run {
+                if (progressTracker.peekDiagnosticReason().isNullOrBlank()) {
+                    progressTracker.setDiagnosticReason("Timed out waiting for embedded player — try again or open in browser.")
+                }
+                null
+            }
         } finally {
             destroyed.set(true)
             hybridPortalJob?.cancel()
@@ -1231,6 +1281,7 @@ class HeadlessWebExtractor @Inject constructor(
         private const val EARLY_EXIT_TICK_MS = 120L
         private const val DOM_READY_POLL_INTERVAL_MS = 300L
         private const val OUTER_EMBED_READY_EARLY_BREAK_MS = 2_200L
+        private const val POST_TAB_CLICK_GRACE_MS = 3_400L
         private const val NEXT_SERVER_TAB_DELAY_MS = 1_800L
         private const val POST_CAPTURE_PROBE_TIMEOUT_MS = 5_000L
         private const val HLS_VERIFY_BATCH_TIMEOUT_MS = 10_500L
@@ -1240,6 +1291,8 @@ class HeadlessWebExtractor @Inject constructor(
         internal const val MAX_PROMOTED_EMBEDS = 4
         internal const val PROMOTED_EMBED_TIMEOUT_MS = 4_500L
         internal const val SOCIAL_FAST_TIMEOUT_MS = 3_800L
+        internal const val MAX_TOTAL_EXTRACTION_MS = 18_000L
+        internal const val MAX_SOCIAL_TOTAL_EXTRACTION_MS = 7_500L
 
         private data class MetadataHint(
             val title: String?,
@@ -1517,6 +1570,51 @@ class HeadlessWebExtractor @Inject constructor(
                 "}" +
                 "return JSON.stringify(out);" +
                 "}catch(e){return '[]';}})();"
+
+        val PORTAL_AJAX_SCRAPE_JS =
+            "(function(){try{" +
+                "var out=[];var seen={};" +
+                "var origin=location.origin||'';" +
+                "var ajaxBase=(typeof MyAjaxURL==='string'&&MyAjaxURL)||(typeof themeAjaxUrl==='string'&&themeAjaxUrl)||(typeof ThemeAjax==='string'&&ThemeAjax)||(typeof ajaxURL==='string'&&ajaxURL)||(typeof ajax_url==='string'&&ajax_url)||'';" +
+                "if(!ajaxBase){var sc=document.querySelectorAll('script');for(var si=0;si<sc.length&&!ajaxBase;si++){var tx=sc[si].textContent||'';var m=tx.match(/(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\\s*=\\s*['\"](https?:\\/\\/[^'\"]+)['\"]/i)||tx.match(/(?:ajaxURL|ajax_url|ajaxUrl)\\s*=\\s*['\"](https?:\\/\\/[^'\"]+)['\"]/i);if(m&&m[1])ajaxBase=m[1];}}" +
+                "var serverEndpoint=ajaxBase?(/\\.php$/i.test(ajaxBase.replace(/\\/+$/,''))?ajaxBase.replace(/\\/+$/,''):ajaxBase.replace(/\\/+$/,'')+'/Single/Server.php'):(origin?origin+'/Ajaxat/Single/Server.php':'');" +
+                "if(serverEndpoint){var tabs=document.querySelectorAll('[data-id][data-server]');for(var i=0;i<tabs.length&&out.length<8;i++){var t=tabs[i];var id=(t.getAttribute('data-id')||'').trim();var srv=(t.getAttribute('data-server')||'').trim();if(!id||!srv)continue;var key='a|'+id+'|'+srv;if(seen[key])continue;seen[key]=true;var nm=(t.innerText||t.textContent||'').trim().slice(0,32)||('Server '+srv);out.push({e:serverEndpoint,b:'id='+encodeURIComponent(id)+'&i='+encodeURIComponent(srv),n:nm,act:t.classList&&t.classList.contains('active')?1:0});}}" +
+                "if(origin){var doo=document.querySelectorAll('[data-post][data-nume]');for(var j=0;j<doo.length&&out.length<8;j++){var d=doo[j];var post=(d.getAttribute('data-post')||'').trim();var nume=(d.getAttribute('data-nume')||'').trim();var tp=(d.getAttribute('data-type')||'movie').trim()||'movie';if(!post||!nume||nume.toLowerCase()==='trailer')continue;var dk='d|'+post+'|'+nume+'|'+tp;if(seen[dk])continue;seen[dk]=true;var dn=(d.innerText||d.textContent||'').trim().slice(0,32)||('Server '+nume);out.push({e:origin+'/wp-admin/admin-ajax.php',b:'action=doo_player_ajax&post='+encodeURIComponent(post)+'&nume='+encodeURIComponent(nume)+'&type='+encodeURIComponent(tp),n:dn,act:0});}}" +
+                "return JSON.stringify(out);" +
+                "}catch(e){return '[]';}})();"
+
+        internal fun parseScrapedAjaxServersJson(
+            rawJson: String?,
+            pageUrl: String
+        ): List<StreamingPortalResolver.AjaxServerSpec> {
+            if (rawJson.isNullOrBlank() || rawJson == "null") return emptyList()
+            val unquoted = runCatching {
+                (org.json.JSONTokener(rawJson).nextValue() as? String)
+                    ?: rawJson.trim().removeSurrounding("\"").replace("\\\"", "\"")
+            }.getOrNull() ?: return emptyList()
+            if (!unquoted.startsWith("[")) return emptyList()
+            val arr = runCatching { org.json.JSONArray(unquoted) }.getOrNull() ?: return emptyList()
+            val nonActive = mutableListOf<StreamingPortalResolver.AjaxServerSpec>()
+            val active = mutableListOf<StreamingPortalResolver.AjaxServerSpec>()
+            val seen = HashSet<String>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val rawEndpoint = obj.optString("e").trim()
+                val endpoint = if (rawEndpoint.startsWith("http://", true) || rawEndpoint.startsWith("https://", true)) {
+                    rawEndpoint
+                } else if (rawEndpoint.isNotEmpty()) {
+                    UrlUtils.resolveUrl(pageUrl, rawEndpoint)
+                } else ""
+                val body = obj.optString("b").trim()
+                val name = obj.optString("n").trim().ifBlank { "Server ${i + 1}" }
+                if (!endpoint.startsWith("http://", true) && !endpoint.startsWith("https://", true)) continue
+                if (body.isEmpty() || !seen.add("$endpoint|$body")) continue
+                val spec = StreamingPortalResolver.AjaxServerSpec(endpoint, body, name)
+                if (obj.optInt("act", 0) == 1) active += spec else nonActive += spec
+            }
+            // Prioritize alternate (non-active) tabs first because the active Server #0 iframe is already in DOM
+            return nonActive + active
+        }
 
         /**
          * Pure early-exit decision state machine for [HeadlessWebExtractor].

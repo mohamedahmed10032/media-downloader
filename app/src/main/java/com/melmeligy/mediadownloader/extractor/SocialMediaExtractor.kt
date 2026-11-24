@@ -16,6 +16,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -1235,7 +1237,12 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         var jsonText = fetchTikwmOnce()
-        if (jsonText.isNullOrBlank()) return@coroutineScope null
+        if (jsonText.isNullOrBlank()) {
+            // Only arm cooldown if this branch genuinely timed out/failed (not cancelled by winning sibling)
+            currentCoroutineContext().ensureActive()
+            tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
+            return@coroutineScope null
+        }
         if (jsonText.trimStart().startsWith("<")) {
             tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
             return@coroutineScope null
@@ -1296,21 +1303,7 @@ class SocialMediaExtractor @Inject constructor(
         desktopHeaders: Map<String, String>,
         tikTokBaseCdnHeaders: Map<String, String>
     ): ResolvedMedia? = coroutineScope {
-        val fetchedHtml = withTimeoutOrNull(TIKTOK_HTML_TIMEOUT_MS) {
-            withCancellableHttpCalls(timeoutMs = TIKTOK_HTML_TIMEOUT_MS) {
-                runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
-            }
-        }
-        val html = fetchedHtml?.html.orEmpty()
-        val cdnHeaders = LinkedHashMap<String, String>(tikTokBaseCdnHeaders).apply {
-            val cookie = fetchedHtml?.cookieHeader?.takeIf { it.isNotBlank() }
-                ?: http.cookieHeaderFor(fetchedHtml?.finalUrl ?: canonicalUrl)
-            if (!cookie.isNullOrBlank()) {
-                put("Cookie", cookie)
-            }
-        }
-
-        fun parseTikTokHtmlDoc(docHtml: String): ResolvedMedia? {
+        fun parseTikTokHtmlDoc(docHtml: String, cdnHeaders: Map<String, String>): ResolvedMedia? {
             if (docHtml.isBlank()) return null
 
             // Photo Mode Slideshow from Hydration JSON (zero blocking audio probe; StreamSizeRefiner fills size asynchronously)
@@ -1393,7 +1386,85 @@ class SocialMediaExtractor @Inject constructor(
             return null
         }
 
-        parseTikTokHtmlDoc(html)?.let { return@coroutineScope it }
+        fun buildCdnHeadersWithFetched(
+            fetched: ExtractorHttp.HtmlFetchResult?,
+            uaOverride: String? = null
+        ): Map<String, String> = LinkedHashMap<String, String>(tikTokBaseCdnHeaders).apply {
+            if (!uaOverride.isNullOrBlank()) put("User-Agent", uaOverride)
+            val cookie = fetched?.cookieHeader?.takeIf { it.isNotBlank() }
+                ?: http.cookieHeaderFor(fetched?.finalUrl ?: canonicalUrl)
+            if (!cookie.isNullOrBlank()) {
+                put("Cookie", cookie)
+            }
+        }
+
+        // Hedged race: desktop HTML (405KB, multi-quality bitrateInfo) starts immediately;
+        // mobile HTML (156KB, webapp.reflow.video.detail, ~500ms) fires ONLY if desktop fails
+        // or hasn't finished within TIKTOK_MOBILE_HEDGE_DELAY_MS (0 extra requests when desktop is fast).
+        val desktopDoneEarly = Channel<Unit>(Channel.CONFLATED)
+        val resultCh = Channel<ResolvedMedia?>(capacity = 2)
+
+        val desktopJob = launch(Dispatchers.IO) {
+            val res = try {
+                val fetched = withTimeoutOrNull(TIKTOK_HTML_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = TIKTOK_HTML_TIMEOUT_MS) {
+                        runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
+                    }
+                }
+                val parsed = parseTikTokHtmlDoc(fetched?.html.orEmpty(), buildCdnHeadersWithFetched(fetched))
+                if (parsed == null) desktopDoneEarly.trySend(Unit)
+                parsed
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                desktopDoneEarly.trySend(Unit)
+                null
+            }
+            resultCh.trySend(res)
+        }
+
+        val mobileJob = launch(Dispatchers.IO) {
+            val res = try {
+                withTimeoutOrNull(TIKTOK_MOBILE_HEDGE_DELAY_MS) {
+                    desktopDoneEarly.receiveCatching()
+                }
+                val mobileHeaders = LinkedHashMap<String, String>(desktopHeaders).apply {
+                    put("User-Agent", TIKTOK_MOBILE_UA)
+                }
+                val fetchedMob = withTimeoutOrNull(TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
+                        runCatching { http.fetchHtmlWithCookies(canonicalUrl, mobileHeaders) }.getOrNull()
+                    }
+                }
+                parseTikTokHtmlDoc(
+                    fetchedMob?.html.orEmpty(),
+                    buildCdnHeadersWithFetched(fetchedMob, uaOverride = TIKTOK_MOBILE_UA)
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            resultCh.trySend(res)
+        }
+
+        var winner: ResolvedMedia? = null
+        try {
+            for (i in 0 until 2) {
+                val candidate = resultCh.receiveCatching().getOrNull() ?: continue
+                if (candidate.streams.isNotEmpty() || candidate.gallerySlides.isNotEmpty()) {
+                    winner = candidate
+                    break
+                }
+            }
+        } finally {
+            desktopJob.cancel()
+            mobileJob.cancel()
+            desktopDoneEarly.close()
+            resultCh.close()
+        }
+
+        if (winner != null) return@coroutineScope winner
 
         // Login-free TikTok embed/v2 fallback when main page returned an anti-bot JS shell
         val postId = UrlUtils.extractPostId(canonicalUrl)?.takeIf { it.all(Char::isDigit) }
@@ -1404,7 +1475,7 @@ class SocialMediaExtractor @Inject constructor(
                     runCatching { http.fetchString(embedUrl, desktopHeaders) }.getOrNull()
                 }
             }.orEmpty()
-            parseTikTokHtmlDoc(embedHtml)?.let { return@coroutineScope it }
+            parseTikTokHtmlDoc(embedHtml, tikTokBaseCdnHeaders)?.let { return@coroutineScope it }
         }
 
         null
@@ -2129,6 +2200,8 @@ class SocialMediaExtractor @Inject constructor(
     companion object {
         private const val TIKTOK_DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        private const val TIKTOK_MOBILE_UA =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
         private const val REDIRECT_CACHE_TTL_MS = 120_000L
         private const val MAX_REDIRECT_CACHE_ENTRIES = 128
         private const val REDIRECT_PROBE_TIMEOUT_MS = 2_200L
@@ -2136,6 +2209,8 @@ class SocialMediaExtractor @Inject constructor(
         private const val TIKWM_API_TIMEOUT_MS = 2_000L
         private const val TIKWM_COOLDOWN_MS = 60_000L
         private const val TIKTOK_HTML_TIMEOUT_MS = 5_500L
+        private const val TIKTOK_MOBILE_HEDGE_DELAY_MS = 1_600L
+        private const val TIKTOK_MOBILE_HTML_TIMEOUT_MS = 3_500L
         private const val SOCIAL_API_TIMEOUT_MS = 2_800L
         private const val FAST_PROBE_TIMEOUT_MS = 1_800L
         private const val FAST_AUDIO_PROBE_TIMEOUT_MS = 1_200L

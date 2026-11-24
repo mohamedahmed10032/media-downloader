@@ -157,6 +157,12 @@ class StreamingPortalResolver(
         PortalExtractionResult(emptyList(), discoveredPoster)
     }
 
+    data class AjaxServerSpec(
+        val endpointUrl: String,
+        val formBody: String,
+        val serverName: String
+    )
+
     /**
      * Fast hybrid entry point used by [HeadlessWebExtractor]: accepts embed/server URLs scraped
      * directly from the live WebView DOM (e.g. `.WatchServersList [data-url]` or `<iframe>`s) and
@@ -166,8 +172,26 @@ class StreamingPortalResolver(
         pageUrl: String,
         embedUrls: Collection<String>,
         baseHeaders: Map<String, String>
+    ): PortalExtractionResult = resolveHybridDomAndAjax(
+        pageUrl = pageUrl,
+        embedUrls = embedUrls,
+        ajaxServers = emptyList(),
+        baseHeaders = baseHeaders
+    )
+
+    /**
+     * Combined hybrid entry point used by [HeadlessWebExtractor]: concurrently resolves BOTH
+     * direct embed URLs (`<iframe>`, `[data-url]`, `.List--Download--Wecima--Single`) AND AJAX
+     * server tabs (`[data-id][data-server]` -> `Single/Server.php`, `[data-post][data-nume]` ->
+     * `admin-ajax.php`) scraped from the live WebView DOM using the WebView's cookies & User-Agent.
+     */
+    suspend fun resolveHybridDomAndAjax(
+        pageUrl: String,
+        embedUrls: Collection<String>,
+        ajaxServers: Collection<AjaxServerSpec>,
+        baseHeaders: Map<String, String>
     ): PortalExtractionResult = withContext(Dispatchers.IO) {
-        if (embedUrls.isEmpty()) return@withContext PortalExtractionResult(emptyList())
+        if (embedUrls.isEmpty() && ajaxServers.isEmpty()) return@withContext PortalExtractionResult(emptyList())
         val visitedEmbeds = ConcurrentHashMap.newKeySet<String>()
         val idCounter = AtomicInteger(0)
         val seen = HashSet<String>()
@@ -178,6 +202,22 @@ class StreamingPortalResolver(
             if (isBlockedOrNonPlayerEmbed(resolved)) return@forEachIndexed
             if (seen.add(dedupeEmbedKey(resolved))) {
                 jobs.add(ServerJob.DirectEmbed(resolved, "Embed ${idx + 1}", pageUrl))
+            }
+        }
+        val seenAjax = HashSet<String>()
+        ajaxServers.forEach { spec ->
+            if (spec.endpointUrl.startsWith("http://", true) || spec.endpointUrl.startsWith("https://", true)) {
+                val key = "${spec.endpointUrl}|${spec.formBody}"
+                if (spec.formBody.isNotBlank() && seenAjax.add(key)) {
+                    jobs.add(
+                        ServerJob.AjaxServer(
+                            endpointUrl = spec.endpointUrl,
+                            formBody = spec.formBody,
+                            serverName = spec.serverName.ifBlank { "Server" },
+                            parentPageUrl = pageUrl
+                        )
+                    )
+                }
             }
         }
         if (jobs.isEmpty()) return@withContext PortalExtractionResult(emptyList())
@@ -1071,7 +1111,7 @@ class StreamingPortalResolver(
         const val MAX_SERVERS = 8
         const val MAX_CONCURRENT_SERVERS = 6
         const val PAGE_FETCH_TIMEOUT_MS = 4_500L
-        const val SERVER_PROBE_TIMEOUT_MS = 4_000L
+        const val SERVER_PROBE_TIMEOUT_MS = 5_200L
         const val EMBED_HOP_TIMEOUT_MS = 3_500L
         const val PROGRESSIVE_PROBE_TIMEOUT_MS = 2_200L
         const val PORTAL_TOTAL_BUDGET_MS = 5_500L
