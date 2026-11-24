@@ -587,20 +587,43 @@ class StreamingPortalResolver(
         }
 
         val fetchHeaders = buildHopHeaders(embedUrl, parentUrl, baseHeaders)
-        val embedHtml = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
+        val fetchedEmbed = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
             withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
-                runCatching { http.fetchString(embedUrl, fetchHeaders) }.getOrNull()
+                val withCookies = runCatching { http.fetchHtmlWithCookies(embedUrl, fetchHeaders) }.getOrNull()
+                if (withCookies != null && withCookies.html.isNotBlank()) {
+                    withCookies
+                } else if (withCookies != null && withCookies.finalUrl.isBlank()) {
+                    runCatching { http.fetchString(embedUrl, fetchHeaders) }
+                        .getOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { ExtractorHttp.HtmlFetchResult(html = it, cookieHeader = null, finalUrl = embedUrl) }
+                } else {
+                    null
+                }
             }
-        }.orEmpty()
+        } ?: return@coroutineScope PortalExtractionResult(emptyList())
+        val embedHtml = fetchedEmbed.html
         if (embedHtml.isBlank()) return@coroutineScope PortalExtractionResult(emptyList())
 
-        // Critical: streams loaded BY this embed player must carry the EMBED URL as Referer & Origin!
-        val streamHeaders = buildStreamHeadersForHost(embedUrl, baseHeaders)
+        // Preserve the post-redirect mirror URL (e.g. earnvids.pro/e/x -> dintezuvio.com/e/x)
+        // and any Set-Cookie tokens issued during the embed redirect chain.
+        val effectiveEmbedUrl = fetchedEmbed.finalUrl.takeIf { it.startsWith("http", ignoreCase = true) } ?: embedUrl
+        val mergedBaseHeaders = if (!fetchedEmbed.cookieHeader.isNullOrBlank()) {
+            val existingCookie = baseHeaders["Cookie"].orEmpty()
+            val combinedCookie = if (existingCookie.isBlank()) fetchedEmbed.cookieHeader
+            else "$existingCookie; ${fetchedEmbed.cookieHeader}"
+            baseHeaders + ("Cookie" to combinedCookie)
+        } else {
+            baseHeaders
+        }
+
+        // Critical: streams loaded BY this embed player must carry the POST-REDIRECT EMBED URL as Referer & Origin!
+        val streamHeaders = buildStreamHeadersForHost(effectiveEmbedUrl, mergedBaseHeaders)
 
         val unpackedBlocks = JsUnpacker.unpackAll(embedHtml)
         com.melmeligy.mediadownloader.core.AppLogger.d(
             "Portal",
-            "Hop depth=$depth host=${UrlUtils.host(embedUrl)} html=${embedHtml.length}B unpacked=${unpackedBlocks.size}"
+            "Hop depth=$depth host=${UrlUtils.host(effectiveEmbedUrl)} html=${embedHtml.length}B unpacked=${unpackedBlocks.size}"
         )
         val combinedScriptText = buildString {
             append(embedHtml)
@@ -610,7 +633,7 @@ class StreamingPortalResolver(
             }
         }
 
-        val playerCfg = JsUnpacker.extractPlayerConfigs(combinedScriptText, baseUrl = embedUrl)
+        val playerCfg = JsUnpacker.extractPlayerConfigs(combinedScriptText, baseUrl = effectiveEmbedUrl)
         val durationHeaders = if (playerCfg.durationSec != null && playerCfg.durationSec > 0L) {
             streamHeaders + ("X-Internal-Duration-Seconds" to playerCfg.durationSec.toString())
         } else {
@@ -625,7 +648,7 @@ class StreamingPortalResolver(
             height: Int? = null,
             isHlsHint: Boolean = false
         ) {
-            val resolved = UrlUtils.resolveUrl(embedUrl, url.trim())
+            val resolved = UrlUtils.resolveUrl(effectiveEmbedUrl, url.trim())
             val cleaned = MediaSniffer.cleanMediaUrl(resolved)
             if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) return
             if (AdBlocker.isAd(cleaned) || MediaSniffer.isPreviewOrAdUrl(cleaned)) return
@@ -661,12 +684,12 @@ class StreamingPortalResolver(
         }
 
         // 3b. Doodstream /pass_md5/<hash>/<token> dynamic stream token endpoint
-        resolveDoodstreamPassMd5(embedUrl, combinedScriptText, streamHeaders)?.let { doodUrl ->
+        resolveDoodstreamPassMd5(effectiveEmbedUrl, combinedScriptText, streamHeaders)?.let { doodUrl ->
             addCandidate(doodUrl, label = serverName.ifBlank { "Doodstream" })
         }
 
         // 4. HTML5 <video>/<source> elements inside the embed DOM
-        val embedDoc = Jsoup.parse(embedHtml, embedUrl)
+        val embedDoc = Jsoup.parse(embedHtml, effectiveEmbedUrl)
         embedDoc.select("video source[src], video source[data-src], video[src], video[data-src]").forEach { el ->
             val src = el.absUrl("src").ifBlank { el.absUrl("data-src") }.ifBlank { el.attr("src") }
             val qLabel = el.attr("label").ifBlank { el.attr("res") }.ifBlank { el.attr("size") }
@@ -685,7 +708,7 @@ class StreamingPortalResolver(
 
         val resolvedPoster = HtmlThumbnailExtractor.extractThumbnail(
             doc = embedDoc,
-            pageUrl = embedUrl,
+            pageUrl = effectiveEmbedUrl,
             preferredThumb = playerCfg.posterUrl
         )
 
@@ -700,7 +723,7 @@ class StreamingPortalResolver(
 
             com.melmeligy.mediadownloader.core.AppLogger.d(
                 "Portal",
-                "Hop depth=$depth host=${UrlUtils.host(embedUrl)} candidates=${candidates.size} verified=${resolvedStreams.size}"
+                "Hop depth=$depth host=${UrlUtils.host(effectiveEmbedUrl)} candidates=${candidates.size} verified=${resolvedStreams.size}"
             )
             if (resolvedStreams.isNotEmpty()) {
                 return@coroutineScope PortalExtractionResult(
@@ -718,12 +741,12 @@ class StreamingPortalResolver(
                     .ifBlank { el.absUrl("data-src") }
                     .ifBlank { el.absUrl("data-lazy-src") }
                     .ifBlank { el.attr("src") }
-                normalizeEmbedUrl(embedUrl, raw)?.let { u ->
+                normalizeEmbedUrl(effectiveEmbedUrl, raw)?.let { u ->
                     if (!isBlockedOrNonPlayerEmbed(u)) nestedUrls.add(u)
                 }
             }
             jsIframeRedirectRegex.findAll(combinedScriptText).forEach { m ->
-                normalizeEmbedUrl(embedUrl, m.groupValues[1])?.let { u ->
+                normalizeEmbedUrl(effectiveEmbedUrl, m.groupValues[1])?.let { u ->
                     if (!isBlockedOrNonPlayerEmbed(u)) nestedUrls.add(u)
                 }
             }
@@ -732,8 +755,8 @@ class StreamingPortalResolver(
             if (nestedList.size == 1) {
                 val deeper = resolveEmbedRecursive(
                     embedUrl = nestedList.first(),
-                    parentUrl = embedUrl,
-                    baseHeaders = baseHeaders,
+                    parentUrl = effectiveEmbedUrl,
+                    baseHeaders = mergedBaseHeaders,
                     serverName = serverName,
                     depth = depth + 1,
                     visited = visited,
@@ -752,8 +775,8 @@ class StreamingPortalResolver(
                             withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
                                 resolveEmbedRecursive(
                                     embedUrl = nested,
-                                    parentUrl = embedUrl,
-                                    baseHeaders = baseHeaders,
+                                    parentUrl = effectiveEmbedUrl,
+                                    baseHeaders = mergedBaseHeaders,
                                     serverName = serverName,
                                     depth = depth + 1,
                                     visited = visited,
@@ -944,10 +967,18 @@ class StreamingPortalResolver(
         baseHeaders["User-Agent"]?.let { merged["User-Agent"] = it }
         merged["Referer"] = embedUrl
         originOf(embedUrl)?.let { merged["Origin"] = it }
-        runCatching {
-            CookieManager.getInstance().getCookie(embedUrl)?.takeIf { it.isNotBlank() }?.let {
-                merged["Cookie"] = it
-            }
+        val baseCookie = baseHeaders["Cookie"]?.takeIf { it.isNotBlank() }
+        val cmCookie = runCatching {
+            CookieManager.getInstance().getCookie(embedUrl)?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+        val combinedCookie = when {
+            baseCookie != null && cmCookie != null -> "$cmCookie; $baseCookie"
+            baseCookie != null -> baseCookie
+            cmCookie != null -> cmCookie
+            else -> null
+        }
+        if (!combinedCookie.isNullOrBlank()) {
+            merged["Cookie"] = combinedCookie
         }
         return merged
     }

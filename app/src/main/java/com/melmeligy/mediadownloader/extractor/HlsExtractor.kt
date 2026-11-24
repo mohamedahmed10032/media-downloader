@@ -48,6 +48,23 @@ class HlsExtractor @Inject constructor(
     suspend fun extract(url: String, headers: Map<String, String>): ResolvedMedia? =
         extract(url, headers, null)
 
+    data class HlsVerificationResult(
+        val media: ResolvedMedia?,
+        val failureReason: String? = null
+    )
+
+    private data class PlaylistFetchOutcome(
+        val text: String?,
+        val headers: Map<String, String>,
+        val failureReason: String?
+    )
+
+    private data class SegmentVerifyOutcome(
+        val headers: Map<String, String>?,
+        val headInfo: HeadInfo?,
+        val failureReason: String?
+    )
+
     /**
      * Header- and quality-hint-aware variant used by the interception and HTML extraction layers.
      */
@@ -56,7 +73,7 @@ class HlsExtractor @Inject constructor(
         headers: Map<String, String>,
         heightHint: Int? = null
     ): ResolvedMedia? = withContext(Dispatchers.IO) {
-        extractOnIo(url, headers, heightHint, verifyDownloadable = false)
+        extractOnIo(url, headers, heightHint, verifyDownloadable = false).media
     }
 
     /**
@@ -69,74 +86,147 @@ class HlsExtractor @Inject constructor(
         url: String,
         headers: Map<String, String>,
         heightHint: Int? = null
-    ): ResolvedMedia? = withContext(Dispatchers.IO) {
+    ): ResolvedMedia? = extractVerifiedDetailed(url, headers, heightHint).media
+
+    /**
+     * Detailed variant of [extractVerified] that returns the exact failure stage and reason
+     * (e.g. `master HTTP 403`, `variant timeout`, `DRM protected`, `seg HTTP 403`, `seg non-media`)
+     * so callers can surface accurate diagnostics instead of a generic fallback label.
+     */
+    suspend fun extractVerifiedDetailed(
+        url: String,
+        headers: Map<String, String>,
+        heightHint: Int? = null
+    ): HlsVerificationResult = withContext(Dispatchers.IO) {
         extractOnIo(url, headers, heightHint, verifyDownloadable = true)
+    }
+
+    private fun describeException(prefix: String, e: Throwable): String = when (e) {
+        is com.melmeligy.mediadownloader.core.MediaException -> when (e.error) {
+            com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED -> "$prefix HTTP 403"
+            com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED -> "$prefix geo-blocked"
+            com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND -> "$prefix HTTP 404"
+            com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK -> "$prefix HTTP 410"
+            com.melmeligy.mediadownloader.core.AppError.SERVER_ERROR -> "$prefix ${e.message?.takeIf { it.startsWith("HTTP ") } ?: "HTTP 5xx"}"
+            else -> if (e.cause is java.net.SocketTimeoutException || e.message?.contains("timeout", ignoreCase = true) == true) {
+                "$prefix timeout"
+            } else {
+                "$prefix ${e.message?.take(24) ?: "error"}"
+            }
+        }
+        is java.net.SocketTimeoutException, is java.io.InterruptedIOException -> "$prefix timeout"
+        else -> "$prefix network error"
     }
 
     private suspend fun fetchPlaylistWithHeaderFallback(
         url: String,
         headers: Map<String, String>,
-        allowRelaxedFallback: Boolean
-    ): Pair<String, Map<String, String>>? {
+        allowRelaxedFallback: Boolean,
+        stagePrefix: String
+    ): PlaylistFetchOutcome {
+        var lastReason: String? = null
         try {
-            return http.fetchString(url, headers) to headers
+            val primaryText = http.fetchString(url, headers)
+            if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(primaryText)) {
+                return PlaylistFetchOutcome(primaryText, headers, null)
+            }
+            lastReason = "$stagePrefix non-HLS"
+            if (!allowRelaxedFallback) {
+                return PlaylistFetchOutcome(primaryText, headers, null)
+            }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
         } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
+            lastReason = describeException(stagePrefix, e)
             val isAuthBlocked = e.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ||
                 e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
-            if (!allowRelaxedFallback || !isAuthBlocked) {
-                if (allowRelaxedFallback) return null
-                throw e
+            if (!allowRelaxedFallback) throw e
+            if (!isAuthBlocked) {
+                return PlaylistFetchOutcome(null, headers, lastReason)
             }
         } catch (e: Exception) {
-            if (allowRelaxedFallback) return null
-            throw e
+            lastReason = describeException(stagePrefix, e)
+            if (!allowRelaxedFallback) throw e
+            return PlaylistFetchOutcome(null, headers, lastReason)
         }
         for (alt in ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)) {
             val text = try {
                 http.fetchString(url, alt)
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                lastReason = describeException(stagePrefix, e)
                 null
             }
             if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
-                return text!! to alt
+                return PlaylistFetchOutcome(text!!, alt, null)
+            } else if (text != null) {
+                lastReason = "$stagePrefix non-HLS"
             }
         }
-        return null
+        return PlaylistFetchOutcome(null, headers, lastReason ?: "$stagePrefix rejected")
     }
 
     private suspend fun verifySegmentDownloadable(
         segmentUrl: String,
         headers: Map<String, String>,
         isAesEncrypted: Boolean = false
-    ): Pair<Map<String, String>, HeadInfo>? {
+    ): SegmentVerifyOutcome {
         val candidates = listOf(headers) + ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
+        var lastReason: String? = null
+        var serverRejectsRange = false
         for (hdrs in candidates) {
-            val info = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
-                withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
-                    runCatching { http.probe(segmentUrl, hdrs, VERIFY_SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
+            var info: HeadInfo? = null
+            var probeThrewDead = false
+            if (!serverRejectsRange) {
+                var probeErr: Throwable? = null
+                info = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+                    withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
+                        try {
+                            http.probe(segmentUrl, hdrs, VERIFY_SEGMENT_PROBE_TIMEOUT_MS)
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            throw ce
+                        } catch (t: Throwable) {
+                            probeErr = t
+                            null
+                        }
+                    }
+                }
+                if (info != null) {
+                    val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                    val isHtmlOrJson = ct.startsWith("text/html") ||
+                        ct.startsWith("application/xhtml") ||
+                        ct.startsWith("application/json")
+                    if (info.code in 200..299 && !isHtmlOrJson) {
+                        return SegmentVerifyOutcome(hdrs, info, null)
+                    }
+                    lastReason = if (info.code in 200..299) "seg HTML/JSON" else "seg HTTP ${info.code}"
+                    if (info.code == 404 || info.code == 410) {
+                        return SegmentVerifyOutcome(null, null, lastReason)
+                    }
+                    if (info.code == 400 || info.code == 405 || info.code == 416) {
+                        serverRejectsRange = true
+                    }
+                } else if (probeErr != null) {
+                    val err = probeErr!!
+                    lastReason = describeException("seg", err)
+                    if (err is com.melmeligy.mediadownloader.core.MediaException &&
+                        (err.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                            err.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK)
+                    ) {
+                        probeThrewDead = true
+                    }
+                } else {
+                    lastReason = "seg timeout"
                 }
             }
-            if (info != null) {
-                val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-                val isHtmlOrJson = ct.startsWith("text/html") ||
-                    ct.startsWith("application/xhtml") ||
-                    ct.startsWith("application/json")
-                if (info.code in 200..299 && !isHtmlOrJson) {
-                    return hdrs to info
-                }
-                // Dead segment (404/410) will not succeed via GET or header relaxation
-                if (info.code == 404 || info.code == 410) {
-                    return null
-                }
+            if (probeThrewDead) {
+                return SegmentVerifyOutcome(null, null, lastReason ?: "seg HTTP 404")
             }
 
             // Many HLS segment CDNs (EarnVids, VidHide, Cloudflare workers) reject `Range: bytes=0-0`
             // with HTTP 400/403/405/500 or timeout, even though plain unranged GET succeeds.
-            val shouldTryUnrangedGet = info == null ||
+            val shouldTryUnrangedGet = serverRejectsRange || info == null ||
                 info.code == 400 || info.code == 403 || info.code == 405 || info.code == 416 || info.code >= 500
             if (shouldTryUnrangedGet) {
                 val getInfo = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
@@ -157,15 +247,18 @@ class HlsExtractor @Inject constructor(
                         gct.startsWith("application/xhtml") ||
                         gct.startsWith("application/json")
                     if (getInfo.code in 200..299 && !isHtmlOrJson) {
-                        return hdrs to getInfo
+                        return SegmentVerifyOutcome(hdrs, getInfo, null)
                     }
+                    lastReason = if (getInfo.code in 200..299) "seg non-media" else "seg HTTP ${getInfo.code}"
                     if (getInfo.code == 404 || getInfo.code == 410) {
-                        return null
+                        return SegmentVerifyOutcome(null, null, lastReason)
                     }
+                } else if (lastReason == null) {
+                    lastReason = "seg timeout"
                 }
             }
         }
-        return null
+        return SegmentVerifyOutcome(null, null, lastReason ?: "seg rejected")
     }
 
     private suspend fun extractOnIo(
@@ -173,13 +266,21 @@ class HlsExtractor @Inject constructor(
         headers: Map<String, String>,
         heightHint: Int?,
         verifyDownloadable: Boolean
-    ): ResolvedMedia? {
-        if (ExtractorRegistry.isConfirmedHtml(url)) return null
-        val fetched = fetchPlaylistWithHeaderFallback(url, headers, allowRelaxedFallback = verifyDownloadable)
-            ?: return null
-        val text = fetched.first
-        var effectiveHeaders = fetched.second
-        if (!com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) return null
+    ): HlsVerificationResult {
+        if (ExtractorRegistry.isConfirmedHtml(url)) {
+            return HlsVerificationResult(null, "master confirmed HTML")
+        }
+        val fetched = fetchPlaylistWithHeaderFallback(
+            url = url,
+            headers = headers,
+            allowRelaxedFallback = verifyDownloadable,
+            stagePrefix = "master"
+        )
+        val text = fetched.text ?: return HlsVerificationResult(null, fetched.failureReason ?: "master fetch failed")
+        var effectiveHeaders = fetched.headers
+        if (!com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
+            return HlsVerificationResult(null, "master non-HLS")
+        }
 
         val streams = mutableListOf<MediaStream>()
 
@@ -228,6 +329,7 @@ class HlsExtractor @Inject constructor(
             // Probe first variant playlist (trying a second variant if verifyDownloadable and the first fails)
             var probedVariant: RawVariant? = rawVariants.firstOrNull()
             var variantText: String? = null
+            var variantFailReason: String? = null
             val variantsToProbe = if (verifyDownloadable) rawVariants.take(2) else rawVariants.take(1)
             for (candidateVar in variantsToProbe) {
                 val fetchedVar = withTimeoutOrNull(VARIANT_PLAYLIST_TIMEOUT_MS) {
@@ -235,15 +337,20 @@ class HlsExtractor @Inject constructor(
                         fetchPlaylistWithHeaderFallback(
                             url = candidateVar.variantUrl,
                             headers = effectiveHeaders,
-                            allowRelaxedFallback = verifyDownloadable
+                            allowRelaxedFallback = verifyDownloadable,
+                            stagePrefix = "variant"
                         )
                     }
                 }
-                if (fetchedVar != null && com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(fetchedVar.first)) {
+                if (fetchedVar?.text != null &&
+                    com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(fetchedVar.text)
+                ) {
                     probedVariant = candidateVar
-                    variantText = fetchedVar.first
-                    effectiveHeaders = fetchedVar.second
+                    variantText = fetchedVar.text
+                    effectiveHeaders = fetchedVar.headers
                     break
+                } else {
+                    variantFailReason = fetchedVar?.failureReason ?: "variant timeout"
                 }
             }
 
@@ -252,13 +359,18 @@ class HlsExtractor @Inject constructor(
             } else null
 
             if (sanitizedFirstVariant?.hasUnsupportedDrm == true) {
-                return null
+                return HlsVerificationResult(null, "DRM protected")
             }
 
             var verifiedSegProbe: Pair<HlsParsedSegment, HeadInfo>? = null
             if (verifyDownloadable) {
-                val mediaSegs = sanitizedFirstVariant?.segments?.filter { !it.isInitMap }.orEmpty()
-                if (mediaSegs.isEmpty()) return null
+                if (sanitizedFirstVariant == null) {
+                    return HlsVerificationResult(null, variantFailReason ?: "variant fetch failed")
+                }
+                val mediaSegs = sanitizedFirstVariant.segments.filter { !it.isInitMap }
+                if (mediaSegs.isEmpty()) {
+                    return HlsVerificationResult(null, "0 HLS segments")
+                }
                 // Verify an interior segment (so the probe also calibrates bitrate), falling back to seg[0]
                 // if the interior segment fails (some CDNs only warm/sign initial segments eagerly).
                 val primarySeg = if (mediaSegs.size >= 3) mediaSegs[mediaSegs.size / 2] else mediaSegs.first()
@@ -268,15 +380,19 @@ class HlsExtractor @Inject constructor(
                     listOf(primarySeg)
                 }
                 var verifiedPair: Pair<HlsParsedSegment, Pair<Map<String, String>, HeadInfo>>? = null
+                var lastSegFail: String? = null
                 for (candSeg in segCandidates) {
                     val isAes = candSeg.keySpec.method == HlsEncryptionMethod.AES_128
                     val res = verifySegmentDownloadable(candSeg.url, effectiveHeaders, isAesEncrypted = isAes)
-                    if (res != null) {
-                        verifiedPair = candSeg to res
+                    if (res.headers != null && res.headInfo != null) {
+                        verifiedPair = candSeg to (res.headers to res.headInfo)
                         break
+                    } else if (!res.failureReason.isNullOrBlank()) {
+                        lastSegFail = res.failureReason
                     }
                 }
-                val (winningSeg, winResult) = verifiedPair ?: return null
+                val (winningSeg, winResult) = verifiedPair
+                    ?: return HlsVerificationResult(null, lastSegFail ?: "seg rejected")
                 effectiveHeaders = winResult.first
                 verifiedSegProbe = winningSeg to winResult.second
             }
@@ -451,9 +567,13 @@ class HlsExtractor @Inject constructor(
         if (streams.isEmpty()) {
             if (text.contains("#EXTINF")) {
                 val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, url)
-                if (sanitized.hasUnsupportedDrm) return null
+                if (sanitized.hasUnsupportedDrm) {
+                    return HlsVerificationResult(null, "DRM protected")
+                }
                 val mediaSegments = sanitized.segments.filter { !it.isInitMap }
-                if (verifyDownloadable && mediaSegments.isEmpty()) return null
+                if (verifyDownloadable && mediaSegments.isEmpty()) {
+                    return HlsVerificationResult(null, "0 HLS segments")
+                }
                 val totalDurationSeconds = sanitized.totalDurationSec.roundToLong()
 
                 val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(url)
@@ -473,11 +593,23 @@ class HlsExtractor @Inject constructor(
                 } else null
 
                 if (verifyDownloadable) {
-                    val firstSeg = mediaSegments.first()
-                    val isAes = firstSeg.keySpec.method == HlsEncryptionMethod.AES_128
-                    val (verifiedHeaders, _) = verifySegmentDownloadable(firstSeg.url, effectiveHeaders, isAesEncrypted = isAes)
-                        ?: return null
+                    val primarySeg = mediaSegments.first()
+                    val altSeg = if (mediaSegments.size >= 3) mediaSegments[mediaSegments.size / 2] else null
+                    val segCandidates = listOfNotNull(primarySeg, altSeg?.takeIf { it.url != primarySeg.url })
+                    var verifiedHeaders: Map<String, String>? = null
+                    var lastSegFail: String? = null
+                    for (candSeg in segCandidates) {
+                        val isAes = candSeg.keySpec.method == HlsEncryptionMethod.AES_128
+                        val res = verifySegmentDownloadable(candSeg.url, effectiveHeaders, isAesEncrypted = isAes)
+                        if (res.headers != null) {
+                            verifiedHeaders = res.headers
+                            break
+                        } else if (!res.failureReason.isNullOrBlank()) {
+                            lastSegFail = res.failureReason
+                        }
+                    }
                     effectiveHeaders = verifiedHeaders
+                        ?: return HlsVerificationResult(null, lastSegFail ?: "seg rejected")
                 }
 
                 // 2. Otherwise probe representative media segment(s)
@@ -561,7 +693,7 @@ class HlsExtractor @Inject constructor(
                     headers = streamHeaders
                 )
             } else {
-                return null
+                return HlsVerificationResult(null, "master empty playlist")
             }
         }
 
@@ -571,7 +703,10 @@ class HlsExtractor @Inject constructor(
             .sortedByDescending { it.bitrateKbps ?: 0 }
         val sorted = sortedVideos + sortedAudios
         val title = UrlUtils.host(url)?.let { "HLS video ($it)" } ?: "HLS video"
-        return ResolvedMedia(sourceUrl = url, title = title, streams = sorted, extractor = name)
+        return HlsVerificationResult(
+            media = ResolvedMedia(sourceUrl = url, title = title, streams = sorted, extractor = name),
+            failureReason = null
+        )
     }
 
     private suspend fun computePeakBandwidthCalibrationScale(

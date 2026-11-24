@@ -59,6 +59,7 @@ class ExtractionLatencyBenchmarkTest {
 
     @Before
     fun setUp() {
+        HtmlMediaExtractor.clearAllCloudflareHintsForTests()
         tikwmRequests.set(0)
         tiktokHtmlRequests.set(0)
         tiktokVideoProbes.set(0)

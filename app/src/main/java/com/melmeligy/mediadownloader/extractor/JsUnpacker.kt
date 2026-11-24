@@ -432,6 +432,22 @@ object JsUnpacker {
                     it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
                 }
             }
+            !baseUrl.isNullOrBlank() &&
+                !trimmed.any { it.isWhitespace() } &&
+                !trimmed.substringBefore('/').contains(':') &&
+                (trimmed.contains(".m3u8", ignoreCase = true) ||
+                    trimmed.contains(".mpd", ignoreCase = true) ||
+                    trimmed.contains(".mp4", ignoreCase = true) ||
+                    trimmed.contains(".webm", ignoreCase = true) ||
+                    trimmed.contains(".mkv", ignoreCase = true) ||
+                    trimmed.contains("hls/", ignoreCase = true) ||
+                    trimmed.contains("hls2/", ignoreCase = true) ||
+                    trimmed.contains("hls3/", ignoreCase = true) ||
+                    trimmed.contains("hls4/", ignoreCase = true)) -> {
+                UrlUtils.resolveUrl(baseUrl, trimmed).takeIf {
+                    it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+                }
+            }
             else -> null
         }
     }

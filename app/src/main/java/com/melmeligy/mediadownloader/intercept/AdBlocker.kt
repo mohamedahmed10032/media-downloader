@@ -152,7 +152,17 @@ object AdBlocker {
         "wecima",
         "mycima",
         "okstream",
-        "updown"
+        "updown",
+        "vinovo",
+        "vidaraa",
+        "fastved",
+        "luluvdo",
+        "abstream",
+        "movearnpre",
+        "dingtezuni",
+        "dintezuvio",
+        "callistanise",
+        "vidroba"
     )
 
     private val POPUP_REDIRECT_PATH_MARKERS = listOf(

@@ -491,8 +491,18 @@ class ExtractorHttp {
                     )
                 }
                 val body = response.body ?: return null
-                val prefix = ByteArray(64)
-                val read = runCatching { body.byteStream().read(prefix) }.getOrDefault(-1)
+                val total = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                val prefix = ByteArray(com.melmeligy.mediadownloader.download.HlsSegmentDownloader.MAX_PREFIX_SCAN_BYTES)
+                val read = runCatching {
+                    val stream = body.byteStream()
+                    var offset = 0
+                    while (offset < prefix.size) {
+                        val n = stream.read(prefix, offset, prefix.size - offset)
+                        if (n <= 0) break
+                        offset += n
+                    }
+                    offset
+                }.getOrDefault(-1)
                 // Abort call immediately so OkHttp does not waste bandwidth draining a multi-MB segment
                 runCatching { call.cancel() }
                 if (read <= 0) return null
@@ -500,7 +510,8 @@ class ExtractorHttp {
                     bytes = prefix,
                     length = read,
                     contentType = ct,
-                    isAesEncrypted = isAesEncrypted
+                    isAesEncrypted = isAesEncrypted,
+                    totalContentLength = total
                 )
                 if (!valid) {
                     return HeadInfo(
@@ -511,7 +522,6 @@ class ExtractorHttp {
                         finalUrl = response.request.url.toString()
                     )
                 }
-                val total = response.header("Content-Length")?.toLongOrNull() ?: -1L
                 val acceptsRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
                 HeadInfo(
                     code = response.code,
@@ -745,45 +755,63 @@ class ExtractorHttp {
             headers: Map<String, String>,
             includeBareNoReferer: Boolean = false
         ): List<Map<String, String>> {
-            val out = ArrayList<Map<String, String>>(3)
+            val out = ArrayList<Map<String, String>>(4)
+            fun addUnique(candidate: Map<String, String>) {
+                if (candidate != headers && out.none { it == candidate }) {
+                    out += candidate
+                }
+            }
+
             val originKey = headers.keys.firstOrNull { it.equals("Origin", ignoreCase = true) }
             val refererKey = headers.keys.firstOrNull { it.equals("Referer", ignoreCase = true) }
             val refererVal = refererKey?.let { headers[it] }?.trim()
 
-            // Variant 1: strip Origin while keeping Referer, Cookie, User-Agent
-            if (originKey != null) {
-                val noOrigin = LinkedHashMap(headers).apply { remove(originKey) }
-                out += noOrigin
-            }
-
-            // Variant 2: origin-only Referer (`https://host/`) without Origin
-            if (!refererVal.isNullOrBlank()) {
-                val originOnly = runCatching {
+            val refererOrigin: String? = if (!refererVal.isNullOrBlank()) {
+                runCatching {
                     val uri = java.net.URI(UrlUtils.encodeNonAsciiUrl(refererVal))
                     val scheme = uri.scheme
                     val host = uri.host
                     if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
-                        val base = if (uri.port > 0) "$scheme://$host:${uri.port}/" else "$scheme://$host/"
-                        base.takeUnless { it.equals(refererVal, ignoreCase = true) }
+                        if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
                     } else null
                 }.getOrNull()
-                if (originOnly != null) {
-                    val v2 = LinkedHashMap(headers).apply {
-                        if (originKey != null) remove(originKey)
-                        if (refererKey != null) remove(refererKey)
-                        put("Referer", originOnly)
-                    }
-                    if (out.none { it == v2 }) out += v2
+            } else null
+
+            // Variant 1: Chromium strict-origin-when-cross-origin CORS pair (`Referer: https://host/` + `Origin: https://host`)
+            if (refererOrigin != null) {
+                val corsOriginPair = LinkedHashMap(headers).apply {
+                    if (refererKey != null) remove(refererKey)
+                    if (originKey != null) remove(originKey)
+                    put("Referer", "$refererOrigin/")
+                    put("Origin", refererOrigin)
                 }
+                addUnique(corsOriginPair)
             }
 
-            // Variant 3 (optional): strip both Referer and Origin (keep User-Agent & Cookie)
-            if (includeBareNoReferer && (refererKey != null || originKey != null)) {
+            // Variant 2: strip Origin while keeping Referer, Cookie, User-Agent
+            if (originKey != null) {
+                val noOrigin = LinkedHashMap(headers).apply { remove(originKey) }
+                addUnique(noOrigin)
+            }
+
+            // Variant 3: origin-only Referer (`https://host/`) without Origin
+            if (refererOrigin != null) {
+                val originOnlyReferer = "$refererOrigin/"
                 val v3 = LinkedHashMap(headers).apply {
                     if (originKey != null) remove(originKey)
                     if (refererKey != null) remove(refererKey)
+                    put("Referer", originOnlyReferer)
                 }
-                if (out.none { it == v3 }) out += v3
+                addUnique(v3)
+            }
+
+            // Variant 4 (optional): strip both Referer and Origin (keep User-Agent & Cookie)
+            if (includeBareNoReferer && (refererKey != null || originKey != null)) {
+                val v4 = LinkedHashMap(headers).apply {
+                    if (originKey != null) remove(originKey)
+                    if (refererKey != null) remove(refererKey)
+                }
+                addUnique(v4)
             }
 
             return out

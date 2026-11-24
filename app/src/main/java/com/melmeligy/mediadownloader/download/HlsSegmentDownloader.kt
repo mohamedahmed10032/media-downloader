@@ -403,6 +403,8 @@ class HlsSegmentDownloader @Inject constructor(
                             }
 
                             var checkedSignature = false
+                            val isDisguisedCt = ct.startsWith("image/") || ct.startsWith("text/plain")
+                            val totalContentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
                             effectiveInput.use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
@@ -410,9 +412,33 @@ class HlsSegmentDownloader @Inject constructor(
                                     if (read == -1) break
                                     if (!checkedSignature) {
                                         checkedSignature = true
-                                        if (!isValidSegmentPrefix(buffer, read, ct, isAesEncrypted = keyBytes != null)) {
+                                        var bufferedLen = read
+                                        if (isDisguisedCt && bufferedLen < MAX_PREFIX_SCAN_BYTES) {
+                                            while (bufferedLen < MAX_PREFIX_SCAN_BYTES) {
+                                                currentCoroutineContext().ensureActive()
+                                                val extra = input.read(
+                                                    buffer,
+                                                    bufferedLen,
+                                                    minOf(buffer.size, MAX_PREFIX_SCAN_BYTES) - bufferedLen
+                                                )
+                                                if (extra == -1) break
+                                                bufferedLen += extra
+                                            }
+                                        }
+                                        if (!isValidSegmentPrefix(
+                                                bytes = buffer,
+                                                length = bufferedLen,
+                                                contentType = ct,
+                                                isAesEncrypted = keyBytes != null,
+                                                totalContentLength = totalContentLength
+                                            )
+                                        ) {
                                             throw MediaException(AppError.EXPIRED_LINK, "HLS segment returned HTML/JSON error page")
                                         }
+                                        output.write(buffer, 0, bufferedLen)
+                                        attemptBytes += bufferedLen
+                                        written.addAndGet(bufferedLen.toLong())
+                                        continue
                                     }
                                     output.write(buffer, 0, read)
                                     attemptBytes += read
@@ -569,17 +595,22 @@ class HlsSegmentDownloader @Inject constructor(
     companion object {
         private const val CONCURRENT_SEGMENTS = 8
         private const val AES_128_KEY_SIZE = 16
+        internal const val MAX_PREFIX_SCAN_BYTES = 4096
+        private const val MIN_UNSYNCED_DISGUISED_IMAGE_BYTES = 8_192L
 
         /**
          * Validates the leading bytes of an HLS segment so disguised `image/` or `text/plain`
          * MPEG-TS (`0x47`), fMP4 (`ftyp`/`moof`/`styp`), and decrypted AES-128 segments are
-         * accepted while HTML (`<!doctype`, `<html`) and JSON (`{`, `[`) error pages are rejected.
+         * accepted (including fake PNG/JPEG/GIF wrapper headers up to 4096 bytes) while HTML
+         * (`<!doctype`, `<html`), JSON (`{`, `[`), plain-text error pages, and tiny tracking
+         * images are rejected.
          */
         internal fun isValidSegmentPrefix(
             bytes: ByteArray,
             length: Int,
             contentType: String,
-            isAesEncrypted: Boolean
+            isAesEncrypted: Boolean,
+            totalContentLength: Long = -1L
         ): Boolean {
             if (length <= 0) return false
             val sampleLen = minOf(length, 64)
@@ -616,19 +647,40 @@ class HlsSegmentDownloader @Inject constructor(
             // 2. If content-type is disguised (image/* or text/plain), verify binary media signature
             val ct = contentType.lowercase()
             if (ct.startsWith("image/") || ct.startsWith("text/plain")) {
-                // MPEG-TS sync byte (0x47 at offset 0 or after a small disguised PNG/GIF/JPEG wrapper header)
-                val tsSyncFound = (bytes[0].toInt() and 0xFF) == 0x47 ||
-                    (0 until minOf(length, 32)).any { off ->
-                        (bytes[off].toInt() and 0xFF) == 0x47 &&
-                            (off + 188 >= length || (bytes[off + 188].toInt() and 0xFF) == 0x47)
+                val isGifMagic = length >= 6 &&
+                    bytes[0] == 'G'.code.toByte() &&
+                    bytes[1] == 'I'.code.toByte() &&
+                    bytes[2] == 'F'.code.toByte() &&
+                    bytes[3] == '8'.code.toByte() &&
+                    (bytes[4] == '7'.code.toByte() || bytes[4] == '9'.code.toByte()) &&
+                    bytes[5] == 'a'.code.toByte()
+                val scanLimit = minOf(length, MAX_PREFIX_SCAN_BYTES)
+                // MPEG-TS sync byte (0x47 at offset 0 or after a disguised PNG/GIF/JPEG/WebP wrapper header up to 4096B).
+                // For non-zero offsets (e.g. offset 3 'G' in PNG magic), require a second 0x47 at +188 to avoid false positives.
+                val tsSyncAtZero = !isGifMagic &&
+                    (bytes[0].toInt() and 0xFF) == 0x47 &&
+                    (length < 189 || (bytes[188].toInt() and 0xFF) == 0x47)
+                val tsSyncFound = tsSyncAtZero ||
+                    (1 until scanLimit).any { off ->
+                        off + 188 < length &&
+                            (bytes[off].toInt() and 0xFF) == 0x47 &&
+                            (bytes[off + 188].toInt() and 0xFF) == 0x47
                     }
                 if (tsSyncFound) return true
 
-                // fMP4 box signature at bytes 4..7 (ftyp, moof, styp, sidx, mdat)
-                if (length >= 8) {
-                    val box = String(bytes, 4, 4, Charsets.ISO_8859_1)
-                    if (box == "ftyp" || box == "moof" || box == "styp" || box == "sidx" || box == "mdat") {
-                        return true
+                // fMP4 box signature at offset 4 (or embedded after a disguised image wrapper header)
+                val boxLimit = minOf(length - 4, 512)
+                if (boxLimit >= 4) {
+                    var off = 4
+                    while (off <= boxLimit) {
+                        val b0 = bytes[off].toInt() and 0xFF
+                        if (b0 == 'f'.code || b0 == 'm'.code || b0 == 's'.code) {
+                            val box = String(bytes, off, 4, Charsets.ISO_8859_1)
+                            if (box == "ftyp" || box == "moof" || box == "styp" || box == "sidx" || box == "mdat") {
+                                return true
+                            }
+                        }
+                        off++
                     }
                 }
 
@@ -639,6 +691,9 @@ class HlsSegmentDownloader @Inject constructor(
                 }
                 // Reject plain ASCII text error pages served as text/plain
                 if (ct.startsWith("text/plain")) return false
+                // For disguised image/* segments without TS/fMP4 sync in the first 4096B, reject tiny tracking/error pixels
+                if (totalContentLength in 1L until MIN_UNSYNCED_DISGUISED_IMAGE_BYTES) return false
+                if (totalContentLength < 0L && length < 512) return false
             }
 
             return true

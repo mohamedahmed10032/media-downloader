@@ -358,6 +358,7 @@ class InstantTikTokQualityAndWeCimaRegressionTest {
         assertEquals(null, result)
         coVerify(exactly = 1) { headless.extract(wecimaUrl, any()) }
         val diag = tracker.peekDiagnosticReason()
+        HtmlMediaExtractor.clearAllCloudflareHintsForTests()
         assertNotNull("Expected Cloudflare/403 diagnostic reason for ShareDialogActivity", diag)
         assertTrue("Diagnostic should mention Cloudflare / HTTP 403, got: $diag", diag!!.contains("403") || diag.contains("Cloudflare"))
     }
