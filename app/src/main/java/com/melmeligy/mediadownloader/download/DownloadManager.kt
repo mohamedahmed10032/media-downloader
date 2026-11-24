@@ -76,6 +76,7 @@ class DownloadManager private constructor(
     private val thumbnailCache: DownloadThumbnailCache?,
     private val availableBytesProvider: (File) -> Long,
     private val mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>?,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator? = null,
     @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
 
@@ -91,7 +92,8 @@ class DownloadManager private constructor(
         notifier: DownloadNotifier,
         dispatchers: DispatcherProvider,
         thumbnailCache: DownloadThumbnailCache,
-        mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>
+        mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
     ) : this(
         context = context,
         repository = repository,
@@ -105,6 +107,7 @@ class DownloadManager private constructor(
         thumbnailCache = thumbnailCache,
         availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
         mediaRepository = mediaRepository,
+        priorityCoordinator = priorityCoordinator,
         marker = true
     )
 
@@ -383,7 +386,11 @@ class DownloadManager private constructor(
                         ?.invalidateCache(existing.sourceUrl)
                     val resolved = withContext(dispatchers.io) {
                         withTimeoutOrNull(SMART_RETRY_RESOLVE_TIMEOUT_MS) {
-                            repo.resolve(existing.sourceUrl)
+                            if (repo is com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl) {
+                                repo.resolveBackground(existing.sourceUrl)
+                            } else {
+                                repo.resolve(existing.sourceUrl)
+                            }
                         }
                     } ?: return@runCatching null
                     selectBestRefreshStream(existing, resolved.streams)
@@ -543,9 +550,11 @@ class DownloadManager private constructor(
                 runOne(item, this@coroutineScope)
             }
             runningJobs[item.id] = job
+            priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
             job.invokeOnCompletion {
                 jobIntents.remove(job)
                 runningJobs.remove(item.id, job)
+                priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
                 queueSignal.trySend(Unit)
             }
             job.start()
@@ -577,6 +586,7 @@ class DownloadManager private constructor(
                 }
             }
         } finally {
+            priorityCoordinator?.setActiveDownloadCount(0)
             settingsObserver.cancel()
         }
     }

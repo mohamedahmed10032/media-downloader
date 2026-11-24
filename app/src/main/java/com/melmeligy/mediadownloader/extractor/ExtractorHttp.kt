@@ -148,8 +148,21 @@ class ExtractorHttp {
     private val client: OkHttpClient
     private val service: RawContentService?
 
-    private val probeClient: OkHttpClient by lazy {
+    private val extractionDispatcher: okhttp3.Dispatcher by lazy {
+        okhttp3.Dispatcher().apply {
+            maxRequests = 48
+            maxRequestsPerHost = 16
+        }
+    }
+
+    private val extractionClient: OkHttpClient by lazy {
         client.newBuilder()
+            .dispatcher(extractionDispatcher)
+            .build()
+    }
+
+    private val probeClient: OkHttpClient by lazy {
+        extractionClient.newBuilder()
             .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(3, TimeUnit.SECONDS)
             .writeTimeout(3, TimeUnit.SECONDS)
@@ -158,7 +171,7 @@ class ExtractorHttp {
     }
 
     private val redirectClient: OkHttpClient by lazy {
-        client.newBuilder()
+        extractionClient.newBuilder()
             .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(3, TimeUnit.SECONDS)
             .callTimeout(3500, TimeUnit.MILLISECONDS)
@@ -168,7 +181,7 @@ class ExtractorHttp {
     }
 
     private val noRedirectClient: OkHttpClient by lazy {
-        client.newBuilder()
+        extractionClient.newBuilder()
             .connectTimeout(2, TimeUnit.SECONDS)
             .readTimeout(2, TimeUnit.SECONDS)
             .callTimeout(2200, TimeUnit.MILLISECONDS)
@@ -256,7 +269,7 @@ class ExtractorHttp {
                     .header("X-Internal-Download", "true")
                     .get()
                     .build()
-                val effectiveClient = clientWithScopedTimeout(client)
+                val effectiveClient = clientWithScopedTimeout(extractionClient)
                 try {
                     executeTracked(effectiveClient, request) { response ->
                         val ct = response.header("Content-Type")
@@ -314,7 +327,7 @@ class ExtractorHttp {
     }.getOrNull()
 
     /**
-     * Fetches [url] as HTML using [client] and returns the body alongside any session cookies
+     * Fetches [url] as HTML using [extractionClient] and returns the body alongside any session cookies
      * (`Set-Cookie` across redirects + active [okhttp3.CookieJar] cookies).
      */
     suspend fun fetchHtmlWithCookies(
@@ -326,7 +339,7 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .get()
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             executeTracked(effectiveClient, request) { response ->
                 val ct = response.header("Content-Type")
@@ -388,7 +401,7 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .post(jsonBody.toRequestBody(mediaType))
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             return executeTracked(effectiveClient, request) { response ->
                 if (!response.isSuccessful) throw mapHttpError(response.code)
@@ -412,7 +425,7 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .post(formBody.toRequestBody(mediaType))
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             return executeTracked(effectiveClient, request) { response ->
                 if (!response.isSuccessful) throw mapHttpError(response.code)

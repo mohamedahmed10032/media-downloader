@@ -72,6 +72,7 @@ class ShareDialogActivity : ComponentActivity() {
 
             DisposableEffect(Unit) {
                 val listener = Consumer<Intent> { newIntent ->
+                    setIntent(newIntent)
                     extractUrl(newIntent)?.let { nextUrl ->
                         currentUrl = nextUrl
                         qualityViewModel.resolve(nextUrl)
@@ -102,6 +103,7 @@ class ShareDialogActivity : ComponentActivity() {
                         finish()
                     },
                     onOpenInBrowser = { targetUrl ->
+                        qualityViewModel.cancelResolve()
                         val browserIntent = Intent(this@ShareDialogActivity, MainActivity::class.java).apply {
                             action = Intent.ACTION_VIEW
                             data = android.net.Uri.parse(targetUrl)
@@ -110,13 +112,17 @@ class ShareDialogActivity : ComponentActivity() {
                         startActivity(browserIntent)
                         finish()
                     },
-                    onDismiss = { finish() }
+                    onDismiss = {
+                        qualityViewModel.cancelResolve()
+                        finish()
+                    }
                 )
             }
         }
     }
 
     override fun finish() {
+        qualityViewModel.cancelResolve()
         super.finish()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, android.R.anim.fade_out)
@@ -149,10 +155,6 @@ private fun ShareOverlaySheet(
     val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
-
-    LaunchedEffect(url) {
-        viewModel.resolve(url)
-    }
 
     LaunchedEffect(Unit) {
         viewModel.queuedCount.collect { count -> onQueued(count) }

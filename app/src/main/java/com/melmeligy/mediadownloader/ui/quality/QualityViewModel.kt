@@ -145,7 +145,7 @@ class QualityViewModel : ViewModel {
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
-        progressTracker.reset()
+        val sessionId = progressTracker.beginSession()
 
         // Synchronous cache fast-path: render immediately without flashing the skeleton loader.
         if (!forceRetry) {
@@ -163,13 +163,17 @@ class QualityViewModel : ViewModel {
 
         val job = viewModelScope.launch {
             val nextState = try {
-                Resource.Success(mediaRepository.resolve(targetUrl))
+                Resource.Success(
+                    progressTracker.runInSession(sessionId) {
+                        mediaRepository.resolve(targetUrl)
+                    }
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: MediaException) {
                 val explicit = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
                 val diagnostic = explicit
-                    ?: progressTracker.peekDiagnosticReason()
+                    ?: progressTracker.peekDiagnosticReasonForSession(sessionId)
                     ?: if (e.error == AppError.NO_MEDIA_FOUND) {
                         "No playable video or audio stream was exposed by this page."
                     } else null
@@ -177,7 +181,9 @@ class QualityViewModel : ViewModel {
             } catch (e: Exception) {
                 Resource.Error(AppError.GENERIC, e.message)
             }
-            if (currentCoroutineContext()[Job]?.isActive == true) {
+            if (currentCoroutineContext()[Job]?.isActive == true &&
+                sessionId == progressTracker.activeSessionId()
+            ) {
                 _state.value = nextState
                 if (nextState is Resource.Success) {
                     launchBackgroundSizeRefinement(nextState.data, normalizedTarget)

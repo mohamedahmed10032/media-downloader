@@ -27,6 +27,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
@@ -70,6 +71,8 @@ class HeadlessWebExtractor @Inject constructor(
         runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
     }
 
+    private val webViewMutex = kotlinx.coroutines.sync.Mutex()
+
     private val resRegex = Regex("(?:^|[^0-9])(2160|1440|1080|720|540|480|360|240)p?(?:[^0-9]|$)", RegexOption.IGNORE_CASE)
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -77,6 +80,15 @@ class HeadlessWebExtractor @Inject constructor(
         targetUrl: String,
         timeoutMs: Long = 7_500L,
         socialEmbedFastMode: Boolean = false
+    ): ResolvedMedia? = webViewMutex.withLock {
+        extractSerialized(targetUrl, timeoutMs, socialEmbedFastMode)
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun extractSerialized(
+        targetUrl: String,
+        timeoutMs: Long,
+        socialEmbedFastMode: Boolean
     ): ResolvedMedia? = coroutineScope {
         val isSocialFastMode = socialEmbedFastMode || UrlUtils.isDedicatedSocialPlatformUrl(targetUrl)
         val effectiveTimeoutMs = if (isSocialFastMode) minOf(timeoutMs, SOCIAL_FAST_TIMEOUT_MS) else timeoutMs
@@ -246,6 +258,7 @@ class HeadlessWebExtractor @Inject constructor(
 
         lateinit var tempEngineRef: MediaInterceptionEngine
         var hybridPortalJob: kotlinx.coroutines.Deferred<StreamingPortalResolver.PortalExtractionResult>? = null
+        var hybridAjaxJob: kotlinx.coroutines.Deferred<StreamingPortalResolver.PortalExtractionResult>? = null
 
         try {
             withTimeoutOrNull(hardCeilingMs) {
@@ -261,7 +274,7 @@ class HeadlessWebExtractor @Inject constructor(
                         javaScriptCanOpenWindowsAutomatically = false
                         allowFileAccess = false
                         allowContentAccess = false
-                        userAgentString = Constants.DEFAULT_USER_AGENT
+                        userAgentString = sanitizeWebViewUserAgent(userAgentString)
                         lastWebViewUserAgent = userAgentString
                     }
                     CookieManager.getInstance().setAcceptCookie(true)
@@ -463,38 +476,103 @@ class HeadlessWebExtractor @Inject constructor(
             val verifiedPayloadKeys = ConcurrentHashMap.newKeySet<String>()
             val webViewUa = lastWebViewUserAgent
 
+            fun collectCompletedHybridResult(): Boolean {
+                val jobs = listOfNotNull(hybridPortalJob, hybridAjaxJob)
+                for (job in jobs) {
+                    if (job.isCompleted && !job.isCancelled) {
+                        val res = runCatching { job.getCompleted() }.getOrNull()
+                        if (res != null && res.streams.isNotEmpty()) {
+                            verifiedStreams.addAll(res.streams)
+                            if (!res.posterUrl.isNullOrBlank() && capturedThumbRef.get().isNullOrBlank()) {
+                                capturedThumbRef.set(res.posterUrl)
+                            }
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+
             fun maybeStartHybridPortal(
                 embeds: Collection<String>,
                 ajaxServers: Collection<StreamingPortalResolver.AjaxServerSpec> = discoveredAjaxServers
             ) {
-                if (hybridPortalJob != null || (embeds.isEmpty() && ajaxServers.isEmpty())) return
-                val promotableNow = selectPromotableEmbedUrls(
-                    outerPageUrl = currentPageUrl,
-                    candidates = embeds,
-                    maxEmbeds = StreamingPortalResolver.MAX_SERVERS,
-                    allowDirectMediaFiles = true
-                )
-                val ajaxSnapshot = ajaxServers.toList()
+                val canLaunchEmbeds = hybridPortalJob == null && embeds.isNotEmpty()
+                val canLaunchAjax = hybridAjaxJob == null && ajaxServers.isNotEmpty()
+                if (!canLaunchEmbeds && !canLaunchAjax) return
+
+                val promotableNow = if (canLaunchEmbeds) {
+                    selectPromotableEmbedUrls(
+                        outerPageUrl = currentPageUrl,
+                        candidates = embeds,
+                        maxEmbeds = StreamingPortalResolver.MAX_SERVERS,
+                        allowDirectMediaFiles = true
+                    )
+                } else {
+                    emptyList()
+                }
+                val ajaxSnapshot = if (canLaunchAjax) ajaxServers.toList() else emptyList()
                 if (promotableNow.isEmpty() && ajaxSnapshot.isEmpty()) return
+
                 cookieFlusher()
                 val hybridHeaders = LinkedHashMap<String, String>().apply {
                     put("User-Agent", webViewUa)
                     put("Referer", currentPageUrl)
                     cookieLookup(currentPageUrl)?.takeIf { it.isNotBlank() }?.let { put("Cookie", it) }
                 }
-                com.melmeligy.mediadownloader.core.AppLogger.d(
-                    "Headless",
-                    "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s) + ${ajaxSnapshot.size} AJAX server(s)"
-                )
-                hybridPortalJob = async(dispatchers.io) {
-                    runCatching {
-                        portalResolver.resolveHybridDomAndAjax(
-                            pageUrl = currentPageUrl,
-                            embedUrls = promotableNow,
-                            ajaxServers = ajaxSnapshot,
-                            baseHeaders = hybridHeaders
-                        )
-                    }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+
+                if (promotableNow.isNotEmpty() && ajaxSnapshot.isNotEmpty() && hybridPortalJob == null && hybridAjaxJob == null) {
+                    com.melmeligy.mediadownloader.core.AppLogger.d(
+                        "Headless",
+                        "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s) + ${ajaxSnapshot.size} AJAX server(s)"
+                    )
+                    val combined = async(dispatchers.extractionIo) {
+                        runCatching {
+                            portalResolver.resolveHybridDomAndAjax(
+                                pageUrl = currentPageUrl,
+                                embedUrls = promotableNow,
+                                ajaxServers = ajaxSnapshot,
+                                baseHeaders = hybridHeaders
+                            )
+                        }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                    }
+                    hybridPortalJob = combined
+                    hybridAjaxJob = combined
+                    return
+                }
+
+                if (promotableNow.isNotEmpty() && hybridPortalJob == null) {
+                    com.melmeligy.mediadownloader.core.AppLogger.d(
+                        "Headless",
+                        "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s)"
+                    )
+                    hybridPortalJob = async(dispatchers.extractionIo) {
+                        runCatching {
+                            portalResolver.resolveHybridDomAndAjax(
+                                pageUrl = currentPageUrl,
+                                embedUrls = promotableNow,
+                                ajaxServers = emptyList(),
+                                baseHeaders = hybridHeaders
+                            )
+                        }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                    }
+                }
+
+                if (ajaxSnapshot.isNotEmpty() && hybridAjaxJob == null) {
+                    com.melmeligy.mediadownloader.core.AppLogger.d(
+                        "Headless",
+                        "Hybrid parallel StreamingPortalResolver launched for ${ajaxSnapshot.size} newly discovered AJAX server(s)"
+                    )
+                    hybridAjaxJob = async(dispatchers.extractionIo) {
+                        runCatching {
+                            portalResolver.resolveHybridDomAndAjax(
+                                pageUrl = currentPageUrl,
+                                embedUrls = emptyList(),
+                                ajaxServers = ajaxSnapshot,
+                                baseHeaders = hybridHeaders
+                            )
+                        }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                    }
                 }
             }
 
@@ -510,7 +588,7 @@ class HeadlessWebExtractor @Inject constructor(
                 cookieFlusher()
                 val batchResults = withCancellableHttpCalls(timeoutMs = HLS_VERIFY_BATCH_TIMEOUT_MS) {
                     fresh.take(8).mapIndexed { idx, payload ->
-                        async(dispatchers.io) {
+                        async(dispatchers.extractionIo) {
                             verifyPayloadCandidate(
                                 payload = payload,
                                 embedUrl = embedContextUrl,
@@ -536,15 +614,8 @@ class HeadlessWebExtractor @Inject constructor(
 
             while (true) {
                 // If hybrid fast OkHttp portal resolver already found verified streams, exit immediately!
-                if (hybridPortalJob?.isCompleted == true) {
-                    val res = runCatching { hybridPortalJob?.getCompleted() }.getOrNull()
-                    if (res != null && res.streams.isNotEmpty()) {
-                        verifiedStreams.addAll(res.streams)
-                        if (!res.posterUrl.isNullOrBlank() && capturedThumbRef.get().isNullOrBlank()) {
-                            capturedThumbRef.set(res.posterUrl)
-                        }
-                        break
-                    }
+                if (collectCompletedHybridResult()) {
+                    break
                 }
 
                 val elapsed = System.currentTimeMillis() - start
@@ -573,18 +644,18 @@ class HeadlessWebExtractor @Inject constructor(
                 }
 
                 // Fast DOM-ready polling (every ~300ms once pageFinished or >= 1.2s):
-                // the instant server tabs / iframes or AJAX server lists appear in DOM, launch parallel StreamingPortalResolver!
-                // Never run movie-portal polling/server clicking on social platforms.
+                // keep polling until BOTH DOM embeds and AJAX server tabs have been checked so an early
+                // dead Server #0 iframe never locks out delayed AJAX server tabs (TopCinema/DooPlay).
                 if (!isSocialFastMode &&
                     firstVidAt == null &&
-                    hybridPortalJob == null &&
+                    (hybridPortalJob == null || hybridAjaxJob == null) &&
                     webViewRef != null &&
                     (pageFinished.get() || elapsed >= 1_200L) &&
                     elapsed - lastDomPollAtMs >= DOM_READY_POLL_INTERVAL_MS
                 ) {
                     lastDomPollAtMs = elapsed
                     val domEmbeds = collectDomEmbedIframes(webViewRef!!)
-                    val domAjax = collectDomAjaxServers(webViewRef!!, currentPageUrl)
+                    val domAjax = if (hybridAjaxJob == null) collectDomAjaxServers(webViewRef!!, currentPageUrl) else emptyList()
                     if (domEmbeds.isNotEmpty()) {
                         domEmbeds.forEach { if (it !in discoveredEmbedUrls) discoveredEmbedUrls.add(it) }
                     }
@@ -692,12 +763,8 @@ class HeadlessWebExtractor @Inject constructor(
                 val outerPageForReferer = currentPageUrl
                 for ((idx, embedUrl) in promotable.withIndex()) {
                     // Check if parallel hybrid OkHttp resolver already succeeded!
-                    if (hybridPortalJob?.isCompleted == true) {
-                        val res = runCatching { hybridPortalJob?.getCompleted() }.getOrNull()
-                        if (res != null && res.streams.isNotEmpty()) {
-                            verifiedStreams.addAll(res.streams)
-                            break
-                        }
+                    if (collectCompletedHybridResult()) {
+                        break
                     }
 
                     promotedEmbedsAttempted++
@@ -720,12 +787,8 @@ class HeadlessWebExtractor @Inject constructor(
                     val embedStart = System.currentTimeMillis()
                     var retriggeredPlay = false
                     while (true) {
-                        if (hybridPortalJob?.isCompleted == true) {
-                            val res = runCatching { hybridPortalJob?.getCompleted() }.getOrNull()
-                            if (res != null && res.streams.isNotEmpty()) {
-                                verifiedStreams.addAll(res.streams)
-                                break
-                            }
+                        if (collectCompletedHybridResult()) {
+                            break
                         }
                         if (promotedVideoCaptured.get()) {
                             com.melmeligy.mediadownloader.core.AppLogger.d(
@@ -781,19 +844,24 @@ class HeadlessWebExtractor @Inject constructor(
                 activePromotedEmbedUrl.set(null)
             }
 
-            // If still no verified streams and hybrid portal job is still running, give it a brief finish window
-            if (verifiedStreams.isEmpty() && hybridPortalJob != null) {
-                val hybridRes = withTimeoutOrNull(1_500L) {
-                    runCatching { hybridPortalJob?.await() }.getOrNull()
-                }
-                if (hybridRes != null && hybridRes.streams.isNotEmpty()) {
-                    verifiedStreams.addAll(hybridRes.streams)
-                    if (!hybridRes.posterUrl.isNullOrBlank() && capturedThumbRef.get().isNullOrBlank()) {
-                        capturedThumbRef.set(hybridRes.posterUrl)
+            // If still no verified streams and hybrid portal/AJAX job(s) are still running, give them a brief finish window
+            if (verifiedStreams.isEmpty()) {
+                val activeHybridJobs = listOfNotNull(hybridAjaxJob, hybridPortalJob).distinct()
+                for (job in activeHybridJobs) {
+                    if (verifiedStreams.isNotEmpty()) break
+                    val hybridRes = withTimeoutOrNull(1_800L) {
+                        runCatching { job.await() }.getOrNull()
+                    }
+                    if (hybridRes != null && hybridRes.streams.isNotEmpty()) {
+                        verifiedStreams.addAll(hybridRes.streams)
+                        if (!hybridRes.posterUrl.isNullOrBlank() && capturedThumbRef.get().isNullOrBlank()) {
+                            capturedThumbRef.set(hybridRes.posterUrl)
+                        }
                     }
                 }
             }
             hybridPortalJob?.cancel()
+            hybridAjaxJob?.cancel()
 
             // Verify any remaining unverified payloads captured before WebView teardown
             if (verifiedStreams.isEmpty() && localCaptured.isNotEmpty()) {
@@ -941,10 +1009,12 @@ class HeadlessWebExtractor @Inject constructor(
         } finally {
             destroyed.set(true)
             hybridPortalJob?.cancel()
+            hybridAjaxJob?.cancel()
             wakeSignal.close()
             withContext(kotlinx.coroutines.NonCancellable + dispatchers.main) {
                 runCatching {
                     webViewRef?.stopLoading()
+                    webViewRef?.loadUrl("about:blank")
                     webViewRef?.removeJavascriptInterface(BlobBridge.NAME)
                     webViewRef?.destroy()
                 }
@@ -1096,7 +1166,11 @@ class HeadlessWebExtractor @Inject constructor(
         }
         absorbCookieString(headers["Cookie"])
         if (!embedUrl.isNullOrBlank()) {
-            absorbCookieString(cookieLookup(embedUrl))
+            val embedFamily = extractHostFamilyStatic(embedUrl)
+            val streamFamily = extractHostFamilyStatic(streamUrl)
+            if (embedFamily.isNotEmpty() && embedFamily == streamFamily) {
+                absorbCookieString(cookieLookup(embedUrl))
+            }
         }
         absorbCookieString(cookieLookup(streamUrl))
         if (cookieMap.isNotEmpty()) {
@@ -1189,9 +1263,14 @@ class HeadlessWebExtractor @Inject constructor(
                 ).apply {
                     if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
                 }
+                val finalStreamUrl = if (InterceptedMediaExtractor.shouldPreserveRedirectorUrl(cleanUrl, info.finalUrl)) {
+                    cleanUrl
+                } else {
+                    info.finalUrl.takeIf { it.startsWith("http") }?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl
+                }
                 val stream = MediaStream(
                     id = "hl-$idx",
-                    url = info.finalUrl.takeIf { it.startsWith("http") }?.let { MediaSniffer.cleanMediaUrl(it) } ?: cleanUrl,
+                    url = finalStreamUrl,
                     type = type,
                     container = container,
                     label = if (type == MediaType.AUDIO) "Original Audio (${container.uppercase()})"
@@ -1571,12 +1650,31 @@ class HeadlessWebExtractor @Inject constructor(
                 "return JSON.stringify(out);" +
                 "}catch(e){return '[]';}})();"
 
+        /**
+         * Strips Android WebView markers (`; wv` and `Version/X.Y`) from the system WebView's
+         * real User-Agent while preserving the exact installed Chromium `Chrome/<version>` token
+         * so `User-Agent` and `Sec-CH-UA` client hints match on Cloudflare-protected portals.
+         */
+        internal fun sanitizeWebViewUserAgent(rawUa: String?): String {
+            val cleaned = rawUa?.trim().orEmpty()
+            if (cleaned.isEmpty() || !cleaned.contains("Chrome/", ignoreCase = true)) {
+                return Constants.DEFAULT_USER_AGENT
+            }
+            val normalized = cleaned
+                .replace(Regex(""";\s*wv\b""", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("""\bVersion/\d+(?:\.\d+)*\s*""", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("""\s{2,}"""), " ")
+                .trim()
+            return normalized.ifBlank { Constants.DEFAULT_USER_AGENT }
+        }
+
         val PORTAL_AJAX_SCRAPE_JS =
             "(function(){try{" +
                 "var out=[];var seen={};" +
                 "var origin=location.origin||'';" +
                 "var ajaxBase=(typeof MyAjaxURL==='string'&&MyAjaxURL)||(typeof themeAjaxUrl==='string'&&themeAjaxUrl)||(typeof ThemeAjax==='string'&&ThemeAjax)||(typeof ajaxURL==='string'&&ajaxURL)||(typeof ajax_url==='string'&&ajax_url)||'';" +
-                "if(!ajaxBase){var sc=document.querySelectorAll('script');for(var si=0;si<sc.length&&!ajaxBase;si++){var tx=sc[si].textContent||'';var m=tx.match(/(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\\s*=\\s*['\"](https?:\\/\\/[^'\"]+)['\"]/i)||tx.match(/(?:ajaxURL|ajax_url|ajaxUrl)\\s*=\\s*['\"](https?:\\/\\/[^'\"]+)['\"]/i);if(m&&m[1])ajaxBase=m[1];}}" +
+                "if(!ajaxBase){var sc=document.querySelectorAll('script');for(var si=0;si<sc.length&&!ajaxBase;si++){var tx=sc[si].textContent||'';var m=tx.match(/(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i)||tx.match(/(?:ajaxURL|ajax_url|ajaxUrl)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i);if(m&&m[1])ajaxBase=m[1];}}" +
+                "if(ajaxBase){try{ajaxBase=new URL(ajaxBase,location.href).href;}catch(e){}}" +
                 "var serverEndpoint=ajaxBase?(/\\.php$/i.test(ajaxBase.replace(/\\/+$/,''))?ajaxBase.replace(/\\/+$/,''):ajaxBase.replace(/\\/+$/,'')+'/Single/Server.php'):(origin?origin+'/Ajaxat/Single/Server.php':'');" +
                 "if(serverEndpoint){var tabs=document.querySelectorAll('[data-id][data-server]');for(var i=0;i<tabs.length&&out.length<8;i++){var t=tabs[i];var id=(t.getAttribute('data-id')||'').trim();var srv=(t.getAttribute('data-server')||'').trim();if(!id||!srv)continue;var key='a|'+id+'|'+srv;if(seen[key])continue;seen[key]=true;var nm=(t.innerText||t.textContent||'').trim().slice(0,32)||('Server '+srv);out.push({e:serverEndpoint,b:'id='+encodeURIComponent(id)+'&i='+encodeURIComponent(srv),n:nm,act:t.classList&&t.classList.contains('active')?1:0});}}" +
                 "if(origin){var doo=document.querySelectorAll('[data-post][data-nume]');for(var j=0;j<doo.length&&out.length<8;j++){var d=doo[j];var post=(d.getAttribute('data-post')||'').trim();var nume=(d.getAttribute('data-nume')||'').trim();var tp=(d.getAttribute('data-type')||'movie').trim()||'movie';if(!post||!nume||nume.toLowerCase()==='trailer')continue;var dk='d|'+post+'|'+nume+'|'+tp;if(seen[dk])continue;seen[dk]=true;var dn=(d.innerText||d.textContent||'').trim().slice(0,32)||('Server '+nume);out.push({e:origin+'/wp-admin/admin-ajax.php',b:'action=doo_player_ajax&post='+encodeURIComponent(post)+'&nume='+encodeURIComponent(nume)+'&type='+encodeURIComponent(tp),n:dn,act:0});}}" +
