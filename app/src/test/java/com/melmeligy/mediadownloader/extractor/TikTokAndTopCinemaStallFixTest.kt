@@ -360,9 +360,26 @@ class TikTokAndTopCinemaStallFixTest {
         assertTrue(HeadlessWebExtractor.PORTAL_AJAX_SCRAPE_JS.contains("[data-id][data-server]"))
         assertTrue(HeadlessWebExtractor.PORTAL_AJAX_SCRAPE_JS.contains("MyAjaxURL"))
         assertTrue(HeadlessWebExtractor.PORTAL_AJAX_SCRAPE_JS.contains("[data-post][data-nume]"))
-        assertTrue(HeadlessWebExtractor.MAX_TOTAL_EXTRACTION_MS in 10_000L..20_000L)
+        assertTrue(HeadlessWebExtractor.MAX_TOTAL_EXTRACTION_MS in 10_000L..24_000L)
         assertTrue(HeadlessWebExtractor.MAX_SOCIAL_TOTAL_EXTRACTION_MS in 5_000L..9_000L)
         assertEquals(5_500L, StreamingPortalResolver.PORTAL_TOTAL_BUDGET_MS)
         assertEquals(5_200L, StreamingPortalResolver.SERVER_PROBE_TIMEOUT_MS)
+    }
+
+    @Test
+    fun tikTok_shortLinkFollowsSecondHopThroughMobileVPathToCanonicalPhotoUrl() = runBlocking {
+        val mockHttp = mockk<ExtractorHttp>(relaxed = true)
+        val mockHeadless = mockk<HeadlessWebExtractor>(relaxed = true)
+        val social = SocialMediaExtractor(mockHttp, mockHeadless)
+
+        val shortUrl = "https://vt.tiktok.com/ZSM999999/"
+        val hop1MobileV = "https://m.tiktok.com/v/7500999888777666555.html?_t=abc&_r=1"
+        val hop2Canonical = "https://www.tiktok.com/@creator/photo/7500999888777666555?is_from_webapp=1"
+
+        io.mockk.every { mockHttp.resolveRedirectLocation(shortUrl, any()) } returns hop1MobileV
+        io.mockk.every { mockHttp.resolveRedirectLocation(hop1MobileV, any()) } returns hop2Canonical
+
+        val resolved = social.resolveRedirectUrl(shortUrl)
+        assertEquals("https://www.tiktok.com/@creator/photo/7500999888777666555", resolved)
     }
 }

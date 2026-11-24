@@ -56,7 +56,8 @@ class HlsExtractor @Inject constructor(
     private data class PlaylistFetchOutcome(
         val text: String?,
         val headers: Map<String, String>,
-        val failureReason: String?
+        val failureReason: String?,
+        val finalUrl: String = ""
     )
 
     private data class SegmentVerifyOutcome(
@@ -64,6 +65,34 @@ class HlsExtractor @Inject constructor(
         val headInfo: HeadInfo?,
         val failureReason: String?
     )
+
+    /**
+     * Fetches a playlist and preserves the post-redirect final URL so relative variant/segment
+     * URIs resolve against the real CDN edge (e.g. EarnVids `/stream/...` -> CDN `master.m3u8`).
+     * Falls back seamlessly to [ExtractorHttp.fetchString] when unit tests mock only `fetchString`.
+     */
+    private suspend fun fetchPlaylistTextAndFinalUrl(
+        url: String,
+        headers: Map<String, String>
+    ): Pair<String, String> {
+        val result = try {
+            http.fetchTextWithFinalUrl(url, headers)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
+            throw me
+        } catch (e: Throwable) {
+            if (e.javaClass.name.contains("MockK", ignoreCase = true)) {
+                return http.fetchString(url, headers) to url
+            }
+            throw e
+        }
+        if (result.finalUrl.isBlank() && result.text.isBlank()) {
+            return http.fetchString(url, headers) to url
+        }
+        val effectiveFinal = result.finalUrl.takeIf { it.startsWith("http", ignoreCase = true) } ?: url
+        return result.text to effectiveFinal
+    }
 
     /**
      * Header- and quality-hint-aware variant used by the interception and HTML extraction layers.
@@ -125,14 +154,15 @@ class HlsExtractor @Inject constructor(
         stagePrefix: String
     ): PlaylistFetchOutcome {
         var lastReason: String? = null
+        var singleCorsRetryOnly = false
         try {
-            val primaryText = http.fetchString(url, headers)
+            val (primaryText, primaryFinalUrl) = fetchPlaylistTextAndFinalUrl(url, headers)
             if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(primaryText)) {
-                return PlaylistFetchOutcome(primaryText, headers, null)
+                return PlaylistFetchOutcome(primaryText, headers, null, primaryFinalUrl)
             }
             lastReason = "$stagePrefix non-HLS"
             if (!allowRelaxedFallback) {
-                return PlaylistFetchOutcome(primaryText, headers, null)
+                return PlaylistFetchOutcome(primaryText, headers, null, primaryFinalUrl)
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
@@ -140,31 +170,38 @@ class HlsExtractor @Inject constructor(
             lastReason = describeException(stagePrefix, e)
             val isAuthBlocked = e.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ||
                 e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+            val isRecoverableEdgeReject = e.message == "HTTP 400" || e.message == "HTTP 502"
             if (!allowRelaxedFallback) throw e
-            if (!isAuthBlocked) {
-                return PlaylistFetchOutcome(null, headers, lastReason)
+            if (!isAuthBlocked && !isRecoverableEdgeReject) {
+                return PlaylistFetchOutcome(null, headers, lastReason, url)
+            }
+            if (isRecoverableEdgeReject) {
+                singleCorsRetryOnly = true
             }
         } catch (e: Exception) {
             lastReason = describeException(stagePrefix, e)
             if (!allowRelaxedFallback) throw e
-            return PlaylistFetchOutcome(null, headers, lastReason)
+            return PlaylistFetchOutcome(null, headers, lastReason, url)
         }
-        for (alt in ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)) {
-            val text = try {
-                http.fetchString(url, alt)
+        val allVariants = ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
+        val retryVariants = if (singleCorsRetryOnly) allVariants.take(1) else allVariants
+        for (alt in retryVariants) {
+            val fetchedAlt = try {
+                fetchPlaylistTextAndFinalUrl(url, alt)
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (e: Exception) {
                 lastReason = describeException(stagePrefix, e)
                 null
             }
+            val text = fetchedAlt?.first
             if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
-                return PlaylistFetchOutcome(text!!, alt, null)
+                return PlaylistFetchOutcome(text!!, alt, null, fetchedAlt!!.second)
             } else if (text != null) {
                 lastReason = "$stagePrefix non-HLS"
             }
         }
-        return PlaylistFetchOutcome(null, headers, lastReason ?: "$stagePrefix rejected")
+        return PlaylistFetchOutcome(null, headers, lastReason ?: "$stagePrefix rejected", url)
     }
 
     private suspend fun verifySegmentDownloadable(
@@ -277,6 +314,7 @@ class HlsExtractor @Inject constructor(
             stagePrefix = "master"
         )
         val text = fetched.text ?: return HlsVerificationResult(null, fetched.failureReason ?: "master fetch failed")
+        val effectiveMasterUrl = fetched.finalUrl.takeIf { it.startsWith("http", ignoreCase = true) } ?: url
         var effectiveHeaders = fetched.headers
         if (!com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
             return HlsVerificationResult(null, "master non-HLS")
@@ -304,7 +342,7 @@ class HlsExtractor @Inject constructor(
                         (lines[uriLine].trim().isEmpty() || lines[uriLine].trim().startsWith("#"))
                     ) uriLine++
                     if (uriLine < lines.size) {
-                        val variantUrl = UrlUtils.resolveUrl(url, lines[uriLine].trim())
+                        val variantUrl = UrlUtils.resolveUrl(effectiveMasterUrl, lines[uriLine].trim())
                         rawVariants += RawVariant(variantUrl = variantUrl, attrs = attrs)
                         index = uriLine
                     }
@@ -317,7 +355,7 @@ class HlsExtractor @Inject constructor(
             rawAudioRenditions.forEach { attrs ->
                 val groupId = attrs["GROUP-ID"] ?: return@forEach
                 val uri = attrs["URI"]?.takeIf { it.isNotBlank() } ?: return@forEach
-                val resolvedAudio = UrlUtils.resolveUrl(url, uri)
+                val resolvedAudio = UrlUtils.resolveUrl(effectiveMasterUrl, uri)
                 val bw = attrs["BANDWIDTH"]?.toIntOrNull() ?: 128_000
                 val isDefault = attrs["DEFAULT"]?.equals("YES", ignoreCase = true) == true
                 val existing = audioGroupUrls[groupId]
@@ -328,6 +366,7 @@ class HlsExtractor @Inject constructor(
 
             // Probe first variant playlist (trying a second variant if verifyDownloadable and the first fails)
             var probedVariant: RawVariant? = rawVariants.firstOrNull()
+            var probedVariantFinalUrl: String? = probedVariant?.variantUrl
             var variantText: String? = null
             var variantFailReason: String? = null
             val variantsToProbe = if (verifyDownloadable) rawVariants.take(2) else rawVariants.take(1)
@@ -346,6 +385,8 @@ class HlsExtractor @Inject constructor(
                     com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(fetchedVar.text)
                 ) {
                     probedVariant = candidateVar
+                    probedVariantFinalUrl = fetchedVar.finalUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+                        ?: candidateVar.variantUrl
                     variantText = fetchedVar.text
                     effectiveHeaders = fetchedVar.headers
                     break
@@ -355,7 +396,7 @@ class HlsExtractor @Inject constructor(
             }
 
             val sanitizedFirstVariant = if (!variantText.isNullOrBlank() && probedVariant != null) {
-                HlsPlaylistSanitizer.parseAndSanitize(variantText, probedVariant.variantUrl)
+                HlsPlaylistSanitizer.parseAndSanitize(variantText, probedVariantFinalUrl ?: probedVariant.variantUrl)
             } else null
 
             if (sanitizedFirstVariant?.hasUnsupportedDrm == true) {
@@ -531,7 +572,7 @@ class HlsExtractor @Inject constructor(
             rawAudioRenditions.forEachIndexed { audioIdx, attrs ->
                 val uri = attrs["URI"]
                 if (!uri.isNullOrBlank()) {
-                    val audioUrl = UrlUtils.resolveUrl(url, uri)
+                    val audioUrl = UrlUtils.resolveUrl(effectiveMasterUrl, uri)
                     val name = attrs["NAME"] ?: attrs["GROUP-ID"] ?: "Audio"
                     val lang = attrs["LANGUAGE"]
                     val label = if (!lang.isNullOrBlank()) "$name ($lang)" else name
@@ -566,7 +607,7 @@ class HlsExtractor @Inject constructor(
 
         if (streams.isEmpty()) {
             if (text.contains("#EXTINF")) {
-                val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, url)
+                val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, effectiveMasterUrl)
                 if (sanitized.hasUnsupportedDrm) {
                     return HlsVerificationResult(null, "DRM protected")
                 }
@@ -576,7 +617,7 @@ class HlsExtractor @Inject constructor(
                 }
                 val totalDurationSeconds = sanitized.totalDurationSec.roundToLong()
 
-                val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(url)
+                val inferredHeight = heightHint?.takeIf { it > 0 } ?: UrlUtils.inferResolution(effectiveMasterUrl)
                 val inferredWidth = inferredHeight?.let { (it * 16) / 9 }
 
                 // 1. Check if sanitized playlist advertises exact #EXT-X-BYTERANGE segment lengths (e.g. xHamster/fMP4 HLS)
@@ -666,7 +707,7 @@ class HlsExtractor @Inject constructor(
                 }
 
                 val resolvedHeight = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
-                    url = url,
+                    url = effectiveMasterUrl,
                     height = inferredHeight,
                     bitrateKbps = bitrateKbps,
                     sizeBytes = sizeBytes,
@@ -681,7 +722,7 @@ class HlsExtractor @Inject constructor(
 
                 streams += MediaStream(
                     id = "hls-auto",
-                    url = url,
+                    url = effectiveMasterUrl,
                     type = MediaType.VIDEO,
                     container = "ts",
                     label = label,

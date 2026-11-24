@@ -162,7 +162,24 @@ object AdBlocker {
         "dingtezuni",
         "dintezuvio",
         "callistanise",
-        "vidroba"
+        "vidroba",
+        "morencius",
+        "delucloud",
+        "vibuxer",
+        "hanerix",
+        "niramirus",
+        "hglamioz",
+        "playnixes",
+        "medixiru",
+        "byseqekaho",
+        "byseraguci",
+        "bysezejataos",
+        "firestream",
+        "yonaplay",
+        "megamax",
+        "playmogo",
+        "myvidplay",
+        "videoland"
     )
 
     private val POPUP_REDIRECT_PATH_MARKERS = listOf(

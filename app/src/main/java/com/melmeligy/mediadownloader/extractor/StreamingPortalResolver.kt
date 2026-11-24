@@ -21,10 +21,14 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Tier 1 generalized streaming-portal and multi-hop embed resolver.
@@ -77,6 +81,10 @@ class StreamingPortalResolver(
     )
     private val ajaxUrlRegex = Regex(
         """(?:ajaxURL|ajax_url|ajaxUrl)\s*=\s*['"](https?://[^'"]+)['"]""",
+        RegexOption.IGNORE_CASE
+    )
+    private val wpThemeDirRegex = Regex(
+        """/wp-content/themes/([A-Za-z0-9_-]+)/""",
         RegexOption.IGNORE_CASE
     )
     private val iframeSrcInHtmlRegex = Regex(
@@ -181,8 +189,8 @@ class StreamingPortalResolver(
 
     /**
      * Combined hybrid entry point used by [HeadlessWebExtractor]: concurrently resolves BOTH
-     * direct embed URLs (`<iframe>`, `[data-url]`, `.List--Download--Wecima--Single`) AND AJAX
-     * server tabs (`[data-id][data-server]` -> `Single/Server.php`, `[data-post][data-nume]` ->
+     * direct embed URLs (`<iframe>`, `[data-url]`, `.openLinkDown[data-href]`, `.List--Download--Wecima--Single`)
+     * AND AJAX server tabs (`[data-id][data-server]` -> `Single/Server.php`, `[data-post][data-nume]` ->
      * `admin-ajax.php`) scraped from the live WebView DOM using the WebView's cookies & User-Agent.
      */
     suspend fun resolveHybridDomAndAjax(
@@ -197,7 +205,7 @@ class StreamingPortalResolver(
         val seen = HashSet<String>()
         val jobs = mutableListOf<ServerJob>()
         embedUrls.forEachIndexed { idx, raw ->
-            val decoded = decodeBase64UrlIfEncoded(raw)
+            val decoded = decodePortalEmbedUrl(raw) ?: return@forEachIndexed
             val resolved = normalizeEmbedUrl(pageUrl, decoded) ?: return@forEachIndexed
             if (isBlockedOrNonPlayerEmbed(resolved)) return@forEachIndexed
             if (seen.add(dedupeEmbedKey(resolved))) {
@@ -293,26 +301,6 @@ class StreamingPortalResolver(
         }
     }
 
-    private fun decodeBase64UrlIfEncoded(raw: String): String {
-        val trimmed = raw.trim()
-        if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) || trimmed.startsWith("//")) {
-            return trimmed
-        }
-        if (trimmed.length < 16 || !trimmed.matches(Regex("^[A-Za-z0-9+/=_-]+$"))) {
-            return trimmed
-        }
-        val decoded = runCatching {
-            val normalized = trimmed.replace('-', '+').replace('_', '/')
-            val pad = (4 - normalized.length % 4) % 4
-            String(java.util.Base64.getDecoder().decode(normalized + "=".repeat(pad)), StandardCharsets.UTF_8).trim()
-        }.getOrNull()
-        return if (decoded != null && (decoded.startsWith("http://", true) || decoded.startsWith("https://", true) || decoded.startsWith("//"))) {
-            decoded
-        } else {
-            trimmed
-        }
-    }
-
     private fun collectServerJobs(
         pageUrl: String,
         html: String,
@@ -322,7 +310,7 @@ class StreamingPortalResolver(
         val seenDirectUrls = HashSet<String>()
 
         fun addDirect(rawUrl: String, serverName: String) {
-            val decoded = decodeBase64UrlIfEncoded(rawUrl)
+            val decoded = decodePortalEmbedUrl(rawUrl) ?: return
             val resolved = normalizeEmbedUrl(pageUrl, decoded) ?: return
             if (isBlockedOrNonPlayerEmbed(resolved)) return
             if (seenDirectUrls.add(dedupeEmbedKey(resolved))) {
@@ -341,7 +329,7 @@ class StreamingPortalResolver(
             }
         }
 
-        // 2. Static server buttons/tabs with direct or Base64-encoded embed URLs in data-* attributes
+        // 2. Static server buttons/tabs with direct, Base64, or WeCima-obfuscated embed URLs in data-* attributes
         val directAttrSelectors = listOf(
             "data-embed", "data-watch", "data-url", "data-iframe", "data-link", "data-player", "data-src"
         )
@@ -351,20 +339,32 @@ class StreamingPortalResolver(
                     el.tagName().equals("script", ignoreCase = true) ||
                     el.tagName().equals("link", ignoreCase = true)
                 ) return@forEach
-                val raw = decodeBase64UrlIfEncoded(el.attr(attr).trim())
-                if (raw.startsWith("http://", true) || raw.startsWith("https://", true) || raw.startsWith("//")) {
+                val decoded = decodePortalEmbedUrl(el.attr(attr).trim()) ?: return@forEach
+                if (decoded.startsWith("http://", true) || decoded.startsWith("https://", true) || decoded.startsWith("//")) {
                     val label = el.text().trim().take(32).ifBlank { "Server" }
-                    addDirect(raw, label)
+                    addDirect(decoded, label)
                 }
             }
         }
 
-        // 2b. WeCima direct download links (.List--Download--Wecima--Single a[href])
-        doc.select(".List--Download--Wecima--Single a[href]").forEach { a ->
-            val href = decodeBase64UrlIfEncoded(a.absUrl("href").ifBlank { a.attr("href") }.trim())
-            if (href.startsWith("http://", true) || href.startsWith("https://", true) || href.startsWith("//")) {
-                val label = a.text().trim().take(32).ifBlank { "WeCima Download" }
-                addDirect(href, label)
+        // 2b. WeCima direct download links (.List--Download--Wecima--Single a[href]) & obfuscated .openLinkDown[data-href]
+        doc.select(".List--Download--Wecima--Single a[href], a.downloadsLink[href]").forEach { a ->
+            val rawHref = a.attr("href").trim().ifBlank { a.absUrl("href").trim() }
+            val decoded = decodePortalEmbedUrl(rawHref) ?: return@forEach
+            if (decoded.startsWith("http://", true) || decoded.startsWith("https://", true) || decoded.startsWith("//")) {
+                val qualityText = a.selectFirst("quality")?.text()?.trim().orEmpty()
+                val label = qualityText.ifBlank { a.text().trim() }.take(32).ifBlank { "WeCima Download" }
+                addDirect(decoded, label)
+            }
+        }
+        doc.select(".openLinkDown[data-href], [data-href]").forEach { el ->
+            val rawHref = el.attr("data-href").trim()
+            if (rawHref.isEmpty()) return@forEach
+            val decoded = decodePortalEmbedUrl(rawHref) ?: return@forEach
+            if (decoded.startsWith("http://", true) || decoded.startsWith("https://", true) || decoded.startsWith("//")) {
+                val qualityText = el.selectFirst("quality")?.text()?.trim().orEmpty()
+                val label = qualityText.ifBlank { el.text().trim() }.take(32).ifBlank { "WeCima Download" }
+                addDirect(decoded, label)
             }
         }
 
@@ -428,7 +428,7 @@ class StreamingPortalResolver(
         return jobs.take(MAX_SERVERS)
     }
 
-    private fun resolveServerAjaxEndpoint(pageUrl: String, html: String): String? {
+    internal fun resolveServerAjaxEndpoint(pageUrl: String, html: String): String? {
         myAjaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { base ->
             val trimmed = base.trimEnd('/')
             return if (trimmed.endsWith(".php", ignoreCase = true)) trimmed else "$trimmed/Single/Server.php"
@@ -438,6 +438,10 @@ class StreamingPortalResolver(
             return if (trimmed.endsWith(".php", ignoreCase = true)) trimmed else "$trimmed/Single/Server.php"
         }
         val origin = originOf(pageUrl) ?: return null
+        val themeName = wpThemeDirRegex.find(html)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+        if (themeName != null && (themeName.contains("movie", ignoreCase = true) || themeName.contains("cima", ignoreCase = true) || themeName.contains("top", ignoreCase = true))) {
+            return "$origin/wp-content/themes/$themeName/Ajaxat/Single/Server.php"
+        }
         return "$origin/Ajaxat/Single/Server.php"
     }
 
@@ -478,12 +482,30 @@ class StreamingPortalResolver(
                                             originOf(job.parentPageUrl)?.let { put("Origin", it) }
                                             put("X-Requested-With", "XMLHttpRequest")
                                         }
-                                        val resp = try {
+                                        var resp = try {
                                             http.postForm(job.endpointUrl, job.formBody, ajaxHeaders)
                                         } catch (ce: CancellationException) {
                                             throw ce
                                         } catch (_: Exception) {
                                             ""
+                                        }
+                                        if (resp.isBlank() && job.endpointUrl.endsWith("/Ajaxat/Single/Server.php", ignoreCase = true)) {
+                                            val origin = originOf(job.endpointUrl) ?: originOf(job.parentPageUrl)
+                                            val altEndpoint = when {
+                                                origin == null -> null
+                                                job.endpointUrl.contains("/wp-content/themes/", ignoreCase = true) ->
+                                                    "$origin/Ajaxat/Single/Server.php"
+                                                else -> "$origin/wp-content/themes/movies2023/Ajaxat/Single/Server.php"
+                                            }
+                                            if (altEndpoint != null && altEndpoint != job.endpointUrl) {
+                                                resp = try {
+                                                    http.postForm(altEndpoint, job.formBody, ajaxHeaders)
+                                                } catch (ce: CancellationException) {
+                                                    throw ce
+                                                } catch (_: Exception) {
+                                                    ""
+                                                }
+                                            }
                                         }
                                         val embedUrl = extractEmbedUrlFromAjaxResponse(resp, job.parentPageUrl)
                                             ?: return@withCancellableHttpCalls PortalExtractionResult(emptyList())
@@ -543,12 +565,17 @@ class StreamingPortalResolver(
                     collectedStreams += outcome.streams
                     val distinctHeights = collectedStreams.mapNotNull { it.height }.distinct().size
                     val hasMultiQualityHls = collectedStreams.any { it.isHls } && distinctHeights >= 2
-                    if (hasMultiQualityHls) {
+                    val hasDirectProgressive = collectedStreams.any { !it.isHls }
+                    if (hasMultiQualityHls && (hasDirectProgressive || remaining == 0)) {
                         break
                     }
                     if (firstWinDeadlineMs == null) {
                         if (remaining == 0) break
-                        val graceMs = if (distinctHeights == 0) UNKNOWN_HEIGHT_MERGE_GRACE_MS else SIBLING_MERGE_GRACE_MS
+                        val graceMs = when {
+                            hasMultiQualityHls -> 350L
+                            distinctHeights == 0 -> UNKNOWN_HEIGHT_MERGE_GRACE_MS
+                            else -> SIBLING_MERGE_GRACE_MS
+                        }
                         firstWinDeadlineMs = System.currentTimeMillis() + graceMs
                     }
                 }
@@ -575,21 +602,21 @@ class StreamingPortalResolver(
                     .ifBlank { obj.optString("src") }
                 if (raw.isNotBlank()) {
                     iframeSrcInHtmlRegex.find(raw)?.groupValues?.getOrNull(1)?.let {
-                        return normalizeEmbedUrl(pageUrl, it)
+                        return normalizeEmbedUrl(pageUrl, unwrapPlayRedirectUrl(it))
                     }
-                    return normalizeEmbedUrl(pageUrl, raw)
+                    return normalizeEmbedUrl(pageUrl, unwrapPlayRedirectUrl(raw))
                 }
             }
         }
 
         // HTML `<iframe src="...">` snippet (TopCinema / movies2023 `Single/Server.php`)
         iframeSrcInHtmlRegex.find(trimmed)?.groupValues?.getOrNull(1)?.let {
-            return normalizeEmbedUrl(pageUrl, it)
+            return normalizeEmbedUrl(pageUrl, unwrapPlayRedirectUrl(it))
         }
 
         // Raw URL response
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("//")) {
-            return normalizeEmbedUrl(pageUrl, trimmed.lineSequence().first().trim())
+            return normalizeEmbedUrl(pageUrl, unwrapPlayRedirectUrl(trimmed.lineSequence().first().trim()))
         }
 
         return null
@@ -624,6 +651,34 @@ class StreamingPortalResolver(
                 idCounter = idCounter
             )
             return@coroutineScope PortalExtractionResult(directStreams)
+        }
+
+        // Fast-path native API resolution for SPA-only embed hosts (Vidara & Byse/Filemoon)
+        val preHost = UrlUtils.host(embedUrl)?.lowercase().orEmpty()
+        if (preHost.contains("vidara")) {
+            val preHeaders = buildStreamHeadersForHost(embedUrl, baseHeaders)
+            val vidaraSources = resolveVidaraApi(embedUrl, preHeaders)
+            if (vidaraSources.isNotEmpty()) {
+                progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
+                val resolvedStreams = vidaraSources.map { cand ->
+                    async(Dispatchers.IO) { materializeCandidate(cand, preHeaders, serverName, idCounter) }
+                }.awaitAll().flatten()
+                if (resolvedStreams.isNotEmpty()) {
+                    return@coroutineScope PortalExtractionResult(resolvedStreams)
+                }
+            }
+        } else if (preHost.contains("byse") || preHost.contains("filemoon") || preHost.contains("moonplayer")) {
+            val preHeaders = buildStreamHeadersForHost(embedUrl, baseHeaders)
+            val byseSources = resolveByseFilemoonApi(embedUrl, preHeaders)
+            if (byseSources.isNotEmpty()) {
+                progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
+                val resolvedStreams = byseSources.map { cand ->
+                    async(Dispatchers.IO) { materializeCandidate(cand, preHeaders, serverName, idCounter) }
+                }.awaitAll().flatten()
+                if (resolvedStreams.isNotEmpty()) {
+                    return@coroutineScope PortalExtractionResult(resolvedStreams)
+                }
+            }
         }
 
         val fetchHeaders = buildHopHeaders(embedUrl, parentUrl, baseHeaders)
@@ -708,7 +763,7 @@ class StreamingPortalResolver(
             }
         }
 
-        // 1. PlayerJS / JWPlayer / Plyr / Clappr / Video.js / links={hls2..4} / MDCore.wurl sources
+        // 1. PlayerJS / JWPlayer / Plyr / Clappr / Video.js / links={hls4,hls2,hls3} / MDCore.wurl sources
         playerCfg.sources.forEach { src ->
             addCandidate(src.url, src.label, src.width, src.height, src.isHlsHint)
         }
@@ -744,6 +799,26 @@ class StreamingPortalResolver(
             m3u8Regex.findAll(stripped).take(3).forEach { addCandidate(it.value, isHlsHint = true) }
             mpdRegex.findAll(stripped).take(2).forEach { addCandidate(it.value) }
             directVideoRegex.findAll(stripped).take(4).forEach { addCandidate(it.value) }
+        }
+
+        // 5b. SPA API fallback triggered by HTML signatures (also works on post-redirect mirrors & loopback)
+        if (candidates.isEmpty()) {
+            val effHost = UrlUtils.host(effectiveEmbedUrl)?.lowercase().orEmpty()
+            val looksLikeVidara = effHost.contains("vidara") ||
+                combinedScriptText.contains("/api/stream", ignoreCase = true)
+            val looksLikeByse = effHost.contains("byse") ||
+                effHost.contains("filemoon") ||
+                combinedScriptText.contains("/api/videos/", ignoreCase = true)
+            if (looksLikeVidara) {
+                resolveVidaraApi(effectiveEmbedUrl, streamHeaders).forEach { src ->
+                    addCandidate(src.url, src.label, src.width, src.height, src.isHlsHint)
+                }
+            }
+            if (candidates.isEmpty() && looksLikeByse) {
+                resolveByseFilemoonApi(effectiveEmbedUrl, streamHeaders).forEach { src ->
+                    addCandidate(src.url, src.label, src.width, src.height, src.isHlsHint)
+                }
+            }
         }
 
         val resolvedPoster = HtmlThumbnailExtractor.extractThumbnail(
@@ -788,6 +863,26 @@ class StreamingPortalResolver(
             jsIframeRedirectRegex.findAll(combinedScriptText).forEach { m ->
                 normalizeEmbedUrl(effectiveEmbedUrl, m.groupValues[1])?.let { u ->
                     if (!isBlockedOrNonPlayerEmbed(u)) nestedUrls.add(u)
+                }
+            }
+            // StreamWish / hgcloud lightweight JS "loading" redirect shells -> try known working mirrors
+            val effHost = UrlUtils.host(effectiveEmbedUrl)?.lowercase().orEmpty()
+            if (nestedUrls.isEmpty() &&
+                embedHtml.length < 4096 &&
+                embedHtml.contains("loading", ignoreCase = true) &&
+                (effHost.contains("hgcloud") || effHost.contains("streamwish"))
+            ) {
+                val parsedUri = runCatching { URI(UrlUtils.encodeNonAsciiUrl(effectiveEmbedUrl)) }.getOrNull()
+                val pathAndQuery = buildString {
+                    append(parsedUri?.rawPath.orEmpty())
+                    if (!parsedUri?.rawQuery.isNullOrBlank()) append('?').append(parsedUri?.rawQuery)
+                }
+                if (pathAndQuery.startsWith("/")) {
+                    for (mirror in STREAMWISH_FALLBACK_MIRRORS) {
+                        if (!effHost.equals(mirror, ignoreCase = true)) {
+                            nestedUrls.add("https://$mirror$pathAndQuery")
+                        }
+                    }
                 }
             }
 
@@ -1005,8 +1100,15 @@ class StreamingPortalResolver(
     ): Map<String, String> {
         val merged = LinkedHashMap<String, String>()
         baseHeaders["User-Agent"]?.let { merged["User-Agent"] = it }
-        merged["Referer"] = embedUrl
-        originOf(embedUrl)?.let { merged["Origin"] = it }
+        val origin = originOf(embedUrl)
+        val hostLower = UrlUtils.host(embedUrl)?.lowercase().orEmpty()
+        // ABStream / delucloud CDNs require origin-only Referer (`https://abstream.to/`) + Origin
+        merged["Referer"] = if (origin != null && (hostLower.contains("abstream") || hostLower.contains("delucloud"))) {
+            "$origin/"
+        } else {
+            embedUrl
+        }
+        origin?.let { merged["Origin"] = it }
         val baseCookie = baseHeaders["Cookie"]?.takeIf { it.isNotBlank() }
         val cmCookie = runCatching {
             CookieManager.getInstance().getCookie(embedUrl)?.takeIf { it.isNotBlank() }
@@ -1028,10 +1130,11 @@ class StreamingPortalResolver(
         if (trimmed.isEmpty() || trimmed.startsWith("javascript:", true) || trimmed.startsWith("about:", true)) {
             return null
         }
+        val unwrapped = unwrapPlayRedirectUrl(trimmed)
         val resolved = when {
-            trimmed.startsWith("//") -> "https:$trimmed"
-            trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
-            else -> UrlUtils.resolveUrl(baseUrl, trimmed)
+            unwrapped.startsWith("//") -> "https:$unwrapped"
+            unwrapped.startsWith("http://") || unwrapped.startsWith("https://") -> unwrapped
+            else -> UrlUtils.resolveUrl(baseUrl, unwrapped)
         }
         return resolved.takeIf { it.startsWith("http://") || it.startsWith("https://") }
     }
@@ -1068,6 +1171,104 @@ class StreamingPortalResolver(
 
     private fun urlEncode(value: String): String =
         URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+
+    private fun extractEmbedCode(embedUrl: String): String? {
+        EMBED_CODE_PATH_REGEX.find(embedUrl)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }?.let { return it }
+        return embedUrl.substringBefore('?')
+            .substringBefore('#')
+            .trimEnd('/')
+            .substringAfterLast('/')
+            .substringBefore('.')
+            .takeIf { it.length in 4..48 && it.matches(Regex("^[A-Za-z0-9_-]+$")) }
+    }
+
+    /**
+     * Resolves Vidara (`vidaraa.*` / `vidara.*`) SPA embeds via `POST $origin/api/stream`.
+     */
+    internal suspend fun resolveVidaraApi(
+        embedUrl: String,
+        streamHeaders: Map<String, String>
+    ): List<JsUnpacker.ExtractedSource> {
+        val origin = originOf(embedUrl) ?: return emptyList()
+        val filecode = extractEmbedCode(embedUrl) ?: return emptyList()
+        val reqBody = JSONObject()
+            .put("filecode", filecode)
+            .put("device", "web")
+            .put("codecs", org.json.JSONArray())
+            .toString()
+        val apiHeaders = LinkedHashMap<String, String>(streamHeaders).apply {
+            put("Accept", "application/json")
+            put("Referer", "$origin/e/$filecode")
+            put("Origin", origin)
+        }
+        val respText = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
+                runCatching { http.postJson("$origin/api/stream", reqBody, apiHeaders) }.getOrNull()
+            }
+        }?.trim()?.takeIf { it.startsWith("{") } ?: return emptyList()
+
+        val json = runCatching { JSONObject(respText) }.getOrNull() ?: return emptyList()
+        val streamUrl = json.optString("streaming_url")
+            .ifBlank { json.optString("stream_url") }
+            .ifBlank { json.optString("url") }
+            .trim()
+            .takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+            ?: return emptyList()
+        val titleHint = json.optString("title").trim()
+        val isHls = streamUrl.contains(".m3u8", ignoreCase = true) || MediaSniffer.isDisguisedHlsUrl(streamUrl)
+        return listOf(
+            JsUnpacker.ExtractedSource(
+                url = streamUrl,
+                label = titleHint,
+                height = UrlUtils.inferResolution(streamUrl, titleHint),
+                isHlsHint = isHls
+            )
+        )
+    }
+
+    /**
+     * Resolves Filemoon / Byse (`byse*`, `filemoon*`) SPA embeds via `GET $origin/api/videos/{code}`
+     * and AES-256-GCM decryption of the `playback` payload.
+     */
+    internal suspend fun resolveByseFilemoonApi(
+        embedUrl: String,
+        streamHeaders: Map<String, String>
+    ): List<JsUnpacker.ExtractedSource> {
+        val origin = originOf(embedUrl) ?: return emptyList()
+        val code = extractEmbedCode(embedUrl) ?: return emptyList()
+        val apiHeaders = LinkedHashMap<String, String>(streamHeaders).apply {
+            put("Accept", "application/json")
+            put("Referer", "$origin/e/$code")
+            put("Origin", origin)
+        }
+        val respText = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
+                runCatching { http.fetchString("$origin/api/videos/$code", apiHeaders) }.getOrNull()
+                    ?.takeIf { it.trimStart().startsWith("{") }
+                    ?: runCatching { http.fetchString("$origin/api/videos/$code/", apiHeaders) }.getOrNull()
+            }
+        }?.trim()?.takeIf { it.startsWith("{") } ?: return emptyList()
+
+        val decryptedJson = decryptBysePlaybackJson(respText) ?: return emptyList()
+        val decObj = runCatching { JSONObject(decryptedJson) }.getOrNull() ?: return emptyList()
+        val sourcesArr = decObj.optJSONArray("sources") ?: return emptyList()
+        val out = mutableListOf<JsUnpacker.ExtractedSource>()
+        for (i in 0 until sourcesArr.length()) {
+            val s = sourcesArr.optJSONObject(i) ?: continue
+            val rawFile = s.optString("url").ifBlank { s.optString("file") }.trim()
+            val resolved = normalizeEmbedUrl(embedUrl, rawFile) ?: continue
+            val label = s.optString("label").ifBlank { s.optString("quality") }.trim()
+            val explicitH = s.optInt("height", 0).takeIf { it > 0 }
+            val isHls = resolved.contains(".m3u8", ignoreCase = true) || MediaSniffer.isDisguisedHlsUrl(resolved)
+            out += JsUnpacker.ExtractedSource(
+                url = resolved,
+                label = label,
+                height = explicitH ?: UrlUtils.inferResolution(resolved, label),
+                isHlsHint = isHls
+            )
+        }
+        return out
+    }
 
     /**
      * Resolves Doodstream's dynamic `/pass_md5/<hash>/<token>` endpoint:
@@ -1107,6 +1308,10 @@ class StreamingPortalResolver(
     companion object {
         private val DOOD_PASS_MD5_REGEX = Regex("""['"](/pass_md5/[^'"\s]+)['"]""")
         private val DOOD_TOKEN_REGEX = Regex("""[?&]token=([A-Za-z0-9_-]+)""")
+        private val EMBED_CODE_PATH_REGEX = Regex("""/(?:e|d|v|f|embed)/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+        private val BASE64_LIKE_REGEX = Regex("""^[A-Za-z0-9+/=_-]+$""")
+        private val STREAMWISH_FALLBACK_MIRRORS = listOf("vibuxer.com", "hanerix.com")
+
         const val MAX_EMBED_HOPS = 3
         const val MAX_SERVERS = 8
         const val MAX_CONCURRENT_SERVERS = 6
@@ -1117,5 +1322,132 @@ class StreamingPortalResolver(
         const val PORTAL_TOTAL_BUDGET_MS = 5_500L
         const val SIBLING_MERGE_GRACE_MS = 850L
         const val UNKNOWN_HEIGHT_MERGE_GRACE_MS = 1_450L
+
+        /**
+         * Unwraps TopCinema/portal `play.php?to=<encoded>` redirector URLs (including
+         * double-prefixed `https://...https://...` targets).
+         */
+        internal fun unwrapPlayRedirectUrl(rawUrl: String): String {
+            val trimmed = rawUrl.trim()
+            if (!trimmed.contains("play.php?to=", ignoreCase = true)) return trimmed
+            val encodedPart = trimmed.substringAfter("play.php?to=").substringBefore('&').trim()
+            if (encodedPart.isEmpty()) return trimmed
+            var decoded = runCatching { URLDecoder.decode(encodedPart, StandardCharsets.UTF_8.name()).trim() }
+                .getOrDefault(encodedPart)
+            val lastHttps = decoded.lastIndexOf("https://")
+            val lastHttp = decoded.lastIndexOf("http://")
+            val lastScheme = maxOf(lastHttps, lastHttp)
+            if (lastScheme > 0) {
+                decoded = decoded.substring(lastScheme)
+            }
+            return decoded.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) || it.startsWith("//") }
+                ?: trimmed
+        }
+
+        /**
+         * Decodes direct, `play.php?to=`, standard Base64/Base64URL, and WeCima-obfuscated
+         * Base64 (`aHR0c` prefix stripped + `+` noise inserted) embed/download URLs.
+         * Returns `null` for undecodable opaque Base64 blobs so they never resolve as bogus
+         * same-host relative paths.
+         */
+        internal fun decodePortalEmbedUrl(raw: String): String? {
+            val trimmed = raw.trim().replace("&amp;", "&").replace("\\/", "/")
+            if (trimmed.isEmpty() ||
+                trimmed.startsWith("javascript:", true) ||
+                trimmed.startsWith("about:", true) ||
+                trimmed.startsWith("data:", true)
+            ) {
+                return null
+            }
+            if (trimmed.startsWith("http://", true) ||
+                trimmed.startsWith("https://", true) ||
+                trimmed.startsWith("//")
+            ) {
+                return unwrapPlayRedirectUrl(trimmed)
+            }
+            if (trimmed.startsWith("/")) {
+                return unwrapPlayRedirectUrl(trimmed)
+            }
+            if (trimmed.length >= 10 && BASE64_LIKE_REGEX.matches(trimmed)) {
+                // 1. Standard Base64 / Base64URL
+                decodeBase64ToHttpUrl(trimmed)?.let { return unwrapPlayRedirectUrl(it) }
+                // 2. WeCima obfuscated Base64: strip inserted '+' noise and prepend stripped "aHR0c" ("http")
+                val stripped = trimmed.replace("+", "").trim()
+                if (stripped.isNotEmpty()) {
+                    val wecimaCandidate = if (stripped.startsWith("aHR0c")) stripped else "aHR0c$stripped"
+                    decodeBase64ToHttpUrl(wecimaCandidate)?.let { return unwrapPlayRedirectUrl(it) }
+                }
+                // Opaque Base64-like string that decoded to neither HTTP(S) nor // -> drop
+                return null
+            }
+            return if (trimmed.contains('/') || trimmed.contains('.')) unwrapPlayRedirectUrl(trimmed) else null
+        }
+
+        private fun decodeBase64ToHttpUrl(b64: String): String? = runCatching {
+            val normalized = b64.replace('-', '+').replace('_', '/')
+            val pad = (4 - normalized.length % 4) % 4
+            val bytes = java.util.Base64.getDecoder().decode(normalized + "=".repeat(pad))
+            val text = String(bytes, StandardCharsets.UTF_8).trim()
+            if ((text.startsWith("http://", true) || text.startsWith("https://", true) || text.startsWith("//")) &&
+                text.none { it.code < 0x20 || it.code == 0x7F }
+            ) {
+                text
+            } else {
+                null
+            }
+        }.getOrNull()
+
+        /**
+         * Pure AES-256-GCM decryptor for Byse / Filemoon `/api/videos/{code}` playback JSON.
+         */
+        internal fun decryptBysePlaybackJson(apiResponseJson: String): String? {
+            val playback = runCatching { JSONObject(apiResponseJson).optJSONObject("playback") }.getOrNull() ?: return null
+            val keyParts = playback.optJSONArray("key_parts") ?: return null
+            val version = playback.optInt("version", 1)
+            val iv = decodeBase64UrlBytes(playback.optString("iv")) ?: return null
+            val payload = decodeBase64UrlBytes(playback.optString("payload")) ?: return null
+            if (iv.isEmpty() || payload.size <= 16) return null
+
+            val total = keyParts.length()
+            val candidateKeys = ArrayList<ByteArray>(2)
+            if (version in 1..20 && version <= total && (31 - version) in 1..total) {
+                val p1 = decodeBase64UrlBytes(keyParts.optString(version - 1))
+                val p2 = decodeBase64UrlBytes(keyParts.optString(30 - version))
+                if (p1 != null && p2 != null) {
+                    val combined = p1 + p2
+                    if (combined.size == 32) candidateKeys.add(combined)
+                }
+            }
+            if (total >= 2) {
+                val p1 = decodeBase64UrlBytes(keyParts.optString(0))
+                val p2 = decodeBase64UrlBytes(keyParts.optString(1))
+                if (p1 != null && p2 != null) {
+                    val combined = p1 + p2
+                    if (combined.size == 32 && candidateKeys.none { it.contentEquals(combined) }) {
+                        candidateKeys.add(combined)
+                    }
+                }
+            }
+
+            for (key in candidateKeys) {
+                val plain = runCatching {
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+                    String(cipher.doFinal(payload), StandardCharsets.UTF_8)
+                }.getOrNull()
+                if (!plain.isNullOrBlank() && plain.contains("sources")) {
+                    return plain
+                }
+            }
+            return null
+        }
+
+        private fun decodeBase64UrlBytes(raw: String): ByteArray? = runCatching {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            val normalized = trimmed.replace('-', '+').replace('_', '/')
+            val pad = (4 - normalized.length % 4) % 4
+            java.util.Base64.getDecoder().decode(normalized + "=".repeat(pad))
+        }.getOrNull()
     }
 }

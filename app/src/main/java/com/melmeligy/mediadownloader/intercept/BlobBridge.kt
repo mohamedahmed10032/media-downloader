@@ -939,10 +939,10 @@ object BlobBridge {
       }
     });
 
-    // E2. Embed player globals: window.links ({hls2, hls3, hls4, hls}) & Mixdrop window.MDCore.wurl
+    // E2. Embed player globals: window.links ({hls4, hls2, hls3, hls}) & Mixdrop window.MDCore.wurl
     safe(function () {
       if (window.links && typeof window.links === 'object') {
-        var linkKeys = ['hls2', 'hls3', 'hls4', 'hls', 'file', 'src'];
+        var linkKeys = ['hls4', 'hls2', 'hls3', 'hls', 'file', 'src'];
         for (var lk = 0; lk < linkKeys.length; lk++) {
           var lKey = linkKeys[lk];
           var lVal = window.links[lKey];

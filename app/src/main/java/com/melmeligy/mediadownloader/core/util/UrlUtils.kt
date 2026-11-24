@@ -30,6 +30,9 @@ object UrlUtils {
     private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
     private val tiktokIdPattern = Regex("tiktok\\.com/(?:(?:@[^/]+/)?(?:video|photo)|v)/(\\d+)", RegexOption.IGNORE_CASE)
     private val tiktokMobileLegacyVPath = Regex("^/v/(\\d+)(?:\\.html)?/?$", RegexOption.IGNORE_CASE)
+    private val trailingConcatenatedBadgeRegex = Regex(
+        "(%[89A-Fa-f][0-9A-Fa-f])(?:Viewed|Watched)(?=[/?#]|$)"
+    )
     private val redditPostPattern = Regex("(?:reddit\\.com/r/[^/]+/comments|redd\\.it)/([A-Za-z0-9]+)", RegexOption.IGNORE_CASE)
     private val threadsPostPattern = Regex("threads\\.(?:net|com)/(?:@[^/]+/)?post/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
 
@@ -72,7 +75,8 @@ object UrlUtils {
 
     /** Cleans social tracking parameters and normalizes paths while preserving fragments and encoding Unicode slugs. */
     fun cleanSocialUrl(url: String): String {
-        val trimmed = encodeNonAsciiUrl(url.trim())
+        val encoded = encodeNonAsciiUrl(url.trim())
+        val trimmed = trailingConcatenatedBadgeRegex.replace(encoded, "$1")
         val hashIdx = trimmed.indexOf('#')
         val withoutFrag = if (hashIdx >= 0) trimmed.substring(0, hashIdx) else trimmed
         val frag = if (hashIdx >= 0) trimmed.substring(hashIdx) else ""
@@ -267,6 +271,7 @@ object UrlUtils {
         val lower = url.lowercase()
         return lower.contains("/share/") ||
             (h.contains("tiktok.com") && lower.contains("/t/")) ||
+            (h == "m.tiktok.com" && lower.contains("/v/")) ||
             (h.contains("reddit.com") && lower.contains("/s/"))
     }
 
