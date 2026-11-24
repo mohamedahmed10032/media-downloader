@@ -27,6 +27,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
@@ -56,6 +58,10 @@ class HeadlessWebExtractor @Inject constructor(
     private val progressTracker: ExtractionProgressTracker
 ) {
 
+    // Android shares one Main/Chromium WebView thread process-wide; serializing headless runs
+    // prevents overlapping offscreen WebViews from starving UI/JS callbacks on repeated attempts.
+    private val headlessMutex = Mutex()
+
     private val portalResolver = StreamingPortalResolver(
         http = http,
         hlsExtractor = hlsExtractor,
@@ -77,6 +83,15 @@ class HeadlessWebExtractor @Inject constructor(
         targetUrl: String,
         timeoutMs: Long = 7_500L,
         socialEmbedFastMode: Boolean = false
+    ): ResolvedMedia? = headlessMutex.withLock {
+        extractSerialized(targetUrl, timeoutMs, socialEmbedFastMode)
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun extractSerialized(
+        targetUrl: String,
+        timeoutMs: Long,
+        socialEmbedFastMode: Boolean
     ): ResolvedMedia? = coroutineScope {
         val isSocialFastMode = socialEmbedFastMode || UrlUtils.isDedicatedSocialPlatformUrl(targetUrl)
         val effectiveTimeoutMs = if (isSocialFastMode) minOf(timeoutMs, SOCIAL_FAST_TIMEOUT_MS) else timeoutMs

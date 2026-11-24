@@ -18,7 +18,8 @@ class MediaSniffingInterceptor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val isInternalDownload = request.header("X-Internal-Download") != null
+        val isInternalBypass = request.header("X-Internal-Download") != null ||
+            request.header("X-Internal-Probe") != null
         val hasInternalHeaders = request.headers.names().any { it.startsWith("X-Internal-", ignoreCase = true) }
         val wireRequest = if (hasInternalHeaders) {
             request.newBuilder().apply {
@@ -29,7 +30,7 @@ class MediaSniffingInterceptor(
         } else {
             request
         }
-        if (isInternalDownload) {
+        if (isInternalBypass) {
             return chain.proceed(wireRequest)
         }
         val response = chain.proceed(wireRequest)

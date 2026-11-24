@@ -20,15 +20,20 @@ object UrlUtils {
         "igsh", "igshid", "evlk", "utm_source", "utm_medium", "utm_campaign", "utm_term",
         "utm_content", "fbclid", "invite_code", "sender", "sfo", "epik", "share_id",
         "mt", "nic_v3",
-        // TikTok share tracking parameters (never CDN signature params)
-        "_t", "_r", "is_from_webapp", "sender_device", "tt_from", "share_app_id", "share_link_id"
+        // TikTok & TikTok Lite share tracking parameters (never CDN signature params)
+        "_t", "_r", "is_from_webapp", "sender_device", "tt_from", "share_app_id", "share_link_id",
+        "enter_method", "enter_from", "checksum", "sec_uid", "sec_user_id", "share_item_id",
+        "u_code", "ug_btm", "social_share_type"
     )
     private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/p/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z0-9-]+\\.)?pinterest\\.[a-z.]+/pin/(?:[^/?#]*--)?(\\d+)", RegexOption.IGNORE_CASE)
     private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
-    private val tiktokIdPattern = Regex("tiktok\\.com/(?:(?:@[^/]+/)?(?:video|photo)|v)/(\\d+)", RegexOption.IGNORE_CASE)
+    private val tiktokIdPattern = Regex(
+        "tiktokv?\\.com/(?:(?:@[^/]*/|share/)?(?:video|photo)|v|embed(?:/v\\d+)?)/(\\d+)",
+        RegexOption.IGNORE_CASE
+    )
     private val tiktokMobileLegacyVPath = Regex("^/v/(\\d+)(?:\\.html)?/?$", RegexOption.IGNORE_CASE)
     private val trailingConcatenatedBadgeRegex = Regex(
         "(%[89A-Fa-f][0-9A-Fa-f])(?:Viewed|Watched)(?=[/?#]|$)"
@@ -130,11 +135,31 @@ object UrlUtils {
         }.getOrDefault(trimmed)
     }
 
-    /** Extracts the first http(s) URL embedded inside arbitrary share text, if any. */
+    /**
+     * Extracts the primary http(s) URL embedded inside arbitrary share text, skipping promotional
+     * app-download links (such as TikTok Lite's `https://www.tiktok.com/tiktoklite`) whenever
+     * another URL is present.
+     */
     fun extractFirstUrl(input: String): String? {
-        val raw = embeddedHttpUrlRegex.find(input)?.value?.trimEnd('.', ',', ';', ')', ']', '>', '"', '\'')
-            ?: return null
-        return cleanSocialUrl(raw)
+        val candidates = embeddedHttpUrlRegex.findAll(input)
+            .map { it.value.trimEnd('.', ',', ';', ')', ']', '>', '"', '\'') }
+            .filter { it.isNotBlank() }
+            .toList()
+        if (candidates.isEmpty()) return null
+        val picked = if (candidates.size > 1) {
+            candidates.firstOrNull { !isPromotionalAppUrl(it) } ?: candidates.first()
+        } else {
+            candidates.first()
+        }
+        return cleanSocialUrl(picked)
+    }
+
+    private fun isPromotionalAppUrl(url: String): Boolean {
+        val lower = url.lowercase().substringBefore('?').substringBefore('#').trimEnd('/')
+        return lower.endsWith("tiktok.com/tiktoklite") ||
+            lower.endsWith("tiktok.com/download") ||
+            lower.contains("play.google.com/store/apps") ||
+            lower.contains("apps.apple.com/")
     }
 
     /** True if the input looks like a URL or bare domain rather than a search phrase. */

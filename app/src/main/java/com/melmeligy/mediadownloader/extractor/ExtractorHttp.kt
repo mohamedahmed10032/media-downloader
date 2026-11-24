@@ -736,7 +736,9 @@ class ExtractorHttp {
 
     fun buildRequest(url: String, headers: Map<String, String>): Request.Builder {
         val safeUrl = UrlUtils.encodeNonAsciiUrl(url.trim())
-        val builder = Request.Builder().url(safeUrl)
+        val builder = Request.Builder()
+            .url(safeUrl)
+            .header("X-Internal-Probe", "true")
         withUserAgent(headers).forEach { (k, v) -> builder.header(k, v) }
         return builder
     }
