@@ -110,26 +110,59 @@ class HlsExtractor @Inject constructor(
 
     private suspend fun verifySegmentDownloadable(
         segmentUrl: String,
-        headers: Map<String, String>
+        headers: Map<String, String>,
+        isAesEncrypted: Boolean = false
     ): Pair<Map<String, String>, HeadInfo>? {
         val candidates = listOf(headers) + ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
         for (hdrs in candidates) {
-            val info = withTimeoutOrNull(SEGMENT_PROBE_TIMEOUT_MS + 250L) {
-                withCancellableHttpCalls(timeoutMs = SEGMENT_PROBE_TIMEOUT_MS) {
-                    runCatching { http.probe(segmentUrl, hdrs, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
+            val info = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+                withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
+                    runCatching { http.probe(segmentUrl, hdrs, VERIFY_SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
                 }
-            } ?: continue
-            val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-            // Disguised HLS segments frequently return image/* or text/plain; only reject HTML/JSON error pages here.
-            val isHtmlOrJson = ct.startsWith("text/html") ||
-                ct.startsWith("application/xhtml") ||
-                ct.startsWith("application/json")
-            if (info.code in 200..299 && !isHtmlOrJson) {
-                return hdrs to info
             }
-            // Only continue relaxing headers on 401/403; 404/410/5xx means the segment itself is dead
-            if (info.code != 401 && info.code != 403) {
-                return null
+            if (info != null) {
+                val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                val isHtmlOrJson = ct.startsWith("text/html") ||
+                    ct.startsWith("application/xhtml") ||
+                    ct.startsWith("application/json")
+                if (info.code in 200..299 && !isHtmlOrJson) {
+                    return hdrs to info
+                }
+                // Dead segment (404/410) will not succeed via GET or header relaxation
+                if (info.code == 404 || info.code == 410) {
+                    return null
+                }
+            }
+
+            // Many HLS segment CDNs (EarnVids, VidHide, Cloudflare workers) reject `Range: bytes=0-0`
+            // with HTTP 400/403/405/500 or timeout, even though plain unranged GET succeeds.
+            val shouldTryUnrangedGet = info == null ||
+                info.code == 400 || info.code == 403 || info.code == 405 || info.code == 416 || info.code >= 500
+            if (shouldTryUnrangedGet) {
+                val getInfo = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+                    withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
+                        runCatching {
+                            http.peekHlsSegmentGet(
+                                url = segmentUrl,
+                                headers = hdrs,
+                                timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS,
+                                isAesEncrypted = isAesEncrypted
+                            )
+                        }.getOrNull()
+                    }
+                }
+                if (getInfo != null) {
+                    val gct = getInfo.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                    val isHtmlOrJson = gct.startsWith("text/html") ||
+                        gct.startsWith("application/xhtml") ||
+                        gct.startsWith("application/json")
+                    if (getInfo.code in 200..299 && !isHtmlOrJson) {
+                        return hdrs to getInfo
+                    }
+                    if (getInfo.code == 404 || getInfo.code == 410) {
+                        return null
+                    }
+                }
             }
         }
         return null
@@ -226,12 +259,26 @@ class HlsExtractor @Inject constructor(
             if (verifyDownloadable) {
                 val mediaSegs = sanitizedFirstVariant?.segments?.filter { !it.isInitMap }.orEmpty()
                 if (mediaSegs.isEmpty()) return null
-                // Verify an interior segment (when available) so the single probe also calibrates bitrate
-                val probeSeg = if (mediaSegs.size >= 3) mediaSegs[mediaSegs.size / 2] else mediaSegs.first()
-                val (verifiedHeaders, headInfo) = verifySegmentDownloadable(probeSeg.url, effectiveHeaders)
-                    ?: return null
-                effectiveHeaders = verifiedHeaders
-                verifiedSegProbe = probeSeg to headInfo
+                // Verify an interior segment (so the probe also calibrates bitrate), falling back to seg[0]
+                // if the interior segment fails (some CDNs only warm/sign initial segments eagerly).
+                val primarySeg = if (mediaSegs.size >= 3) mediaSegs[mediaSegs.size / 2] else mediaSegs.first()
+                val segCandidates = if (primarySeg.url != mediaSegs.first().url) {
+                    listOf(primarySeg, mediaSegs.first())
+                } else {
+                    listOf(primarySeg)
+                }
+                var verifiedPair: Pair<HlsParsedSegment, Pair<Map<String, String>, HeadInfo>>? = null
+                for (candSeg in segCandidates) {
+                    val isAes = candSeg.keySpec.method == HlsEncryptionMethod.AES_128
+                    val res = verifySegmentDownloadable(candSeg.url, effectiveHeaders, isAesEncrypted = isAes)
+                    if (res != null) {
+                        verifiedPair = candSeg to res
+                        break
+                    }
+                }
+                val (winningSeg, winResult) = verifiedPair ?: return null
+                effectiveHeaders = winResult.first
+                verifiedSegProbe = winningSeg to winResult.second
             }
 
             val probedDurationSeconds = sanitizedFirstVariant?.totalDurationSec?.roundToLong() ?: 0L
@@ -426,7 +473,9 @@ class HlsExtractor @Inject constructor(
                 } else null
 
                 if (verifyDownloadable) {
-                    val (verifiedHeaders, _) = verifySegmentDownloadable(mediaSegments.first().url, effectiveHeaders)
+                    val firstSeg = mediaSegments.first()
+                    val isAes = firstSeg.keySpec.method == HlsEncryptionMethod.AES_128
+                    val (verifiedHeaders, _) = verifySegmentDownloadable(firstSeg.url, effectiveHeaders, isAesEncrypted = isAes)
                         ?: return null
                     effectiveHeaders = verifiedHeaders
                 }
@@ -650,7 +699,8 @@ class HlsExtractor @Inject constructor(
     )
 
     private companion object {
-        const val VARIANT_PLAYLIST_TIMEOUT_MS = 2_500L
+        const val VARIANT_PLAYLIST_TIMEOUT_MS = 3_200L
+        const val VERIFY_SEGMENT_PROBE_TIMEOUT_MS = 2_600L
         const val SEGMENT_PROBE_TIMEOUT_MS = 1_200L
         const val DIRECT_SEGMENT_PROBE_TIMEOUT_MS = 1_800L
         const val TS_TO_MP4_CONTAINER_FACTOR = 0.94

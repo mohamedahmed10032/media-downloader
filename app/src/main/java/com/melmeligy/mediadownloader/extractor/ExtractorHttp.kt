@@ -448,6 +448,94 @@ class ExtractorHttp {
     }
 
     /**
+     * Lightweight unranged `GET` peek for HLS segment verification when a CDN rejects `Range: bytes=0-0`
+     * (e.g. EarnVids/VidHide/Cloudflare-proxy segment hosts returning HTTP 400/403/500 to ranged probes)
+     * while serving valid media segments to plain unranged `GET` requests.
+     *
+     * Reads at most 64 leading bytes to validate non-HTML/non-JSON binary media signatures via
+     * [com.melmeligy.mediadownloader.download.HlsSegmentDownloader.isValidSegmentPrefix], then aborts
+     * immediately without draining the remaining segment body.
+     */
+    fun peekHlsSegmentGet(
+        url: String,
+        headers: Map<String, String>,
+        timeoutMs: Long = 2_600L,
+        isAesEncrypted: Boolean = false
+    ): HeadInfo? {
+        val scoped = ExtractorHttpScope.currentTimeoutMs()?.coerceAtLeast(300L)
+        val requested = timeoutMs.coerceAtLeast(300L)
+        val effective = if (scoped != null && scoped < requested) scoped else requested
+        val c = clientWithScopedTimeout(probeClient, effective)
+        val request = buildRequest(url, headers)
+            .header("X-Internal-Download", "true")
+            .get()
+            .build()
+        val registry = ExtractorHttpScope.currentRegistry()
+        if (registry?.isCancelled() == true) {
+            throw CancellationException("HTTP call cancelled before execution")
+        }
+        val call = c.newCall(request)
+        if (registry != null && !registry.register(call)) {
+            throw CancellationException("HTTP call cancelled")
+        }
+        return try {
+            call.execute().use { response ->
+                val ct = response.header("Content-Type")?.substringBefore(';')?.trim().orEmpty()
+                if (response.code !in 200..299) {
+                    return HeadInfo(
+                        code = response.code,
+                        contentType = ct.ifBlank { null },
+                        contentLength = -1L,
+                        acceptsRanges = false,
+                        finalUrl = response.request.url.toString()
+                    )
+                }
+                val body = response.body ?: return null
+                val prefix = ByteArray(64)
+                val read = runCatching { body.byteStream().read(prefix) }.getOrDefault(-1)
+                // Abort call immediately so OkHttp does not waste bandwidth draining a multi-MB segment
+                runCatching { call.cancel() }
+                if (read <= 0) return null
+                val valid = com.melmeligy.mediadownloader.download.HlsSegmentDownloader.isValidSegmentPrefix(
+                    bytes = prefix,
+                    length = read,
+                    contentType = ct,
+                    isAesEncrypted = isAesEncrypted
+                )
+                if (!valid) {
+                    return HeadInfo(
+                        code = response.code,
+                        contentType = "text/html",
+                        contentLength = -1L,
+                        acceptsRanges = false,
+                        finalUrl = response.request.url.toString()
+                    )
+                }
+                val total = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                val acceptsRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
+                HeadInfo(
+                    code = response.code,
+                    contentType = ct.ifBlank { null },
+                    contentLength = total,
+                    acceptsRanges = acceptsRanges,
+                    finalUrl = response.request.url.toString()
+                )
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (ioe: IOException) {
+            if (registry?.isCancelled() == true) {
+                throw CancellationException("HTTP call cancelled", ioe)
+            }
+            null
+        } catch (_: Exception) {
+            null
+        } finally {
+            registry?.unregister(call)
+        }
+    }
+
+    /**
      * Single-hop redirect resolver (`followRedirects = false`) that reads ONLY the `Location`
      * response header via `HEAD` (falling back to ranged `GET` `bytes=0-0` on HTTP 405) with
      * zero response-body download. Returns `null` if [url] did not return a 3xx redirect.

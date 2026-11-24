@@ -501,14 +501,15 @@ class StreamingPortalResolver(
                 }
                 if (outcome.streams.isNotEmpty()) {
                     collectedStreams += outcome.streams
-                    val hasMultiQualityHls = collectedStreams.any { it.isHls } &&
-                        collectedStreams.mapNotNull { it.height }.distinct().size >= 2
+                    val distinctHeights = collectedStreams.mapNotNull { it.height }.distinct().size
+                    val hasMultiQualityHls = collectedStreams.any { it.isHls } && distinctHeights >= 2
                     if (hasMultiQualityHls) {
                         break
                     }
                     if (firstWinDeadlineMs == null) {
                         if (remaining == 0) break
-                        firstWinDeadlineMs = System.currentTimeMillis() + SIBLING_MERGE_GRACE_MS
+                        val graceMs = if (distinctHeights == 0) UNKNOWN_HEIGHT_MERGE_GRACE_MS else SIBLING_MERGE_GRACE_MS
+                        firstWinDeadlineMs = System.currentTimeMillis() + graceMs
                     }
                 }
             }
@@ -1044,5 +1045,6 @@ class StreamingPortalResolver(
         const val PROGRESSIVE_PROBE_TIMEOUT_MS = 2_200L
         const val PORTAL_TOTAL_BUDGET_MS = 5_500L
         const val SIBLING_MERGE_GRACE_MS = 850L
+        const val UNKNOWN_HEIGHT_MERGE_GRACE_MS = 1_450L
     }
 }

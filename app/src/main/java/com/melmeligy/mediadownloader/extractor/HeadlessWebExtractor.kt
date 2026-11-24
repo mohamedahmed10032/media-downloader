@@ -584,12 +584,40 @@ class HeadlessWebExtractor @Inject constructor(
                 "Outer pass finished host=${UrlUtils.host(currentPageUrl)} captured=${localCaptured.size} verified=${verifiedStreams.size} interceptedEmbeds=${discoveredEmbedUrls.size}"
             )
             if (!isSocialFastMode && !hasVerifiedOuterVideo && webViewRef != null) {
-                val domEmbeds = collectDomEmbedIframes(webViewRef!!)
-                val allEmbeds = discoveredEmbedUrls + domEmbeds
-                maybeStartHybridPortal(allEmbeds)
-                val promotable = selectPromotableEmbedUrls(
+                val failedOuterEmbed = lastEmbedIframeUrl.get()?.substringBefore('#')?.trimEnd('/')?.lowercase()
+                var domEmbeds = collectDomEmbedIframes(webViewRef!!)
+                var allEmbeds = discoveredEmbedUrls + domEmbeds
+                val rawPromotable = selectPromotableEmbedUrls(
                     outerPageUrl = currentPageUrl,
                     candidates = allEmbeds,
+                    maxEmbeds = MAX_PROMOTED_EMBEDS + 1
+                )
+                val untestedAlternateExists = rawPromotable.any {
+                    failedOuterEmbed == null || it.substringBefore('#').trimEnd('/').lowercase() != failedOuterEmbed
+                }
+                // If outer pass captured a candidate that failed verification and DOM only listed that same embed
+                // (e.g. portals that inject alternate server iframes only on tab click), click the next server tab once.
+                if (!untestedAlternateExists && localCaptured.isNotEmpty()) {
+                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                    withContext(dispatchers.main) {
+                        runCatching { webViewRef?.evaluateJavascript(TRY_NEXT_SERVER_JS, null) }
+                    }
+                    delay(1_400L)
+                    domEmbeds = collectDomEmbedIframes(webViewRef!!)
+                    allEmbeds = discoveredEmbedUrls + domEmbeds
+                }
+                maybeStartHybridPortal(allEmbeds)
+                val orderedCandidates = if (failedOuterEmbed != null) {
+                    val (failedOnes, freshOnes) = allEmbeds.partition {
+                        it.substringBefore('#').trimEnd('/').lowercase() == failedOuterEmbed
+                    }
+                    freshOnes + failedOnes
+                } else {
+                    allEmbeds
+                }
+                val promotable = selectPromotableEmbedUrls(
+                    outerPageUrl = currentPageUrl,
+                    candidates = orderedCandidates,
                     maxEmbeds = MAX_PROMOTED_EMBEDS
                 )
                 com.melmeligy.mediadownloader.core.AppLogger.d(
@@ -1176,7 +1204,7 @@ class HeadlessWebExtractor @Inject constructor(
         private const val SELF_CONTAINED_SETTLE_MS = 220L
         private const val SPLIT_DASH_AUDIO_WAIT_MS = 750L
         private const val METADATA_SCRAPE_MAX_WAIT_MS = 750L
-        internal const val MAX_PROMOTED_EMBEDS = 3
+        internal const val MAX_PROMOTED_EMBEDS = 4
         internal const val PROMOTED_EMBED_TIMEOUT_MS = 4_500L
         internal const val SOCIAL_FAST_TIMEOUT_MS = 3_800L
 
@@ -1412,11 +1440,11 @@ class HeadlessWebExtractor @Inject constructor(
                 "for(var i=0;i<frames.length;i++){" +
                 "addUrl(frames[i].getAttribute('src')||frames[i].getAttribute('data-src')||frames[i].getAttribute('data-lazy-src')||'');" +
                 "}" +
-                "var tabs=document.querySelectorAll('[data-url],[data-embed],[data-iframe],[data-watch]');" +
+                "var tabs=document.querySelectorAll('[data-url],[data-embed],[data-iframe],[data-watch],[data-link],[data-player],[data-src]');" +
                 "for(var j=0;j<tabs.length;j++){" +
                 "var tag=(tabs[j].tagName||'').toLowerCase();" +
-                "if(tag==='img'||tag==='script'||tag==='link')continue;" +
-                "addUrl(tabs[j].getAttribute('data-url')||tabs[j].getAttribute('data-embed')||tabs[j].getAttribute('data-iframe')||tabs[j].getAttribute('data-watch')||'');" +
+                "if(tag==='img'||tag==='script'||tag==='link'||tag==='source'||tag==='video'||tag==='audio')continue;" +
+                "addUrl(tabs[j].getAttribute('data-url')||tabs[j].getAttribute('data-embed')||tabs[j].getAttribute('data-iframe')||tabs[j].getAttribute('data-watch')||tabs[j].getAttribute('data-link')||tabs[j].getAttribute('data-player')||tabs[j].getAttribute('data-src')||'');" +
                 "}" +
                 "return JSON.stringify(out);" +
                 "}catch(e){return '[]';}})();"
