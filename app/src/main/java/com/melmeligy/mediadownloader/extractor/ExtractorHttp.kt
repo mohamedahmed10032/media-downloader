@@ -188,6 +188,8 @@ class ExtractorHttp {
         this.service = null
     }
 
+    private val scopedClientCache = ConcurrentHashMap<Long, OkHttpClient>()
+
     private fun clientWithScopedTimeout(base: OkHttpClient, explicitTimeoutMs: Long? = null): OkHttpClient {
         val scoped = ExtractorHttpScope.currentTimeoutMs()
         val effective = listOfNotNull(explicitTimeoutMs, scoped)
@@ -200,12 +202,20 @@ class ExtractorHttp {
         if (curCall in 1L..effective && curRead in 1L..effective) {
             return base
         }
-        return base.newBuilder()
+        val baseId = System.identityHashCode(base).toLong() shl 32
+        val cacheKey = baseId or (effective and 0xFFFFFFFFL)
+        scopedClientCache[cacheKey]?.let { return it }
+        if (scopedClientCache.size >= 32) {
+            scopedClientCache.clear()
+        }
+        val derived = base.newBuilder()
             .connectTimeout(effective, TimeUnit.MILLISECONDS)
             .readTimeout(effective, TimeUnit.MILLISECONDS)
             .writeTimeout(effective, TimeUnit.MILLISECONDS)
             .callTimeout(effective, TimeUnit.MILLISECONDS)
             .build()
+        scopedClientCache.putIfAbsent(cacheKey, derived)?.let { return it }
+        return derived
     }
 
     private inline fun <T> executeTracked(
@@ -224,7 +234,9 @@ class ExtractorHttp {
         try {
             return call.execute().use(block)
         } catch (ioe: IOException) {
-            if (registry?.isCancelled() == true || call.isCanceled()) {
+            val isOkHttpTimeout = ioe is java.io.InterruptedIOException &&
+                ioe.message?.contains("timeout", ignoreCase = true) == true
+            if (registry?.isCancelled() == true || (call.isCanceled() && !isOkHttpTimeout)) {
                 throw CancellationException("HTTP call cancelled", ioe)
             }
             throw ioe
@@ -689,14 +701,14 @@ class ExtractorHttp {
             return out
         }
 
-        fun isRejectedMediaContentType(contentType: String?): Boolean {
+        fun isRejectedMediaContentType(contentType: String?, allowImage: Boolean = false): Boolean {
             val ct = contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
             if (ct.isEmpty()) return false
             return ct.startsWith("text/html") ||
                 ct.startsWith("application/xhtml") ||
                 ct.startsWith("application/json") ||
                 ct.startsWith("text/plain") ||
-                ct.startsWith("image/")
+                (!allowImage && ct.startsWith("image/"))
         }
     }
 }

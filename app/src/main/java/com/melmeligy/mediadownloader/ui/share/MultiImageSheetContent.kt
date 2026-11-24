@@ -394,7 +394,8 @@ private fun GallerySlideTile(
     val imageRequest = remember(slide.thumbnailUrl, slide.headers) {
         ImageRequest.Builder(context)
             .data(slide.thumbnailUrl)
-            .crossfade(true)
+            .size(360, 360)
+            .crossfade(false)
             .apply {
                 slide.headers.forEach { (k, v) ->
                     if (!k.startsWith("X-Internal-", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) {

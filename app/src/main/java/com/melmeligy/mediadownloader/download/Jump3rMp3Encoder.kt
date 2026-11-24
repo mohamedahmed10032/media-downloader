@@ -89,7 +89,7 @@ class Jump3rMp3Encoder(
         flags.out_samplerate = effectiveRate
         flags.brate = effectiveBitrateKbps
         flags.VBR = VbrMode.vbr_off
-        flags.quality = 5
+        flags.quality = 7
         flags.mode = if (channelCount == 1) MPEGMode.MONO else MPEGMode.JOINT_STEREO
         flags.bWriteVbrTag = false
 

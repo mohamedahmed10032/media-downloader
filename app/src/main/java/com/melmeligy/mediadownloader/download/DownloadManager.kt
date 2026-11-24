@@ -52,6 +52,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.min
@@ -752,8 +753,9 @@ class DownloadManager private constructor(
             val companionAcceptsRanges = headers["X-Internal-Companion-Accepts-Ranges"]?.equals("true", ignoreCase = true) == true
 
             if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
-                // Cache remote thumbnail (or extract a remote video frame if no poster URL exists / fetch fails)
-                // on queueScope so it finishes even if the user pauses right after starting.
+                // Cache remote thumbnail on queueScope so it finishes even if the user pauses right after starting.
+                // For MediaType.IMAGE whose thumbnailUrl == remoteUrl, skip the duplicate HTTP download and
+                // promote the downloaded staging file locally once transfer completes.
                 val effectiveThumbCandidate = item.thumbnailUrl?.takeIf {
                     DownloadThumbnailCache.resolveExistingLocalFile(it) != null ||
                         it.startsWith("http://", ignoreCase = true) ||
@@ -761,18 +763,20 @@ class DownloadManager private constructor(
                 } ?: headers["X-Internal-Original-Thumbnail-Url"]?.takeIf {
                     it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
                 }
-                queueScope.launch(dispatchers.io) {
-                    val cached = if (!effectiveThumbCandidate.isNullOrBlank()) {
-                        thumbnailCache.cacheRemoteThumbnail(
+                val isDuplicateImageFetch = item.type == MediaType.IMAGE &&
+                    !effectiveThumbCandidate.isNullOrBlank() &&
+                    DownloadThumbnailCache.resolveExistingLocalFile(effectiveThumbCandidate) == null &&
+                    effectiveThumbCandidate.trim().equals(item.remoteUrl.trim(), ignoreCase = true)
+                if (!isDuplicateImageFetch && !effectiveThumbCandidate.isNullOrBlank()) {
+                    queueScope.launch(dispatchers.io) {
+                        val cached = thumbnailCache.cacheRemoteThumbnail(
                             downloadId = item.id,
                             thumbnailUrl = effectiveThumbCandidate,
                             sourceUrl = item.sourceUrl,
                             headers = headers
                         )
-                    } else {
-                        null
+                        persistCachedThumbnail(cached)
                     }
-                    persistCachedThumbnail(cached)
                 }
             }
             val companionAudioUrl = headers["X-Internal-Companion-Audio"]?.takeIf { it.startsWith("http") }
@@ -818,75 +822,154 @@ class DownloadManager private constructor(
                     .coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES)
 
                 try {
-                    hlsDownloader.download(
-                        playlistUrl = item.remoteUrl,
-                        headers = headers,
-                        dest = stagingTs,
-                        expectedTotalBytes = videoKnownBytes,
-                        maxRetries = configuredRetries
-                    ) { p ->
-                        if (targetAudioTotal > 0L) {
-                            // Keep progress aligned with target audio bytes without rolling back or spiking to video size
-                            val ratio = if (p.total > 0L) {
-                                (p.downloaded.toDouble() / p.total.toDouble()).coerceIn(0.0, 1.0)
-                            } else 0.0
-                            val scaledDone = (targetAudioTotal * 0.90 * ratio).toLong()
-                            reportProgress(scaledDone, targetAudioTotal, p.speed, p.eta)
-                        } else {
-                            val combinedEst = if (hasSplitHlsAudio && p.total > 0L) {
-                                p.total + audioKnownBytes.coerceAtLeast(0L)
-                            } else {
-                                p.total
-                            }
-                            reportProgress(p.downloaded, combinedEst, p.speed, p.eta)
-                        }
-                    }
-
-                    if (hasSplitHlsAudio && companionAudioUrl != null) {
-                        val videoActual = stagingTs.length()
+                    if (hasSplitHlsAudio) {
+                        val splitAudioUrl = companionAudioUrl!!
                         val audioIsHls = headers["X-Internal-Companion-Audio-Hls"] == "true" ||
-                            companionAudioUrl.contains(".m3u8", ignoreCase = true)
-                        if (audioIsHls) {
-                            hlsDownloader.download(
-                                playlistUrl = companionAudioUrl,
-                                headers = headers,
-                                dest = stagingAudioTs,
-                                expectedTotalBytes = audioKnownBytes,
-                                maxRetries = configuredRetries
-                            ) { p ->
-                                val total = if (p.total > 0L) videoActual + p.total else -1L
-                                reportProgress(videoActual + p.downloaded, total, p.speed, p.eta)
+                            splitAudioUrl.contains(".m3u8", ignoreCase = true)
+                        val progressMutex = Mutex()
+                        val vDone = AtomicLong(0L)
+                        val aDone = AtomicLong(0L)
+                        val vTotal = AtomicLong(videoKnownBytes.coerceAtLeast(0L))
+                        val aTotal = AtomicLong(audioKnownBytes.coerceAtLeast(0L))
+                        val vSpeed = AtomicLong(0L)
+                        val aSpeed = AtomicLong(0L)
+
+                        suspend fun emitSplitHlsProgress() {
+                            progressMutex.withLock {
+                                val done = vDone.get() + aDone.get()
+                                val vt = vTotal.get()
+                                val at = aTotal.get()
+                                val total = if (vt > 0L && at > 0L) maxOf(done, vt + at)
+                                else if (vt > 0L) maxOf(done, vt + audioKnownBytes.coerceAtLeast(0L))
+                                else -1L
+                                val speed = vSpeed.get() + aSpeed.get()
+                                val eta = if (speed > 0L && total > done) ((total - done) / speed).coerceAtLeast(0L) else -1L
+                                reportProgress(done, total, speed, eta)
                             }
-                        } else {
-                            segmentedDownloader.download(
-                                url = companionAudioUrl,
-                                headers = headers,
-                                dest = stagingAudioTs,
-                                knownTotal = audioKnownBytes,
-                                acceptsRanges = companionAcceptsRanges,
-                                segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
-                                onProgress = { p ->
-                                    val total = if (p.total > 0L) videoActual + p.total else -1L
-                                    reportProgress(videoActual + p.downloaded, total, p.speed, p.eta)
-                                }
-                            )
                         }
+
+                        coroutineScope {
+                            val videoDeferred = async(dispatchers.io) {
+                                hlsDownloader.download(
+                                    playlistUrl = item.remoteUrl,
+                                    headers = headers,
+                                    dest = stagingTs,
+                                    expectedTotalBytes = videoKnownBytes,
+                                    maxRetries = configuredRetries
+                                ) { p ->
+                                    vDone.set(p.downloaded.coerceAtLeast(0L))
+                                    if (p.total > 0L) vTotal.set(p.total)
+                                    vSpeed.set(p.speed.coerceAtLeast(0L))
+                                    emitSplitHlsProgress()
+                                }
+                                val actual = stagingTs.length()
+                                if (actual > 0L) {
+                                    vDone.set(actual)
+                                    vTotal.set(actual)
+                                }
+                                vSpeed.set(0L)
+                            }
+                            val audioDeferred = async(dispatchers.io) {
+                                if (audioIsHls) {
+                                    hlsDownloader.download(
+                                        playlistUrl = splitAudioUrl,
+                                        headers = headers,
+                                        dest = stagingAudioTs,
+                                        expectedTotalBytes = audioKnownBytes,
+                                        maxRetries = configuredRetries
+                                    ) { p ->
+                                        aDone.set(p.downloaded.coerceAtLeast(0L))
+                                        if (p.total > 0L) aTotal.set(p.total)
+                                        aSpeed.set(p.speed.coerceAtLeast(0L))
+                                        emitSplitHlsProgress()
+                                    }
+                                } else {
+                                    segmentedDownloader.download(
+                                        url = splitAudioUrl,
+                                        headers = headers,
+                                        dest = stagingAudioTs,
+                                        knownTotal = audioKnownBytes,
+                                        acceptsRanges = companionAcceptsRanges,
+                                        segmentCount = minOf(Constants.DEFAULT_SEGMENT_COUNT, 3),
+                                        onProgress = { p ->
+                                            aDone.set(p.downloaded.coerceAtLeast(0L))
+                                            if (p.total > 0L) aTotal.set(p.total)
+                                            aSpeed.set(p.speed.coerceAtLeast(0L))
+                                            emitSplitHlsProgress()
+                                        }
+                                    )
+                                }
+                                val actual = stagingAudioTs.length()
+                                if (actual > 0L) {
+                                    aDone.set(actual)
+                                    aTotal.set(actual)
+                                }
+                                aSpeed.set(0L)
+                            }
+                            videoDeferred.await()
+                            audioDeferred.await()
+                        }
+
+                        val videoActual = stagingTs.length()
                         val finalizingBytes = (videoActual + stagingAudioTs.length()).coerceAtLeast(1L)
                         ensureSufficientStorage(stagingDir(), finalizingBytes)
                         enterFinalizing(finalizingBytes, resetProgressForMux = true)
-                        val vOk = runMuxWithProgress(finalizingBytes, baseFraction = 0f, fractionSpan = 0.45f) { onP ->
-                            videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4, onP)
-                        }
-                        val aOk = if (vOk) {
-                            runMuxWithProgress(finalizingBytes, baseFraction = 0.45f, fractionSpan = 0.25f) { onP ->
-                                videoAudioMuxer.extractM4a(stagingAudioTs, stagingAudioM4a, onProgress = onP)
+
+                        // Independent TS->MP4 video remux and audio->M4A extraction run concurrently
+                        val preMuxOk = runMuxWithProgress(finalizingBytes, baseFraction = 0f, fractionSpan = 0.70f) { onP ->
+                            val vPct = AtomicLong(0L)
+                            val aPct = AtomicLong(0L)
+                            fun reportCombinedPreMux() {
+                                val combined = (vPct.get() * 0.65f + aPct.get() * 0.35f) / 1000f
+                                onP(combined.coerceIn(0f, 1f))
                             }
-                        } else false
-                        val ok = vOk && aOk && runMuxWithProgress(finalizingBytes, baseFraction = 0.70f, fractionSpan = 0.30f) { onP ->
+                            val vRes = java.util.concurrent.atomic.AtomicBoolean(false)
+                            val aRes = java.util.concurrent.atomic.AtomicBoolean(false)
+                            val audioThread = Thread {
+                                aRes.set(
+                                    runCatching {
+                                        videoAudioMuxer.extractM4a(stagingAudioTs, stagingAudioM4a) { p ->
+                                            aPct.set((p.coerceIn(0f, 1f) * 1000f).toLong())
+                                            reportCombinedPreMux()
+                                        }
+                                    }.getOrDefault(false)
+                                )
+                            }
+                            audioThread.start()
+                            vRes.set(
+                                runCatching {
+                                    videoAudioMuxer.remuxTsToMp4(stagingTs, stagingVideoMp4) { p ->
+                                        vPct.set((p.coerceIn(0f, 1f) * 1000f).toLong())
+                                        reportCombinedPreMux()
+                                    }
+                                }.getOrDefault(false)
+                            )
+                            runCatching { audioThread.join() }
+                            vRes.get() && aRes.get()
+                        }
+                        val ok = preMuxOk && runMuxWithProgress(finalizingBytes, baseFraction = 0.70f, fractionSpan = 0.30f) { onP ->
                             videoAudioMuxer.mux(stagingVideoMp4, stagingAudioM4a, staging, onP)
                         }
                         if (!ok) throw MediaException(AppError.GENERIC, "Failed to mux split HLS streams")
                     } else {
+                        hlsDownloader.download(
+                            playlistUrl = item.remoteUrl,
+                            headers = headers,
+                            dest = stagingTs,
+                            expectedTotalBytes = videoKnownBytes,
+                            maxRetries = configuredRetries
+                        ) { p ->
+                            if (targetAudioTotal > 0L) {
+                                // Keep progress aligned with target audio bytes without rolling back or spiking to video size
+                                val ratio = if (p.total > 0L) {
+                                    (p.downloaded.toDouble() / p.total.toDouble()).coerceIn(0.0, 1.0)
+                                } else 0.0
+                                val scaledDone = (targetAudioTotal * 0.90 * ratio).toLong()
+                                reportProgress(scaledDone, targetAudioTotal, p.speed, p.eta)
+                            } else {
+                                reportProgress(p.downloaded, p.total, p.speed, p.eta)
+                            }
+                        }
                         val finalizingBytes = (if (targetAudioTotal > 0L) targetAudioTotal else stagingTs.length()).coerceAtLeast(1L)
                         ensureSufficientStorage(stagingDir(), finalizingBytes)
                         enterFinalizing(finalizingBytes, resetProgressForMux = true)
@@ -946,41 +1029,83 @@ class DownloadManager private constructor(
 
                 var adaptiveMuxComplete = false
                 try {
-                    // 1. Download adaptive video track
-                    segmentedDownloader.download(
-                        url = item.remoteUrl,
-                        headers = headers,
-                        dest = stagingVideo,
-                        knownTotal = videoKnownBytes,
-                        acceptsRanges = videoAcceptsRanges,
-                        segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
-                        onProgress = { p ->
-                            val total = if (combinedTotal > 0L) {
-                                maxOf(combinedTotal, p.total + audioKnownBytes)
-                            } else {
-                                p.total
+                    // Download adaptive video and companion audio tracks concurrently to eliminate sequential wait
+                    val progressMutex = Mutex()
+                    val vDone = AtomicLong(0L)
+                    val aDone = AtomicLong(0L)
+                    val vTotal = AtomicLong(videoKnownBytes.coerceAtLeast(0L))
+                    val aTotal = AtomicLong(audioKnownBytes.coerceAtLeast(0L))
+                    val vSpeed = AtomicLong(0L)
+                    val aSpeed = AtomicLong(0L)
+
+                    suspend fun emitAdaptiveProgress() {
+                        progressMutex.withLock {
+                            val done = vDone.get() + aDone.get()
+                            val vt = vTotal.get()
+                            val at = aTotal.get()
+                            val total = when {
+                                vt > 0L && at > 0L -> maxOf(combinedTotal, vt + at, done)
+                                combinedTotal > 0L -> maxOf(combinedTotal, done)
+                                vt > 0L -> maxOf(vt + audioKnownBytes, done)
+                                else -> -1L
                             }
-                            reportProgress(p.downloaded, total, p.speed, p.eta)
+                            val speed = vSpeed.get() + aSpeed.get()
+                            val eta = if (speed > 0L && total > done) ((total - done) / speed).coerceAtLeast(0L) else -1L
+                            reportProgress(done, total, speed, eta)
                         }
-                    )
+                    }
+
+                    coroutineScope {
+                        val videoDeferred = async(dispatchers.io) {
+                            segmentedDownloader.download(
+                                url = item.remoteUrl,
+                                headers = headers,
+                                dest = stagingVideo,
+                                knownTotal = videoKnownBytes,
+                                acceptsRanges = videoAcceptsRanges,
+                                segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
+                                onProgress = { p ->
+                                    vDone.set(p.downloaded.coerceAtLeast(0L))
+                                    if (p.total > 0L) vTotal.set(p.total)
+                                    vSpeed.set(p.speed.coerceAtLeast(0L))
+                                    emitAdaptiveProgress()
+                                }
+                            )
+                            val actual = stagingVideo.length()
+                            if (actual > 0L) {
+                                vDone.set(actual)
+                                vTotal.set(actual)
+                            }
+                            vSpeed.set(0L)
+                        }
+                        val audioDeferred = async(dispatchers.io) {
+                            segmentedDownloader.download(
+                                url = companionAudioUrl,
+                                headers = headers,
+                                dest = stagingAudio,
+                                knownTotal = audioKnownBytes,
+                                acceptsRanges = audioAcceptsRanges,
+                                segmentCount = minOf(Constants.DEFAULT_SEGMENT_COUNT, 3),
+                                onProgress = { p ->
+                                    aDone.set(p.downloaded.coerceAtLeast(0L))
+                                    if (p.total > 0L) aTotal.set(p.total)
+                                    aSpeed.set(p.speed.coerceAtLeast(0L))
+                                    emitAdaptiveProgress()
+                                }
+                            )
+                            val actual = stagingAudio.length()
+                            if (actual > 0L) {
+                                aDone.set(actual)
+                                aTotal.set(actual)
+                            }
+                            aSpeed.set(0L)
+                        }
+                        videoDeferred.await()
+                        audioDeferred.await()
+                    }
+
+                    // Mux video + audio into final container (MP4 or WebM)
                     val videoActualBytes = stagingVideo.length()
-
-                    // 2. Download companion audio track
-                    segmentedDownloader.download(
-                        url = companionAudioUrl,
-                        headers = headers,
-                        dest = stagingAudio,
-                        knownTotal = audioKnownBytes,
-                        acceptsRanges = audioAcceptsRanges,
-                        segmentCount = Constants.DEFAULT_SEGMENT_COUNT,
-                        onProgress = { p ->
-                            val done = videoActualBytes + p.downloaded
-                            val total = if (p.total > 0L) videoActualBytes + p.total else combinedTotal
-                            reportProgress(done, total, p.speed, p.eta)
-                        }
-                    )
-
-                    // 3. Mux video + audio into final container (MP4 or WebM)
                     val finalizingBytes = (videoActualBytes + stagingAudio.length()).coerceAtLeast(1L)
                     ensureSufficientStorage(stagingDir(), finalizingBytes)
                     enterFinalizing(finalizingBytes, resetProgressForMux = true)
@@ -1051,9 +1176,14 @@ class DownloadManager private constructor(
                 val realKnownBytes = headers["X-Internal-Video-Bytes"]?.toLongOrNull()?.takeIf { it > 0L }
                     ?: item.totalBytes
                 ensureSufficientStorage(stagingDir(), realKnownBytes.coerceAtLeast(0L))
+                val effectiveDirectHeaders = if (item.type == MediaType.IMAGE) {
+                    headers + ("X-Internal-Allow-Image" to "true")
+                } else {
+                    headers
+                }
                 segmentedDownloader.download(
                     url = item.remoteUrl,
-                    headers = headers,
+                    headers = effectiveDirectHeaders,
                     dest = staging,
                     knownTotal = realKnownBytes,
                     acceptsRanges = preProbedAcceptsRanges,
@@ -1070,9 +1200,19 @@ class DownloadManager private constructor(
             // Persist exact output size under FINALIZING state while publishing to MediaStore
             enterFinalizing(bytes, resetProgressForMux = false)
 
-            if (item.type == MediaType.VIDEO && thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
-                val localFrame = thumbnailCache.extractVideoFrameThumbnail(item.id, staging)
-                persistCachedThumbnail(localFrame)
+            if (thumbnailCache != null && !thumbnailCache.hasCachedThumbnail(item.id)) {
+                if (item.type == MediaType.VIDEO) {
+                    val localFrame = thumbnailCache.extractVideoFrameThumbnail(item.id, staging)
+                    persistCachedThumbnail(localFrame)
+                } else if (item.type == MediaType.IMAGE && bytes <= 12L * 1024L * 1024L) {
+                    val localImgThumb = thumbnailCache.cacheRemoteThumbnail(
+                        downloadId = item.id,
+                        thumbnailUrl = staging.absolutePath,
+                        sourceUrl = item.sourceUrl,
+                        headers = headers
+                    )
+                    persistCachedThumbnail(localImgThumb)
+                }
             }
 
             val settings = settingsRepository.current()

@@ -342,8 +342,9 @@ class VideoAudioMuxer @Inject constructor() {
 
             val adtsReadBuffer = if (audioHasAdts) ByteBuffer.allocateDirect(512 * 1024) else null
             val pendingAdtsFrames = ArrayDeque<Pair<ByteArray, Long>>()
+            var pcmScratch = ByteArray(16 * 1024)
 
-            BufferedOutputStream(FileOutputStream(outputFile)).use { out ->
+            BufferedOutputStream(FileOutputStream(outputFile), 64 * 1024).use { out ->
                 while (!outputDone) {
                     if (!inputDone) {
                         if (audioHasAdts && pendingAdtsFrames.isEmpty() && !extractorDone) {
@@ -424,10 +425,16 @@ class VideoAudioMuxer @Inject constructor() {
                                 val outBuf = decoder.getOutputBuffer(outIdx)!!
                                 outBuf.position(info.offset)
                                 outBuf.limit(info.offset + info.size)
-                                val pcm = ByteArray(info.size)
-                                outBuf.get(pcm)
-                                val stereoOrMonoPcm = if (channels > 2) downmixPcm16LeToStereo(pcm, channels) else pcm
-                                totalEncodedBytes += enc.encodePcm16Le(stereoOrMonoPcm, stereoOrMonoPcm.size, out)
+                                if (pcmScratch.size < info.size) {
+                                    pcmScratch = ByteArray(info.size)
+                                }
+                                outBuf.get(pcmScratch, 0, info.size)
+                                if (channels > 2) {
+                                    val downmixed = downmixPcm16LeToStereo(pcmScratch, channels, info.size)
+                                    totalEncodedBytes += enc.encodePcm16Le(downmixed, downmixed.size, out)
+                                } else {
+                                    totalEncodedBytes += enc.encodePcm16Le(pcmScratch, info.size, out)
+                                }
                                 if (onProgress != null && durationUs > 0L && info.presentationTimeUs > 0L) {
                                     val pct = ((info.presentationTimeUs.toDouble() / durationUs.toDouble()) * 100.0)
                                         .toInt()
@@ -1104,10 +1111,11 @@ class VideoAudioMuxer @Inject constructor() {
     }
 
     /** Downmixes interleaved >2-channel 16-bit little-endian PCM (e.g. 5.1 AAC) to stereo PCM16LE. */
-    private fun downmixPcm16LeToStereo(pcm: ByteArray, channels: Int): ByteArray {
-        if (channels <= 2) return pcm
+    private fun downmixPcm16LeToStereo(pcm: ByteArray, channels: Int, length: Int = pcm.size): ByteArray {
+        val validLength = length.coerceIn(0, pcm.size)
+        if (channels <= 2) return if (validLength == pcm.size) pcm else pcm.copyOf(validLength)
         val bytesPerFrame = channels * 2
-        val frames = pcm.size / bytesPerFrame
+        val frames = validLength / bytesPerFrame
         if (frames <= 0) return ByteArray(0)
         val out = ByteArray(frames * 4)
 

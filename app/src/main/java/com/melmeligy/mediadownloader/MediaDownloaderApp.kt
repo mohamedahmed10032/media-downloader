@@ -7,6 +7,8 @@ import androidx.work.Configuration
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
 import com.melmeligy.mediadownloader.intercept.AdBlocker
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
@@ -14,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import java.io.File
 import javax.inject.Inject
 
 /**
@@ -49,6 +52,18 @@ class MediaDownloaderApp : Application(), Configuration.Provider, ImageLoaderFac
         ImageLoader.Builder(this)
             .okHttpClient { okHttpClient }
             .components { add(VideoFrameDecoder.Factory()) }
+            .memoryCache {
+                MemoryCache.Builder(this)
+                    .maxSizePercent(0.20)
+                    .build()
+            }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(File(cacheDir, "image_cache"))
+                    .maxSizeBytes(64L * 1024L * 1024L)
+                    .build()
+            }
+            .respectCacheHeaders(false)
             .crossfade(false)
             .build()
 }

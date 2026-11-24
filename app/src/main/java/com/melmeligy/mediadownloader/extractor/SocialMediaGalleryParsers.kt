@@ -29,7 +29,8 @@ internal object SocialMediaGalleryParsers {
         val postId: String? = null,
         val slides: List<GallerySlide> = emptyList(),
         val videoStreams: List<MediaStream> = emptyList(),
-        val audioStreams: List<MediaStream> = emptyList()
+        val audioStreams: List<MediaStream> = emptyList(),
+        val isStructuredSinglePin: Boolean = false
     )
 
     // =========================================================================
@@ -670,6 +671,7 @@ internal object SocialMediaGalleryParsers {
             candidate.videoStreams.isNotEmpty() && current.videoStreams.isEmpty() -> candidate
             current.videoStreams.isNotEmpty() && candidate.videoStreams.isEmpty() -> current
             candidate.slides.size > current.slides.size -> candidate
+            candidate.isStructuredSinglePin && !current.isStructuredSinglePin -> candidate
             else -> current
         }
     }
@@ -682,15 +684,14 @@ internal object SocialMediaGalleryParsers {
             html.contains("v3GetPinQuery", ignoreCase = true)
     }
 
+    private val pinterestNonNullMultiSlideRegex = Regex(
+        """(?:"(?:carouselData|carousel_data|storyPinData|story_pin_data)"\s*:\s*\{|"(?:carouselSlots|carousel_slots)"\s*:\s*\[\s*\{|"isCarousel"\s*:\s*true)""",
+        RegexOption.IGNORE_CASE
+    )
+
     internal fun pinterestHtmlHintsMultiSlide(html: String): Boolean {
         if (html.isBlank()) return false
-        return html.contains("carouselData", ignoreCase = true) ||
-            html.contains("carousel_data", ignoreCase = true) ||
-            html.contains("carouselSlots", ignoreCase = true) ||
-            html.contains("carousel_slots", ignoreCase = true) ||
-            html.contains("storyPinData", ignoreCase = true) ||
-            html.contains("story_pin_data", ignoreCase = true) ||
-            html.contains("\"isCarousel\":true", ignoreCase = true) ||
+        return pinterestNonNullMultiSlideRegex.containsMatchIn(html) ||
             html.contains("story-pin", ignoreCase = true) ||
             html.contains("carousel-slide", ignoreCase = true)
     }
@@ -993,6 +994,11 @@ internal object SocialMediaGalleryParsers {
         val imgSpec = extractPinterestImageSpec(pin) ?: return null
         val (origUrl, thumbUrl, dims) = imgSpec
         val upgraded = upgradePinterestUrlToOriginal(origUrl)
+        val slideHeaders = if (hasVerbatimOriginalUrl(pin, upgraded)) {
+            headers + ("X-Internal-Verbatim-Orig" to "true")
+        } else {
+            headers
+        }
         return ParsedPost(
             title = title,
             thumbnailUrl = thumbUrl,
@@ -1007,11 +1013,26 @@ internal object SocialMediaGalleryParsers {
                     container = inferImageExt(upgraded),
                     width = dims?.first,
                     height = dims?.second,
-                    headers = headers,
+                    headers = slideHeaders,
                     postId = id
                 )
-            )
+            ),
+            isStructuredSinglePin = true
         )
+    }
+
+    private fun hasVerbatimOriginalUrl(obj: JSONObject, candidateUrl: String): Boolean {
+        if (!candidateUrl.contains("/originals/", ignoreCase = true)) return false
+        val images = obj.optJSONObject("images")
+        val candidates = listOf(
+            images?.optJSONObject("orig")?.optString("url"),
+            images?.optJSONObject("originals")?.optString("url"),
+            obj.optJSONObject("imageSpec_orig")?.optString("url"),
+            obj.optJSONObject("imageSpecOrig")?.optString("url"),
+            obj.optJSONObject("imageSpec_originals")?.optString("url"),
+            obj.optJSONObject("imageSpecOriginals")?.optString("url")
+        )
+        return candidates.any { !it.isNullOrBlank() && it == candidateUrl }
     }
 
     private fun parsePinterestCarouselSlot(
@@ -1049,6 +1070,9 @@ internal object SocialMediaGalleryParsers {
             ?: return null
         val (rawUrl, thumbUrl, dims) = imgSpec
         val upgraded = upgradePinterestUrlToOriginal(rawUrl)
+        val isVerbatim = hasVerbatimOriginalUrl(slot, upgraded) ||
+            (details != null && hasVerbatimOriginalUrl(details, upgraded))
+        val slideHeaders = if (isVerbatim) headers + ("X-Internal-Verbatim-Orig" to "true") else headers
         return GallerySlide(
             id = "pin-carousel-$index",
             index = index,
@@ -1058,7 +1082,7 @@ internal object SocialMediaGalleryParsers {
             container = inferImageExt(upgraded),
             width = dims?.first,
             height = dims?.second,
-            headers = headers,
+            headers = slideHeaders,
             postId = pinId
         )
     }

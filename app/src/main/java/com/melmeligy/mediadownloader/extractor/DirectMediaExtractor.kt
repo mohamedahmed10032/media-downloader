@@ -30,21 +30,36 @@ class DirectMediaExtractor @Inject constructor(
     override suspend fun extract(url: String): ResolvedMedia? {
         if (ExtractorRegistry.isConfirmedHtml(url)) return null
         val ext = UrlUtils.fileExtension(url)
-        val info = runCatching { http.probe(url) }.getOrNull()
+        val info = try {
+            http.probe(url, emptyMap(), FAST_PROBE_TIMEOUT_MS)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
+            if (me.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                me.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK ||
+                me.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ||
+                me.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+            ) {
+                return null
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
         if (info != null && info.code !in 200..299) return null
         val contentType = info?.contentType.orEmpty()
 
         // A page, not a file: let the HTML extractor take over.
-        if (contentType.startsWith("text/html")) return null
+        if (contentType.startsWith("text/html", ignoreCase = true)) return null
 
         val type = UrlUtils.mediaTypeForExtension(ext) ?: when {
-            contentType.startsWith("video/") -> MediaType.VIDEO
-            contentType.startsWith("audio/") -> MediaType.AUDIO
+            contentType.startsWith("video/", ignoreCase = true) -> MediaType.VIDEO
+            contentType.startsWith("audio/", ignoreCase = true) -> MediaType.AUDIO
             else -> return null
         }
         val container = ext ?: contentType.substringAfter('/', "bin").ifBlank { "bin" }
         val fileName = UrlUtils.fileNameFromUrl(url)
-        val finalUrl = info?.finalUrl ?: url
+        val finalUrl = info?.finalUrl?.ifBlank { url } ?: url
         val label = when (type) {
             MediaType.VIDEO -> "Original quality"
             MediaType.AUDIO -> "Original audio"
@@ -65,5 +80,9 @@ class DirectMediaExtractor @Inject constructor(
             streams = listOf(stream),
             extractor = name
         )
+    }
+
+    private companion object {
+        const val FAST_PROBE_TIMEOUT_MS = 1_000L
     }
 }

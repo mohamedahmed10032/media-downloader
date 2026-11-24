@@ -240,7 +240,7 @@ class HlsSegmentDownloader @Inject constructor(
         try {
             val tsNormalizer = MpegTsTimestampNormalizer()
             if (dest.exists()) dest.delete()
-            FileOutputStream(dest, true).use { output ->
+            java.io.BufferedOutputStream(FileOutputStream(dest, true), Constants.DOWNLOAD_BUFFER_SIZE).use { output ->
                 for ((index, task) in tasks.withIndex()) {
                     currentCoroutineContext().ensureActive()
                     val partFile = task.await()
@@ -567,7 +567,7 @@ class HlsSegmentDownloader @Inject constructor(
     )
 
     companion object {
-        private const val CONCURRENT_SEGMENTS = 5
+        private const val CONCURRENT_SEGMENTS = 8
         private const val AES_128_KEY_SIZE = 16
 
         /**

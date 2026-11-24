@@ -52,6 +52,7 @@ class SegmentedDownloader @Inject constructor(
     ) = coroutineScope {
         dest.parentFile?.mkdirs()
 
+        val allowImageContentType = headers["X-Internal-Allow-Image"]?.equals("true", ignoreCase = true) == true
         var effectiveHeaders = headers
         val isGoogleVideo = url.contains("googlevideo.com", ignoreCase = true)
         var total = knownTotal
@@ -60,14 +61,14 @@ class SegmentedDownloader @Inject constructor(
         }
         var ranged = acceptsRanges || isGoogleVideo
         if (total <= 0 || !ranged) {
-            val probed = probeWithHeaderFallback(url, effectiveHeaders)
+            val probed = probeWithHeaderFallback(url, effectiveHeaders, allowImageContentType)
             if (probed != null) {
                 val (info, workingHeaders) = probed
                 effectiveHeaders = workingHeaders
                 if (info.code !in 200..299 && info.code != 405 && info.code != 416) {
                     throw http.mapHttpError(info.code)
                 }
-                if (ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+                if (ExtractorHttp.isRejectedMediaContentType(info.contentType, allowImage = allowImageContentType)) {
                     throw MediaException(AppError.EXPIRED_LINK, "Media URL returned non-media content (${info.contentType})")
                 }
                 if (total <= 0 && info.contentLength > 0) total = info.contentLength
@@ -84,7 +85,7 @@ class SegmentedDownloader @Inject constructor(
 
         val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && effectiveSegments > 1
         if (!canSegment) {
-            singleStream(url, effectiveHeaders, dest, total, ranged, isGoogleVideo, onProgress)
+            singleStream(url, effectiveHeaders, dest, total, ranged, isGoogleVideo, allowImageContentType, onProgress)
             return@coroutineScope
         }
 
@@ -114,7 +115,7 @@ class SegmentedDownloader @Inject constructor(
             coroutineScope {
                 val tasks = (0 until n).map { i ->
                     async(Dispatchers.IO) {
-                        downloadSegment(url, effectiveHeaders, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo)
+                        downloadSegment(url, effectiveHeaders, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo, allowImageContentType)
                     }
                 }
                 tasks.awaitAll()
@@ -133,7 +134,7 @@ class SegmentedDownloader @Inject constructor(
         if (fallbackToSingleStream) {
             runCatching { idxFile.delete() }
             runCatching { dest.delete() }
-            singleStream(url, effectiveHeaders, dest, total, acceptsRanges = false, isGoogleVideo = false, onProgress = onProgress)
+            singleStream(url, effectiveHeaders, dest, total, acceptsRanges = false, isGoogleVideo = false, allowImageContentType = allowImageContentType, onProgress = onProgress)
             return@coroutineScope
         }
 
@@ -149,7 +150,8 @@ class SegmentedDownloader @Inject constructor(
 
     private suspend fun probeWithHeaderFallback(
         url: String,
-        primaryHeaders: Map<String, String>
+        primaryHeaders: Map<String, String>,
+        allowImageContentType: Boolean = false
     ): Pair<HeadInfo, Map<String, String>>? = withContext(Dispatchers.IO) {
         val candidates = listOf(primaryHeaders) +
             ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)
@@ -173,7 +175,7 @@ class SegmentedDownloader @Inject constructor(
                 lastPermanent = http.mapHttpError(info.code)
                 continue
             }
-            if (ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+            if (ExtractorHttp.isRejectedMediaContentType(info.contentType, allowImage = allowImageContentType)) {
                 lastPermanent = MediaException(AppError.EXPIRED_LINK, "Media URL returned non-media content (${info.contentType})")
                 continue
             }
@@ -195,7 +197,8 @@ class SegmentedDownloader @Inject constructor(
         index: Int,
         downloaded: AtomicLong,
         total: Long,
-        isGoogleVideo: Boolean
+        isGoogleVideo: Boolean,
+        allowImageContentType: Boolean = false
     ) {
         val (_, endInclusive) = bound
         var attempt = 0
@@ -226,7 +229,7 @@ class SegmentedDownloader @Inject constructor(
                     if (response.code != 206 && !response.isSuccessful) {
                         throw http.mapHttpError(response.code)
                     }
-                    if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"))) {
+                    if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"), allowImage = allowImageContentType)) {
                         throw MediaException(AppError.EXPIRED_LINK, "Segment returned HTML instead of media")
                     }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment body")
@@ -282,6 +285,7 @@ class SegmentedDownloader @Inject constructor(
         total: Long,
         acceptsRanges: Boolean,
         isGoogleVideo: Boolean,
+        allowImageContentType: Boolean = false,
         onProgress: ProgressCallback
     ) = coroutineScope {
         val downloaded = AtomicLong(if (dest.exists()) dest.length() else 0L)
@@ -322,7 +326,7 @@ class SegmentedDownloader @Inject constructor(
                     var responseContentLength = -1L
                     client.executeCancellable(request) { response ->
                         if (!response.isSuccessful && response.code != 206) throw http.mapHttpError(response.code)
-                        if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"))) {
+                        if (ExtractorHttp.isRejectedMediaContentType(response.header("Content-Type"), allowImage = allowImageContentType)) {
                             throw MediaException(AppError.EXPIRED_LINK, "Stream returned HTML instead of media")
                         }
                         val isPartial = response.code == 206

@@ -909,9 +909,17 @@ class SocialMediaExtractor @Inject constructor(
             if (!liveCookie.isNullOrBlank()) put("Cookie", liveCookie)
         }
 
-        val pluginUrl = "https://www.facebook.com/plugins/video.php?href=" +
-            URLEncoder.encode(resolvedUrl, "UTF-8") + "&show_text=0"
-        val targets = listOf(resolvedUrl, pluginUrl)
+        val isExplicitPhotoUrl = resolvedUrl.contains("/photo.php", ignoreCase = true) ||
+            resolvedUrl.contains("/photos/", ignoreCase = true) ||
+            resolvedUrl.contains("/photo/", ignoreCase = true) ||
+            resolvedUrl.contains("/photo?", ignoreCase = true)
+        val targets = if (isExplicitPhotoUrl) {
+            listOf(resolvedUrl)
+        } else {
+            val pluginUrl = "https://www.facebook.com/plugins/video.php?href=" +
+                URLEncoder.encode(resolvedUrl, "UTF-8") + "&show_text=0"
+            listOf(resolvedUrl, pluginUrl)
+        }
         val fbChannel = Channel<ResolvedMedia?>(capacity = targets.size)
         val fbJobs = targets.map { targetUrl ->
             launch(Dispatchers.IO) {
@@ -1306,17 +1314,19 @@ class SocialMediaExtractor @Inject constructor(
             if (docHtml.isBlank()) return null
 
             // Photo Mode Slideshow from Hydration JSON (zero blocking audio probe; StreamSizeRefiner fills size asynchronously)
-            val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
-                html = docHtml,
-                postId = UrlUtils.extractPostId(canonicalUrl),
-                headers = cdnHeaders
-            )
-            if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
-                return buildGalleryResolvedMedia(
-                    rawUrl = rawUrl,
-                    extractorName = "TikTok",
-                    parsed = parsedPhotoHtml
+            if (docHtml.contains("\"imagePost\"", ignoreCase = true)) {
+                val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
+                    html = docHtml,
+                    postId = UrlUtils.extractPostId(canonicalUrl),
+                    headers = cdnHeaders
                 )
+                if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
+                    return buildGalleryResolvedMedia(
+                        rawUrl = rawUrl,
+                        extractorName = "TikTok",
+                        parsed = parsedPhotoHtml
+                    )
+                }
             }
 
             // Full structured __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON video + multi-quality bitrateInfo + music.
@@ -1552,40 +1562,120 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         var bestParsed: SocialMediaGalleryParsers.ParsedPost? = null
+        var html = ""
 
-        // Tier 1: Fetch canonical Pin HTML and scan ALL Relay SSR / __PWS_DATA__ / JSON blocks
-        val html = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
-        if (html.isNotBlank()) {
-            bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(
-                bestParsed,
-                SocialMediaGalleryParsers.parsePinterestHtml(html, pinId, desktopHeaders)
-            )
+        val apiHeaders = desktopHeaders + mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "X-Pinterest-AppState" to "active",
+            "X-Pinterest-PWS-Handler" to "www/pin/[id].js",
+            "Referer" to canonicalUrl,
+            "Accept" to "application/json, text/javascript, */*, q=0.01"
+        )
+        fun pinResourceUrl(fieldSet: String): String {
+            val dataJson = "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"$fieldSet\"}}"
+            val dataParam = URLEncoder.encode(dataJson, "UTF-8")
+            return "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam"
         }
 
-        fun needsMultiSlideUpgrade(): Boolean {
-            val cur = bestParsed ?: return true
-            return cur.slides.size <= 1 && cur.videoStreams.isEmpty()
+        fun isConfirmedPin(post: SocialMediaGalleryParsers.ParsedPost?, pageHtml: String): Boolean {
+            if (post == null) return false
+            if (post.slides.size > 1 || post.videoStreams.isNotEmpty()) return true
+            return post.isStructuredSinglePin &&
+                post.slides.size == 1 &&
+                !SocialMediaGalleryParsers.pinterestHtmlHintsMultiSlide(pageHtml)
         }
 
-        // Tier 2 & 3 in parallel: PinResource/get + v3/pins fallback when HTML yielded <= 1 image.
-        // Cancels remaining API calls as soon as a multi-slide or video result is discovered.
-        if (needsMultiSlideUpgrade() && !pinId.isNullOrBlank()) {
-            val fieldSets = listOf("detailed", "unauth_react_main_pin", "auth_web_main_pin")
-            val apiHeaders = desktopHeaders + mapOf(
-                "X-Requested-With" to "XMLHttpRequest",
-                "X-Pinterest-AppState" to "active",
-                "X-Pinterest-PWS-Handler" to "www/pin/[id].js",
-                "Referer" to canonicalUrl,
-                "Accept" to "application/json, text/javascript, */*, q=0.01"
-            )
+        // Tier 1: Race canonical Pin HTML + primary PinResource/get JSON in parallel so single-image
+        // pins, carousels, and video pins all resolve in a single fast round-trip without waiting
+        // sequentially for HTML or stalling on redundant fallback APIs.
+        data class PinRaceResult(
+            val parsed: SocialMediaGalleryParsers.ParsedPost?,
+            val rawHtml: String = "",
+            val fromStructuredApi: Boolean = false
+        )
+
+        if (!pinId.isNullOrBlank()) {
+            val tier1Ch = Channel<PinRaceResult>(capacity = 2)
+            val htmlJob = launch(Dispatchers.IO) {
+                val res = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            val pageHtml = runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
+                            val parsed = if (pageHtml.isNotBlank()) {
+                                SocialMediaGalleryParsers.parsePinterestHtml(pageHtml, pinId, desktopHeaders)
+                            } else null
+                            PinRaceResult(parsed = parsed, rawHtml = pageHtml, fromStructuredApi = false)
+                        }
+                    } ?: PinRaceResult(parsed = null)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    PinRaceResult(parsed = null)
+                }
+                tier1Ch.trySend(res)
+            }
+            val primaryApiJob = launch(Dispatchers.IO) {
+                val res = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            val apiJson = runCatching {
+                                http.fetchString(pinResourceUrl("unauth_react_main_pin"), apiHeaders)
+                            }.getOrNull()
+                            val parsed = if (!apiJson.isNullOrBlank()) {
+                                SocialMediaGalleryParsers.parsePinterestHtml(apiJson, pinId, desktopHeaders)
+                            } else null
+                            PinRaceResult(parsed = parsed, fromStructuredApi = true)
+                        }
+                    } ?: PinRaceResult(parsed = null, fromStructuredApi = true)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    PinRaceResult(parsed = null, fromStructuredApi = true)
+                }
+                tier1Ch.trySend(res)
+            }
+            try {
+                for (i in 0 until 2) {
+                    val outcome = tier1Ch.receiveCatching().getOrNull() ?: break
+                    if (outcome.rawHtml.isNotBlank()) {
+                        html = outcome.rawHtml
+                    }
+                    if (outcome.parsed != null) {
+                        bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, outcome.parsed)
+                    }
+                    if (isConfirmedPin(bestParsed, html)) {
+                        break
+                    }
+                }
+            } finally {
+                htmlJob.cancel()
+                primaryApiJob.cancel()
+                tier1Ch.close()
+            }
+        } else {
+            html = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                    runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull().orEmpty()
+                }
+            }.orEmpty()
+            if (html.isNotBlank()) {
+                bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(
+                    bestParsed,
+                    SocialMediaGalleryParsers.parsePinterestHtml(html, pinId, desktopHeaders)
+                )
+            }
+        }
+
+        // Tier 2 & 3 in parallel: secondary PinResource field sets + v3/pins fallback ONLY when
+        // Tier 1 did not yield a confirmed structured pin (e.g. OG-only HTML or non-null multi-slide hint).
+        if (!isConfirmedPin(bestParsed, html) && !pinId.isNullOrBlank()) {
+            val fieldSets = listOf("detailed", "auth_web_main_pin")
             val v3Headers = desktopHeaders + mapOf(
                 "Accept" to "application/json",
                 "Referer" to canonicalUrl
             )
             val targets: List<Pair<String, Map<String, String>>> = fieldSets.map { fieldSet ->
-                val dataJson = "{\"options\":{\"id\":\"$pinId\",\"field_set_key\":\"$fieldSet\"}}"
-                val dataParam = URLEncoder.encode(dataJson, "UTF-8")
-                "https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/$pinId/&data=$dataParam" to apiHeaders
+                pinResourceUrl(fieldSet) to apiHeaders
             } + ("https://api.pinterest.com/v3/pins/$pinId/?fields=pin.id,pin.title,pin.images,pin.carousel_data,pin.story_pin_data,pin.videos" to v3Headers)
 
             val pinCh = Channel<SocialMediaGalleryParsers.ParsedPost?>(capacity = targets.size)
@@ -1613,7 +1703,7 @@ class SocialMediaExtractor @Inject constructor(
                     val apiParsed = pinCh.receiveCatching().getOrNull()
                     if (apiParsed != null) {
                         bestParsed = SocialMediaGalleryParsers.preferRicherPinterestPost(bestParsed, apiParsed)
-                        if (!needsMultiSlideUpgrade()) break
+                        if (isConfirmedPin(bestParsed, html)) break
                     }
                 }
             } finally {
@@ -1622,9 +1712,9 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        // Tier 4: Strictly scoped Headless WebView fallback when HTTP still yielded <= 1 image
-        // and the page either hints at a carousel/story pin or lacked hydrated Relay/PWS JSON.
-        if (needsMultiSlideUpgrade() &&
+        // Tier 4: Strictly scoped Headless WebView fallback ONLY when HTTP did not confirm a
+        // structured pin and the page either hints a non-null carousel/story or lacked hydrated JSON.
+        if (!isConfirmedPin(bestParsed, html) &&
             (bestParsed == null ||
                 SocialMediaGalleryParsers.pinterestHtmlHintsMultiSlide(html) ||
                 !SocialMediaGalleryParsers.hasStructuredPinterestJson(html))
@@ -1644,23 +1734,37 @@ class SocialMediaExtractor @Inject constructor(
 
         val resolved = bestParsed ?: return@coroutineScope null
 
-        // Multi-image Carousel / Idea Pin / Single Image Pin -> Multi-Image Bottom Sheet
+        // Multi-image Carousel / Idea Pin / Single Image Pin -> Multi-Image Bottom Sheet.
+        // Verbatim `/originals/` URLs returned directly by Pinterest JSON skip blocking probes;
+        // only synthesized `/originals/` upgrades run a tight bounded parallel verification.
         if (resolved.slides.isNotEmpty()) {
-            val verifiedSlides = withTimeoutOrNull(1_600L) {
-                resolved.slides.mapIndexed { idx, slide ->
-                    async {
-                        if (slide.type == MediaType.IMAGE &&
-                            slide.mediaUrl.contains("/originals/", ignoreCase = true) &&
-                            slide.mediaUrl != slide.thumbnailUrl &&
-                            idx < 24
-                        ) {
-                            verifyPinterestOriginalSlide(slide, desktopHeaders)
-                        } else {
-                            slide
+            val needsProbe = resolved.slides.withIndex().any { (idx, slide) ->
+                idx < 24 &&
+                    slide.type == MediaType.IMAGE &&
+                    slide.mediaUrl.contains("/originals/", ignoreCase = true) &&
+                    slide.mediaUrl != slide.thumbnailUrl &&
+                    slide.headers["X-Internal-Verbatim-Orig"] != "true"
+            }
+            val verifiedSlides = if (!needsProbe) {
+                resolved.slides
+            } else {
+                withTimeoutOrNull(900L) {
+                    resolved.slides.mapIndexed { idx, slide ->
+                        async {
+                            if (slide.type == MediaType.IMAGE &&
+                                slide.mediaUrl.contains("/originals/", ignoreCase = true) &&
+                                slide.mediaUrl != slide.thumbnailUrl &&
+                                slide.headers["X-Internal-Verbatim-Orig"] != "true" &&
+                                idx < 24
+                            ) {
+                                verifyPinterestOriginalSlide(slide, desktopHeaders)
+                            } else {
+                                slide
+                            }
                         }
-                    }
-                }.awaitAll()
-            } ?: resolved.slides
+                    }.awaitAll()
+                } ?: resolved.slides
+            }
 
             return@coroutineScope buildGalleryResolvedMedia(
                 rawUrl = rawUrl,

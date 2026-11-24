@@ -35,41 +35,63 @@ class WebViewCookieJar : CookieJar {
         val seq: Long
     )
 
+    private data class CachedCmCookies(
+        val family: String,
+        val header: String?,
+        val fetchedAtMs: Long
+    )
+
     private val seqGen = AtomicLong(0L)
-    private val store = ConcurrentHashMap<String, Entry>()
+    private val storeByFamily = ConcurrentHashMap<String, ConcurrentHashMap<String, Entry>>()
     private val lastSeeded = ConcurrentHashMap<String, String>()
+    private val cmReadCache = ConcurrentHashMap<String, CachedCmCookies>()
+
+    internal var clockMs: () -> Long = { System.currentTimeMillis() }
+    internal var cookieManagerReader: (String) -> String? = { target ->
+        runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
+    }
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         if (cookies.isEmpty()) return
-        val now = System.currentTimeMillis()
+        val now = clockMs()
         val urlStr = url.toString()
+        val touchedFamilies = HashSet<String>(2)
         for (raw in cookies) {
             val cookie = normalizeImplicitDefaultPath(url, raw)
             runCatching { CookieManager.getInstance().setCookie(urlStr, cookie.toString()) }
-            val key = "${cookie.domain.lowercase()}|${cookie.path}|${cookie.name}"
+            val domainLower = cookie.domain.lowercase()
+            val family = registrableFamily(domainLower)
+            touchedFamilies.add(family)
+            val familyMap = storeByFamily.computeIfAbsent(family) { ConcurrentHashMap() }
+            val key = "$domainLower|${cookie.path}|${cookie.name}"
             if (cookie.expiresAt <= now) {
-                store.remove(key)
+                familyMap.remove(key)
                 // Also evict any domain/subdomain host-only copies of the same cookie name in this domain family
-                val domainLower = cookie.domain.lowercase()
-                store.entries.removeIf { (_, entry) ->
+                familyMap.entries.removeIf { (_, entry) ->
+                    val entryDomain = entry.cookie.domain.lowercase()
                     entry.cookie.name == cookie.name &&
-                        isSameDomainFamily(entry.cookie.domain.lowercase(), domainLower) &&
-                        (entry.cookie.domain.lowercase() == domainLower ||
-                            entry.cookie.domain.lowercase().endsWith(".$domainLower") ||
-                            domainLower.endsWith(".${entry.cookie.domain.lowercase()}"))
+                        (entryDomain == domainLower ||
+                            entryDomain.endsWith(".$domainLower") ||
+                            domainLower.endsWith(".$entryDomain"))
                 }
             } else {
-                store[key] = Entry(cookie, seqGen.incrementAndGet())
+                familyMap[key] = Entry(cookie, seqGen.incrementAndGet())
             }
+        }
+        if (touchedFamilies.isNotEmpty() && cmReadCache.isNotEmpty()) {
+            cmReadCache.entries.removeIf { it.value.family in touchedFamilies }
         }
     }
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        val now = System.currentTimeMillis()
+        val now = clockMs()
+        val hostLower = url.host.lowercase()
+        val family = registrableFamily(hostLower)
         val result = LinkedHashMap<String, Cookie>()
 
-        // 1. Seed from Android WebView CookieManager if available (lowest precedence)
-        val cmHeader = runCatching { CookieManager.getInstance().getCookie(url.toString()) }.getOrNull()
+        // 1. Seed from Android WebView CookieManager with short per-path-prefix TTL cache
+        //    so hundreds of HLS segments / range chunks avoid repeated Chromium IPC locks.
+        val cmHeader = readCookieManagerCached(url, family, now)
         if (!cmHeader.isNullOrBlank()) {
             for (pair in cmHeader.split(';')) {
                 val eq = pair.indexOf('=')
@@ -92,22 +114,44 @@ class WebViewCookieJar : CookieJar {
             }
         }
 
-        // 2. Apply in-memory entries matching this URL sorted by (path.length, seq) so freshest/most-specific wins
-        val matching = store.values
-            .filter { entry ->
+        // 2. Apply in-memory entries for this domain family only (O(k) instead of full-store scan),
+        //    sorted by (path.length, seq) so freshest/most-specific wins.
+        val familyMap = storeByFamily[family]
+        if (familyMap != null && familyMap.isNotEmpty()) {
+            val matching = ArrayList<Entry>(familyMap.size)
+            for ((k, entry) in familyMap) {
                 if (entry.cookie.expiresAt <= now) {
-                    store.remove("${entry.cookie.domain.lowercase()}|${entry.cookie.path}|${entry.cookie.name}")
-                    false
-                } else {
-                    entry.cookie.matches(url)
+                    familyMap.remove(k, entry)
+                } else if (entry.cookie.matches(url)) {
+                    matching.add(entry)
                 }
             }
-            .sortedWith(compareBy<Entry>({ it.cookie.path.length }, { it.seq }))
-
-        for (entry in matching) {
-            result[entry.cookie.name] = entry.cookie
+            if (matching.size > 1) {
+                matching.sortWith(compareBy<Entry>({ it.cookie.path.length }, { it.seq }))
+            }
+            for (entry in matching) {
+                result[entry.cookie.name] = entry.cookie
+            }
         }
-        return result.values.toList()
+        return if (result.isEmpty()) emptyList() else result.values.toList()
+    }
+
+    private fun readCookieManagerCached(url: HttpUrl, family: String, now: Long): String? {
+        val dirPath = url.encodedPath.substringBeforeLast('/', "")
+        val cacheKey = "${url.scheme}://${url.host.lowercase()}:${url.port}$dirPath"
+        val cached = cmReadCache[cacheKey]
+        if (cached != null && now - cached.fetchedAtMs < CM_CACHE_TTL_MS) {
+            return cached.header
+        }
+        val fresh = cookieManagerReader(url.toString())
+        if (cmReadCache.size >= MAX_CM_CACHE_ENTRIES) {
+            cmReadCache.entries.removeIf { now - it.value.fetchedAtMs >= CM_CACHE_TTL_MS }
+            if (cmReadCache.size >= MAX_CM_CACHE_ENTRIES) {
+                cmReadCache.clear()
+            }
+        }
+        cmReadCache[cacheKey] = CachedCmCookies(family = family, header = fresh, fetchedAtMs = now)
+        return fresh
     }
 
     /**
@@ -116,9 +160,10 @@ class WebViewCookieJar : CookieJar {
      */
     fun seedFromRequestHeader(url: HttpUrl, cookieHeader: String) {
         if (cookieHeader.isBlank()) return
-        val now = System.currentTimeMillis()
+        val now = clockMs()
         val reqHost = url.host.lowercase()
         val familyKey = registrableFamily(reqHost)
+        val familyMap = storeByFamily.computeIfAbsent(familyKey) { ConcurrentHashMap() }
 
         for (part in cookieHeader.split(';')) {
             val eq = part.indexOf('=')
@@ -130,11 +175,18 @@ class WebViewCookieJar : CookieJar {
             val seedKey = "$familyKey|$name"
             val prevSeed = lastSeeded[seedKey]
 
-            // Check if the jar already holds an active cookie for this URL (or domain family) with a different value
-            val existingMatching = store.values
-                .filter { it.cookie.name == name && it.cookie.expiresAt > now && it.cookie.matches(url) }
-                .sortedWith(compareBy<Entry>({ it.cookie.path.length }, { it.seq }))
-                .lastOrNull()
+            // Check if the jar already holds an active cookie for this URL (within its domain family)
+            var existingMatching: Entry? = null
+            for (entry in familyMap.values) {
+                if (entry.cookie.name == name && entry.cookie.expiresAt > now && entry.cookie.matches(url)) {
+                    if (existingMatching == null ||
+                        entry.cookie.path.length > existingMatching.cookie.path.length ||
+                        (entry.cookie.path.length == existingMatching.cookie.path.length && entry.seq > existingMatching.seq)
+                    ) {
+                        existingMatching = entry
+                    }
+                }
+            }
 
             if (existingMatching != null && prevSeed != null && prevSeed == value) {
                 // Caller is replaying the stale initial seed — keep the server-rotated cookie!
@@ -152,12 +204,9 @@ class WebViewCookieJar : CookieJar {
                     .build()
             }.getOrNull() ?: continue
             val key = "${seeded.domain.lowercase()}|${seeded.path}|${seeded.name}"
-            store[key] = Entry(seeded, seqGen.incrementAndGet())
+            familyMap[key] = Entry(seeded, seqGen.incrementAndGet())
         }
     }
-
-    private fun isSameDomainFamily(a: String, b: String): Boolean =
-        registrableFamily(a) == registrableFamily(b)
 
     private fun registrableFamily(host: String): String {
         val clean = host.lowercase().trimEnd('.')
@@ -168,6 +217,11 @@ class WebViewCookieJar : CookieJar {
     private fun normalizeImplicitDefaultPath(url: HttpUrl, cookie: Cookie): Cookie {
         // Ensure root-level cookies from paths like /video/123 are still visible on sibling paths when appropriate
         return cookie
+    }
+
+    private companion object {
+        const val CM_CACHE_TTL_MS = 1_500L
+        const val MAX_CM_CACHE_ENTRIES = 256
     }
 }
 
@@ -208,7 +262,14 @@ object NetworkModule {
                     chain.proceed(req)
                 }
             }
-            .addInterceptor(logging)
+            .addInterceptor { chain ->
+                val req = chain.request()
+                if (!BuildConfig.DEBUG || req.header("X-Internal-Download") == "true") {
+                    chain.proceed(req)
+                } else {
+                    logging.intercept(chain)
+                }
+            }
             // Sniffs media traffic that never passes through the WebView (probes, playlists)
             // and strips X-Internal-* metadata headers before hitting the wire.
             .addNetworkInterceptor(MediaSniffingInterceptor(engine))
