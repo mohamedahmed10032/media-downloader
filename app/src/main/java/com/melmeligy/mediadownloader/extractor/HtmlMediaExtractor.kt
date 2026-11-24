@@ -99,7 +99,8 @@ class HtmlMediaExtractor @Inject constructor(
         RegexOption.IGNORE_CASE
     )
 
-    override fun canHandle(url: String): Boolean = url.startsWith("http")
+    override fun canHandle(url: String): Boolean =
+        url.startsWith("http") && !UrlUtils.isDedicatedSocialPlatformUrl(url)
 
     override suspend fun extract(url: String): ResolvedMedia? =
         extractWithHeaders(url, emptyMap(), allowHeadlessFallback = true)
@@ -1065,7 +1066,7 @@ class HtmlMediaExtractor @Inject constructor(
 
         // ---- 10. Streaming portal unwrapping (watch/download tabs, multi-server AJAX, up to 3-hop embeds) ----
         val hasVideoOrAudio = found.values.any { it.type == MediaType.VIDEO || it.type == MediaType.AUDIO }
-        if (!hasVideoOrAudio && allowEmbedFollow) {
+        if (!hasVideoOrAudio && allowEmbedFollow && !UrlUtils.isDedicatedSocialPlatformUrl(pageUrl)) {
             val portalRes = portalResolver.resolvePortalAndEmbeds(
                 pageUrl = pageUrl,
                 html = html,

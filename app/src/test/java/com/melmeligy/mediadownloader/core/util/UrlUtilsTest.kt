@@ -63,9 +63,14 @@ class UrlUtilsTest {
 
     @Test
     fun extractFirstUrl_normalizesInstagramSharedTextAndStripsTracking() {
-        val sharedReel = "Watch this reel on Instagram https://www.instagram.com/share/reel/DEvv7ssup4o/?igsh=MTZvdjgzZnRsbzRuMg=="
-        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.extractFirstUrl(sharedReel))
-        assertEquals("https://www.instagram.com/reel/DEvv7ssup4o/", UrlUtils.normalize(sharedReel))
+        val sharedOpaqueReel = "Watch this reel on Instagram https://www.instagram.com/share/reel/DEvv7ssup4o/?igsh=MTZvdjgzZnRsbzRuMg=="
+        assertEquals("https://www.instagram.com/share/reel/DEvv7ssup4o/", UrlUtils.extractFirstUrl(sharedOpaqueReel))
+        assertEquals("https://www.instagram.com/share/reel/DEvv7ssup4o/", UrlUtils.normalize(sharedOpaqueReel))
+        assertTrue(UrlUtils.isShortOrRedirectUrl("https://www.instagram.com/share/reel/DEvv7ssup4o/"))
+
+        val directReel = "Watch this reel https://www.instagram.com/reels/Df7oqT6ItI_/?igsh=MTZvdjgz"
+        assertEquals("https://www.instagram.com/reel/Df7oqT6ItI_/", UrlUtils.extractFirstUrl(directReel))
+        assertEquals("https://www.instagram.com/reel/Df7oqT6ItI_/", UrlUtils.normalize(directReel))
 
         val sharedPost = "Check out this photo https://www.instagram.com/p/C9U3YwJMPKj/?igsh=YWJ4"
         assertEquals("https://www.instagram.com/p/C9U3YwJMPKj/", UrlUtils.extractFirstUrl(sharedPost))

@@ -180,7 +180,13 @@ class ExtractorRegistry @Inject constructor(
     }
 
     private suspend fun performResolve(url: String): ResolvedMedia {
-        val willing = extractors.filter { it.canHandle(url) }.sortedByDescending { it.priority }
+        val isDedicatedSocial = UrlUtils.isDedicatedSocialPlatformUrl(url)
+        val rawWilling = extractors.filter { it.canHandle(url) }.sortedByDescending { it.priority }
+        val willing = if (isDedicatedSocial && rawWilling.any { !it.name.equals("Web page", ignoreCase = true) }) {
+            rawWilling.filterNot { it.name.equals("Web page", ignoreCase = true) }
+        } else {
+            rawWilling
+        }
         var lastError: MediaException? = null
 
         for (extractor in willing) {
@@ -207,29 +213,9 @@ class ExtractorRegistry @Inject constructor(
             }
         }
 
-        // If a specialized extractor handles this walled domain (Instagram, TikTok, YouTube, etc.)
-        // and found no streams, do not waste 60+ seconds probing generic HTML/HLS/DASH/Direct extractors.
-        val host = UrlUtils.host(url)?.lowercase().orEmpty()
-        val isWalledSocial = host.contains("instagram.com") ||
-            host.contains("instagr.am") ||
-            host.contains("tiktok.com") ||
-            host.contains("youtube.com") ||
-            host.contains("youtu.be") ||
-            host.contains("facebook.com") ||
-            host.contains("fb.watch") ||
-            host.contains("fb.com") ||
-            host.contains("fb.me") ||
-            host.contains("twitter.com") ||
-            host.contains("x.com") ||
-            host.contains("t.co") ||
-            host.contains("pinterest.") ||
-            host.contains("pin.it") ||
-            host.contains("threads.net") ||
-            host.contains("threads.com") ||
-            host.contains("reddit.com") ||
-            host.contains("redd.it")
-
-        if (willing.isNotEmpty() && isWalledSocial) {
+        // Dedicated social platforms (Instagram, TikTok, YouTube, Facebook, X, Threads, Pinterest, Reddit)
+        // must NEVER fall through to generic HTML/StreamingPortalResolver/HLS/DASH/Direct extractors.
+        if (isDedicatedSocial) {
             throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
         }
 

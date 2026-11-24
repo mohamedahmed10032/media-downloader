@@ -457,7 +457,7 @@ class ExtractorHttp {
                 if (finalReqUrl.isNotBlank() && finalReqUrl != safeUrl && finalReqUrl != url.trim()) {
                     return@executeTracked finalReqUrl
                 }
-                if (response.code == 405) {
+                if (response.code == 400 || response.code == 403 || response.code == 405 || response.code == 501) {
                     val getReq = buildRequest(safeUrl, headers)
                         .header("Range", "bytes=0-0")
                         .header("X-Internal-Download", "true")

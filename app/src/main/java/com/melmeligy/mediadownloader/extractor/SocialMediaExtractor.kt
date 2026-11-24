@@ -70,9 +70,21 @@ class SocialMediaExtractor @Inject constructor(
     private var tikwmBlockedUntilMs: Long = 0L
 
     internal var clockMs: () -> Long = { System.currentTimeMillis() }
+    internal var cookieProvider: (String) -> String? = { target ->
+        runCatching { android.webkit.CookieManager.getInstance().getCookie(target) }.getOrNull()
+    }
+    internal var instagramEmbedFallbackRunner: suspend (String) -> ResolvedMedia? = { embedUrl ->
+        headlessWebExtractor.extract(
+            targetUrl = embedUrl,
+            timeoutMs = HeadlessWebExtractor.SOCIAL_FAST_TIMEOUT_MS,
+            socialEmbedFastMode = true
+        )
+    }
 
-    private val igShortcodeRegex =
-        Regex("(?:reel|reels|p|tv|share/reel|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val igCanonicalShortcodeRegex =
+        Regex("(?<!/share)/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val igShareTokenRegex =
+        Regex("/share/(?:reel|p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val twitterStatusRegex =
         Regex("(?:twitter\\.com|x\\.com)/([^/]+)/status/(\\d+)", RegexOption.IGNORE_CASE)
     private val pinterestPinIdRegex =
@@ -134,10 +146,11 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         if (fastResult != null && (fastResult.streams.isNotEmpty() || fastResult.gallerySlides.isNotEmpty())) {
-            return@withContext fastResult
+            return@withContext fastResult.copy(sourceUrl = url)
         }
 
-        // For Instagram, Pinterest, Threads, Reddit do NOT fall back to video-only Headless WebView
+        // For Instagram (which handles its own targeted embed-only fallback), Pinterest, Threads, Reddit
+        // do NOT fall back to full-page Headless WebView.
         if (host.contains("instagram.com") || host.contains("instagr.am") ||
             host.contains("pinterest.") || host.contains("pin.it") ||
             host.contains("threads.net") || host.contains("threads.com") ||
@@ -146,9 +159,13 @@ class SocialMediaExtractor @Inject constructor(
             return@withContext null
         }
 
-        // Fallback to Headless WebView to execute JS/GraphQL and intercept live CDN streams
+        // Targeted social-fast-mode Headless WebView fallback (never clicks watch servers or promotes embeds)
         try {
-            headlessWebExtractor.extract(workingUrl)
+            headlessWebExtractor.extract(
+                targetUrl = workingUrl,
+                timeoutMs = HeadlessWebExtractor.SOCIAL_FAST_TIMEOUT_MS,
+                socialEmbedFastMode = true
+            )
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Exception) {
@@ -247,275 +264,440 @@ class SocialMediaExtractor @Inject constructor(
     // 1. INSTAGRAM (Snaptube Polaris GraphQL + doc_id + Embed DASH/JSON)
     // =========================================================================
 
+    private data class InstagramRaceOutcome(
+        val resolved: ResolvedMedia? = null,
+        val loginRequired: Boolean = false
+    )
+
+    internal fun extractInstagramShortcode(url: String): String? {
+        igCanonicalShortcodeRegex.find(url)?.groupValues?.getOrNull(1)?.let { return it }
+        // Instagram /share/reel/... sometimes 302-redirects to /accounts/login/?next=%2Freel%2F<CODE>%2F
+        val nextParam = Regex("[?&]next=([^&#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.getOrNull(1)
+        if (!nextParam.isNullOrBlank()) {
+            val decodedNext = runCatching { java.net.URLDecoder.decode(nextParam, "UTF-8") }.getOrDefault(nextParam)
+            igCanonicalShortcodeRegex.find(decodedNext)?.groupValues?.getOrNull(1)?.let { return it }
+        }
+        // Last resort for legacy /share/reel/<shortcode> links that did not redirect
+        return igShareTokenRegex.find(url)?.groupValues?.getOrNull(1)
+    }
+
+    internal fun looksLikeInstagramLoginOrPrivate(payload: String): Boolean {
+        if (payload.isBlank()) return false
+        val lower = payload.lowercase()
+        val hasMedia = lower.contains("\"video_url\"") ||
+            lower.contains("\"video_versions\"") ||
+            lower.contains("<video") ||
+            lower.contains("embeddedmediaimage")
+        if (hasMedia) return false
+        return lower.contains("\"login_required\"") ||
+            lower.contains("\"require_login\":true") ||
+            lower.contains("\"is_private\":true") ||
+            lower.contains("this account is private") ||
+            lower.contains("sorry, this page isn't available") ||
+            lower.contains("sorry, this page isn&#039;t available") ||
+            (lower.contains("/accounts/login/") && !lower.contains("gql_data"))
+    }
+
+    private fun extractCsrfTokenFromCookie(cookieHeader: String?): String? {
+        if (cookieHeader.isNullOrBlank()) return null
+        return cookieHeader.split(';')
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("csrftoken=", ignoreCase = true) }
+            ?.substringAfter('=')
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }
+
     private suspend fun extractInstagram(rawUrl: String): ResolvedMedia? = coroutineScope {
-        val resolvedUrl = if (rawUrl.contains("/share/", ignoreCase = true)) {
-            runCatching { http.probe(rawUrl).finalUrl }.getOrDefault(rawUrl)
+        val resolvedUrl = if (rawUrl.contains("/share/", ignoreCase = true) || rawUrl.contains("instagr.am", ignoreCase = true)) {
+            resolveRedirectUrl(rawUrl)
         } else {
             rawUrl
         }
 
-        val shortcode = igShortcodeRegex.find(resolvedUrl)?.groupValues?.getOrNull(1)
-            ?: return@coroutineScope null
+        val shortcode = extractInstagramShortcode(resolvedUrl)
+        if (shortcode.isNullOrBlank()) {
+            if (resolvedUrl.contains("/accounts/login", ignoreCase = true)) {
+                progressTracker.setDiagnosticReason(INSTAGRAM_LOGIN_REQUIRED_MESSAGE)
+            }
+            return@coroutineScope null
+        }
 
         val mediaId = shortcodeToMediaId(shortcode)
+        val liveCookie = runCatching { cookieProvider("https://www.instagram.com/") }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        val csrfToken = extractCsrfTokenFromCookie(liveCookie)
 
-        val rawStreams = LinkedHashMap<String, MediaStream>()
-        var counter = 0
-        var capturedTitle: String? = null
-        var capturedThumb: String? = null
-
-        val defaultHeaders = mapOf(
-            "Referer" to "https://www.instagram.com/",
-            "Accept-Language" to "en-US,en;q=0.9"
-        )
-
-        fun addCandidate(
-            candidateUrl: String,
-            type: MediaType,
-            container: String,
-            label: String,
-            width: Int? = null,
-            height: Int? = null,
-            bitrateKbps: Int? = null,
-            isDashVideoOnly: Boolean = false
-        ) {
-            val cleaned = MediaSniffer.cleanMediaUrl(unescape(candidateUrl))
-            if (!cleaned.startsWith("http")) return
-            val key = cleaned.substringBefore('?')
-            if (rawStreams.containsKey(key)) return
-            val extraHeaders = if (isDashVideoOnly) {
-                defaultHeaders + ("X-Internal-Dash-VideoOnly" to "true")
-            } else {
-                defaultHeaders
-            }
-            rawStreams[key] = MediaStream(
-                id = "ig-${counter++}",
-                url = cleaned,
-                type = type,
-                container = container,
-                label = label,
-                width = width,
-                height = height,
-                bitrateKbps = bitrateKbps,
-                isHls = false,
-                headers = extraHeaders
-            )
+        val defaultHeaders = LinkedHashMap<String, String>().apply {
+            put("Referer", "https://www.instagram.com/")
+            put("Accept-Language", "en-US,en;q=0.9")
+            put("User-Agent", IG_DESKTOP_UA)
+            if (!liveCookie.isNullOrBlank()) put("Cookie", liveCookie)
         }
 
-        fun parseMediaPayload(jsonText: String) {
-            if (jsonText.isBlank()) return
-            val unescaped = unescape(jsonText)
-
-            // DASH manifest XML
-            val dashRegex = Regex("<MPD[\\s\\S]*?</MPD>", RegexOption.IGNORE_CASE)
-            dashRegex.findAll(unescaped).forEach { match ->
-                parseDashXml(match.value).forEach { s ->
-                    addCandidate(
-                        s.url,
-                        s.type,
-                        s.container,
-                        s.label,
-                        s.width,
-                        s.height,
-                        s.bitrateKbps,
-                        isDashVideoOnly = (s.type == MediaType.VIDEO)
-                    )
-                }
-            }
-
-            // video_versions JSON array
-            val versionsRegex = Regex("\"video_versions\"\\s*:\\s*(\\[[^\\]]+\\])")
-            versionsRegex.findAll(unescaped).forEach { match ->
-                runCatching {
-                    val arr = JSONArray(match.groupValues[1])
-                    for (i in 0 until arr.length()) {
-                        val obj = arr.optJSONObject(i) ?: continue
-                        val vUrl = obj.optString("url")
-                        val w = obj.optInt("width", 0).takeIf { it > 0 }
-                        val h = obj.optInt("height", 0).takeIf { it > 0 }
-                        val label = when {
-                            h != null && h >= 720 -> "High quality (${h}p)"
-                            h != null -> "Fast (${h}p)"
-                            i == 0 -> "High quality (720p)"
-                            else -> "Fast (480p)"
-                        }
-                        addCandidate(vUrl, MediaType.VIDEO, "mp4", label, w, h)
-                    }
-                }
-            }
-
-            // direct video_url fields
-            val videoUrlRegex = Regex("\"video_url\"\\s*:\\s*\"([^\"]+)\"")
-            videoUrlRegex.findAll(unescaped).forEach { match ->
-                addCandidate(match.groupValues[1], MediaType.VIDEO, "mp4", "High quality (720p)")
-            }
-
-            // display_url / thumbnail_src
-            val thumbRegex = Regex("\"(?:display_url|thumbnail_src)\"\\s*:\\s*\"([^\"]+)\"")
-            thumbRegex.find(unescaped)?.groupValues?.getOrNull(1)?.let {
-                if (capturedThumb == null && it.startsWith("http")) capturedThumb = it
-            }
+        val isPostPath = resolvedUrl.contains("/p/", ignoreCase = true) || rawUrl.contains("/share/p/", ignoreCase = true)
+        val canonicalUrl = if (isPostPath) {
+            "https://www.instagram.com/p/$shortcode/"
+        } else {
+            "https://www.instagram.com/reel/$shortcode/"
+        }
+        val primaryEmbedUrl = if (isPostPath) {
+            "https://www.instagram.com/p/$shortcode/embed/captioned/"
+        } else {
+            "https://www.instagram.com/reel/$shortcode/embed/captioned/"
+        }
+        val alternateEmbedUrl = if (isPostPath) {
+            "https://www.instagram.com/reel/$shortcode/embed/captioned/"
+        } else {
+            "https://www.instagram.com/p/$shortcode/embed/captioned/"
         }
 
-        // Method 0: High-speed FastDL resolver (supports carousels, mixed slides, single photos & Reels)
-        runCatching {
-            val fastDlHeaders = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin" to "https://fastdl.to",
-                "Referer" to "https://fastdl.to/en",
-                "X-Requested-With" to "XMLHttpRequest",
-                "Accept" to "*/*"
-            )
-            val canonicalUrl = if (rawUrl.contains("/p/", ignoreCase = true)) {
-                "https://www.instagram.com/p/$shortcode/"
-            } else {
-                "https://www.instagram.com/reel/$shortcode/"
+        fun parsePayloadIntoResolved(
+            payloadText: String,
+            parsedPost: SocialMediaGalleryParsers.ParsedPost?,
+            fallbackTitle: String? = null,
+            fallbackThumb: String? = null,
+            extraVideos: List<String> = emptyList()
+        ): ResolvedMedia? {
+            if (parsedPost != null && parsedPost.slides.isNotEmpty()) {
+                return buildGalleryResolvedMedia(rawUrl, "Instagram", parsedPost)
             }
-            val postBody = "q=" + URLEncoder.encode(canonicalUrl, "UTF-8") + "&t=media&lang=en&v=v2"
-            val respJson = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
-                    http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
+            val rawStreams = LinkedHashMap<String, MediaStream>()
+            var counter = 0
+            var capturedTitle = parsedPost?.title ?: fallbackTitle
+            var capturedThumb = parsedPost?.thumbnailUrl ?: fallbackThumb
+
+            fun addCandidate(
+                candidateUrl: String,
+                type: MediaType,
+                container: String,
+                label: String,
+                width: Int? = null,
+                height: Int? = null,
+                bitrateKbps: Int? = null,
+                isDashVideoOnly: Boolean = false
+            ) {
+                val cleaned = MediaSniffer.cleanMediaUrl(unescape(candidateUrl))
+                if (!cleaned.startsWith("http")) return
+                val key = cleaned.substringBefore('?')
+                if (rawStreams.containsKey(key)) return
+                val extraHeaders = if (isDashVideoOnly) {
+                    defaultHeaders + ("X-Internal-Dash-VideoOnly" to "true")
+                } else {
+                    defaultHeaders
                 }
-            }.orEmpty()
-            if (respJson.isNotBlank()) {
-                val jsonRoot = JSONObject(respJson)
-                if (jsonRoot.optString("status") == "ok") {
-                    val dataHtml = jsonRoot.optString("data")
-                    if (dataHtml.isNotBlank()) {
-                        val parsedFastDl = SocialMediaGalleryParsers.parseInstagramFastDlHtml(
-                            dataHtml = dataHtml,
-                            shortcode = shortcode,
-                            headers = defaultHeaders
+                rawStreams[key] = MediaStream(
+                    id = "ig-${counter++}",
+                    url = cleaned,
+                    type = type,
+                    container = container,
+                    label = label,
+                    width = width,
+                    height = height,
+                    bitrateKbps = bitrateKbps,
+                    isHls = false,
+                    headers = extraHeaders
+                )
+            }
+
+            parsedPost?.videoStreams?.forEach { v ->
+                addCandidate(v.url, MediaType.VIDEO, v.container, v.label, v.width, v.height, v.bitrateKbps)
+            }
+
+            if (payloadText.isNotBlank()) {
+                val unescaped = unescape(payloadText)
+
+                // DASH manifest XML
+                val dashRegex = Regex("<MPD[\\s\\S]*?</MPD>", RegexOption.IGNORE_CASE)
+                dashRegex.findAll(unescaped).forEach { match ->
+                    parseDashXml(match.value).forEach { s ->
+                        addCandidate(
+                            s.url,
+                            s.type,
+                            s.container,
+                            s.label,
+                            s.width,
+                            s.height,
+                            s.bitrateKbps,
+                            isDashVideoOnly = (s.type == MediaType.VIDEO)
                         )
-                        if (parsedFastDl != null) {
-                            if (parsedFastDl.slides.isNotEmpty()) {
-                                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedFastDl)
+                    }
+                }
+
+                // video_versions JSON array
+                val versionsRegex = Regex("\"video_versions\"\\s*:\\s*(\\[[^\\]]+\\])")
+                versionsRegex.findAll(unescaped).forEach { match ->
+                    runCatching {
+                        val arr = JSONArray(match.groupValues[1])
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.optJSONObject(i) ?: continue
+                            val vUrl = obj.optString("url")
+                            val w = obj.optInt("width", 0).takeIf { it > 0 }
+                            val h = obj.optInt("height", 0).takeIf { it > 0 }
+                            val label = when {
+                                h != null && h >= 720 -> "High quality (${h}p)"
+                                h != null -> "Fast (${h}p)"
+                                i == 0 -> "High quality (720p)"
+                                else -> "Fast (480p)"
                             }
-                            if (capturedThumb == null && !parsedFastDl.thumbnailUrl.isNullOrBlank()) {
-                                capturedThumb = parsedFastDl.thumbnailUrl
-                            }
-                            parsedFastDl.videoStreams.forEach { v ->
-                                addCandidate(v.url, MediaType.VIDEO, v.container, v.label, v.width, v.height)
-                            }
+                            addCandidate(vUrl, MediaType.VIDEO, "mp4", label, w, h)
                         }
                     }
                 }
+
+                // direct video_url fields
+                val videoUrlRegex = Regex("\"video_url\"\\s*:\\s*\"([^\"]+)\"")
+                videoUrlRegex.findAll(unescaped).forEach { match ->
+                    addCandidate(match.groupValues[1], MediaType.VIDEO, "mp4", "High quality (720p)")
+                }
+
+                // display_url / thumbnail_src
+                if (capturedThumb == null) {
+                    val thumbRegex = Regex("\"(?:display_url|thumbnail_src)\"\\s*:\\s*\"([^\"]+)\"")
+                    thumbRegex.find(unescaped)?.groupValues?.getOrNull(1)?.let {
+                        if (it.startsWith("http")) capturedThumb = it
+                    }
+                }
             }
+
+            extraVideos.forEach { vUrl ->
+                addCandidate(vUrl, MediaType.VIDEO, "mp4", "High quality (720p)")
+            }
+
+            if (rawStreams.isEmpty()) return null
+            return buildInstagramResolvedMedia(
+                rawUrl = rawUrl,
+                shortcode = shortcode,
+                probed = rawStreams.values.take(10).toList(),
+                capturedTitle = capturedTitle,
+                capturedThumb = capturedThumb
+            )
         }
 
-        // Methods 1 & 2 in parallel: Polaris LoggedOut Desktop GraphQL + doc_id query
-        if (rawStreams.isEmpty()) {
-            val gqlChannel = Channel<Pair<String, SocialMediaGalleryParsers.ParsedPost?>>(capacity = 2)
-            val gqlJobs = buildList {
-                if (mediaId != null) {
-                    add(launch(Dispatchers.IO) {
-                        val res = try {
-                            withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
-                                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
-                                    val polarisHeaders = mapOf(
-                                        "X-IG-App-ID" to "1217981644879628",
-                                        "X-ASBD-ID" to "198387",
-                                        "Origin" to "https://www.instagram.com",
-                                        "Referer" to "https://www.instagram.com/",
-                                        "User-Agent" to "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-                                    )
-                                    val polarisBody = "av=0&__d=www&__user=0&dpr=1&lsd=AVqb_dummy&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisLoggedOutDesktopWWWPostRootContentQuery&variables=" +
-                                        URLEncoder.encode("{\"media_id\":\"$mediaId\"}", "UTF-8") +
-                                        "&doc_id=27130156389949648"
-                                    val polarisJson = http.postForm("https://www.instagram.com/api/graphql", polarisBody, polarisHeaders)
-                                    val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(polarisJson, shortcode, defaultHeaders)
-                                    polarisJson to parsed
-                                }
+        // Race all 4 lightweight HTTP paths in parallel (First-Valid-Wins; cancel slower siblings immediately)
+        val raceChannel = Channel<InstagramRaceOutcome>(capacity = 4)
+        val raceJobs = buildList {
+            // Path 1: Public login-free /embed/captioned/ page (reel & post variants)
+            add(launch(Dispatchers.IO) {
+                val outcome = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            var html = runCatching { http.fetchString(primaryEmbedUrl, defaultHeaders) }.getOrNull().orEmpty()
+                            var usedUrl = primaryEmbedUrl
+                            if (html.isBlank()) {
+                                html = runCatching { http.fetchString(alternateEmbedUrl, defaultHeaders) }.getOrNull().orEmpty()
+                                usedUrl = alternateEmbedUrl
                             }
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (_: Exception) {
-                            null
+                            if (html.isBlank()) {
+                                InstagramRaceOutcome()
+                            } else {
+                                val parsedEmbed = SocialMediaGalleryParsers.parseInstagramEmbedHtml(html, shortcode, defaultHeaders)
+                                val doc = Jsoup.parse(html, usedUrl)
+                                val videoTags = doc.select("video[src], video source[src]").mapNotNull { el ->
+                                    el.absUrl("src").ifBlank { el.attr("src") }.takeIf { it.startsWith("http") }
+                                }
+                                val title = doc.select(".CaptionUsername").text().takeIf { it.isNotBlank() }
+                                    ?.let { "Instagram Reel (@$it)" }
+                                    ?: doc.select("meta[property=og:title]").attr("content").takeIf { it.isNotBlank() }
+                                val thumb = doc.select("img.EmbeddedMediaImage").attr("src")
+                                    .ifBlank { doc.select("meta[property=og:image]").attr("content") }
+                                    .let { unescape(it) }
+                                    .takeIf { it.startsWith("http") }
+                                val resolved = parsePayloadIntoResolved(
+                                    payloadText = html,
+                                    parsedPost = parsedEmbed,
+                                    fallbackTitle = title,
+                                    fallbackThumb = thumb,
+                                    extraVideos = videoTags
+                                )
+                                InstagramRaceOutcome(
+                                    resolved = resolved,
+                                    loginRequired = resolved == null && looksLikeInstagramLoginOrPrivate(html)
+                                )
+                            }
                         }
-                        gqlChannel.trySend(res ?: ("" to null))
-                    })
+                    } ?: InstagramRaceOutcome()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    InstagramRaceOutcome()
                 }
+                raceChannel.trySend(outcome)
+            })
+
+            // Path 2: Polaris GraphQL POST (with X-IG-App-ID, optional live CookieManager session & CSRF token)
+            if (mediaId != null) {
                 add(launch(Dispatchers.IO) {
-                    val res = try {
+                    val outcome = try {
                         withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
                             withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
-                                val docHeaders = mapOf(
-                                    "X-IG-App-ID" to "1217981644879628",
-                                    "Referer" to "https://www.instagram.com/"
+                                val polarisHeaders = LinkedHashMap<String, String>().apply {
+                                    put("X-IG-App-ID", IG_WEB_APP_ID)
+                                    put("X-ASBD-ID", "198387")
+                                    put("Origin", "https://www.instagram.com")
+                                    put("Referer", canonicalUrl)
+                                    put("User-Agent", IG_MOBILE_UA)
+                                    if (!liveCookie.isNullOrBlank()) put("Cookie", liveCookie)
+                                    if (!csrfToken.isNullOrBlank()) put("X-CSRFToken", csrfToken)
+                                }
+                                val polarisBody = "av=0&__d=www&__user=0&dpr=1&lsd=AVqb_dummy&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisLoggedOutDesktopWWWPostRootContentQuery&variables=" +
+                                    URLEncoder.encode("{\"media_id\":\"$mediaId\"}", "UTF-8") +
+                                    "&doc_id=27130156389949648"
+                                val polarisJson = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                                    http.postForm("https://www.instagram.com/api/graphql", polarisBody, polarisHeaders)
+                                }
+                                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(polarisJson, shortcode, defaultHeaders)
+                                val resolved = parsePayloadIntoResolved(polarisJson, parsed)
+                                InstagramRaceOutcome(
+                                    resolved = resolved,
+                                    loginRequired = resolved == null && looksLikeInstagramLoginOrPrivate(polarisJson)
                                 )
-                                val docUrl = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" +
-                                    URLEncoder.encode("{\"shortcode\":\"$shortcode\"}", "UTF-8")
-                                val docJson = http.fetchString(docUrl, docHeaders)
-                                val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(docJson, shortcode, defaultHeaders)
-                                docJson to parsed
                             }
-                        }
+                        } ?: InstagramRaceOutcome()
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Exception) {
-                        null
+                        InstagramRaceOutcome()
                     }
-                    gqlChannel.trySend(res ?: ("" to null))
+                    raceChannel.trySend(outcome)
                 })
             }
 
-            var winningGallery: SocialMediaGalleryParsers.ParsedPost? = null
-            try {
-                for (i in gqlJobs.indices) {
-                    val (jsonPayload, parsed) = gqlChannel.receiveCatching().getOrNull() ?: break
-                    if (parsed != null && parsed.slides.isNotEmpty()) {
-                        winningGallery = parsed
-                        break
-                    }
-                    if (jsonPayload.isNotBlank()) {
-                        parseMediaPayload(jsonPayload)
-                        if (rawStreams.isNotEmpty()) break
-                    }
+            // Path 3: Instagram GraphQL doc_id GET query (with X-IG-App-ID & optional live CookieManager session)
+            add(launch(Dispatchers.IO) {
+                val outcome = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            val docHeaders = LinkedHashMap<String, String>().apply {
+                                put("X-IG-App-ID", IG_WEB_APP_ID)
+                                put("Referer", canonicalUrl)
+                                put("User-Agent", IG_DESKTOP_UA)
+                                if (!liveCookie.isNullOrBlank()) put("Cookie", liveCookie)
+                                if (!csrfToken.isNullOrBlank()) put("X-CSRFToken", csrfToken)
+                            }
+                            val docUrl = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" +
+                                URLEncoder.encode("{\"shortcode\":\"$shortcode\"}", "UTF-8")
+                            val docJson = http.fetchString(docUrl, docHeaders)
+                            val parsed = SocialMediaGalleryParsers.parseInstagramGraphQl(docJson, shortcode, defaultHeaders)
+                            val resolved = parsePayloadIntoResolved(docJson, parsed)
+                            InstagramRaceOutcome(
+                                resolved = resolved,
+                                loginRequired = resolved == null && looksLikeInstagramLoginOrPrivate(docJson)
+                            )
+                        }
+                    } ?: InstagramRaceOutcome()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    InstagramRaceOutcome()
                 }
-            } finally {
-                gqlJobs.forEach { it.cancel() }
-                gqlChannel.close()
-            }
-            if (winningGallery != null) {
-                return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", winningGallery)
-            }
+                raceChannel.trySend(outcome)
+            })
+
+            // Path 4: Lightweight FastDL web resolver (raced in parallel, never blocks other paths)
+            add(launch(Dispatchers.IO) {
+                val outcome = try {
+                    withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            val fastDlHeaders = mapOf(
+                                "User-Agent" to IG_DESKTOP_UA,
+                                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                                "Origin" to "https://fastdl.to",
+                                "Referer" to "https://fastdl.to/en",
+                                "X-Requested-With" to "XMLHttpRequest",
+                                "Accept" to "*/*"
+                            )
+                            val postBody = "q=" + URLEncoder.encode(canonicalUrl, "UTF-8") + "&t=media&lang=en&v=v2"
+                            val respJson = kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                                http.postForm("https://fastdl.to/api/ajaxSearch", postBody, fastDlHeaders)
+                            }
+                            if (respJson.isBlank()) {
+                                InstagramRaceOutcome()
+                            } else {
+                                val jsonRoot = JSONObject(respJson)
+                                val dataHtml = if (jsonRoot.optString("status") == "ok") jsonRoot.optString("data") else ""
+                                val parsedFastDl = if (dataHtml.isNotBlank()) {
+                                    SocialMediaGalleryParsers.parseInstagramFastDlHtml(
+                                        dataHtml = dataHtml,
+                                        shortcode = shortcode,
+                                        headers = defaultHeaders
+                                    )
+                                } else null
+                                val resolved = if (parsedFastDl != null) {
+                                    parsePayloadIntoResolved("", parsedFastDl)
+                                } else null
+                                InstagramRaceOutcome(resolved = resolved)
+                            }
+                        }
+                    } ?: InstagramRaceOutcome()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    InstagramRaceOutcome()
+                }
+                raceChannel.trySend(outcome)
+            })
         }
 
-        // Method 3: Embed page captioned (supports embedded sidecar JSON, single photos & videos)
-        if (rawStreams.isEmpty()) {
-            val embedUrl = "https://www.instagram.com/p/$shortcode/embed/captioned/"
-            val html = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
-                    runCatching { http.fetchString(embedUrl, defaultHeaders) }.getOrNull()
+        var winner: ResolvedMedia? = null
+        var sawLoginWall = false
+        try {
+            for (i in raceJobs.indices) {
+                val outcome = raceChannel.receiveCatching().getOrNull() ?: break
+                if (outcome.loginRequired) sawLoginWall = true
+                if (outcome.resolved != null) {
+                    winner = outcome.resolved
+                    break
                 }
-            }.orEmpty()
-            if (html.isNotBlank()) {
-                val parsedEmbed = SocialMediaGalleryParsers.parseInstagramEmbedHtml(html, shortcode, defaultHeaders)
-                if (parsedEmbed != null && parsedEmbed.slides.isNotEmpty()) {
-                    return@coroutineScope buildGalleryResolvedMedia(rawUrl, "Instagram", parsedEmbed)
-                }
-                parseMediaPayload(html)
-                val doc = Jsoup.parse(html, embedUrl)
-                doc.select("video[src], video source[src]").forEach { el ->
-                    val src = el.absUrl("src").ifBlank { el.attr("src") }
-                    addCandidate(src, MediaType.VIDEO, "mp4", "High quality (720p)")
-                }
-                capturedTitle = doc.select(".CaptionUsername").text().takeIf { it.isNotBlank() }?.let { "Instagram Reel (@$it)" }
-                    ?: doc.select("meta[property=og:title]").attr("content").takeIf { it.isNotBlank() }
-                capturedThumb = doc.select("img.EmbeddedMediaImage").attr("src")
-                    .ifBlank { doc.select("meta[property=og:image]").attr("content") }
-                    .let { unescape(it) }
-                    .takeIf { it.startsWith("http") }
             }
+        } finally {
+            raceJobs.forEach { it.cancel() }
+            raceChannel.close()
         }
 
-        if (rawStreams.isEmpty()) return@coroutineScope null
+        if (winner != null) {
+            return@coroutineScope winner
+        }
 
+        // Fail fast with a clear diagnostic when Instagram explicitly requires login / private access
+        if (sawLoginWall) {
+            progressTracker.setDiagnosticReason(INSTAGRAM_LOGIN_REQUIRED_MESSAGE)
+            return@coroutineScope null
+        }
+
+        // Targeted, short-capped (~3.8s) WebView fallback strictly on the login-free /embed/captioned/ URL
+        // (socialEmbedFastMode = true: zero watch-server clicking, zero iframe promotion)
+        val embedFallback = try {
+            instagramEmbedFallbackRunner(primaryEmbedUrl)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
+        if (embedFallback != null && (embedFallback.streams.isNotEmpty() || embedFallback.gallerySlides.isNotEmpty())) {
+            return@coroutineScope embedFallback.copy(
+                sourceUrl = rawUrl,
+                title = embedFallback.title.takeIf { it.isNotBlank() && !it.equals("Instagram", ignoreCase = true) }
+                    ?: "Instagram Reel ($shortcode)",
+                extractor = "Instagram"
+            )
+        }
+
+        if (progressTracker.peekDiagnosticReason().isNullOrBlank()) {
+            progressTracker.setDiagnosticReason(INSTAGRAM_LOGIN_REQUIRED_MESSAGE)
+        }
+        null
+    }
+
+    private fun buildInstagramResolvedMedia(
+        rawUrl: String,
+        shortcode: String,
+        probed: List<MediaStream>,
+        capturedTitle: String?,
+        capturedThumb: String?
+    ): ResolvedMedia {
         // Return formats immediately without blocking on HEAD/Range size probes;
         // StreamSizeRefiner populates missing sizes asynchronously in the background.
-        val probed = rawStreams.values.take(10).toList()
-
         val rawAudios = probed.filter { it.type == MediaType.AUDIO }
             .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
         val bestAudio = rawAudios.firstOrNull()
@@ -611,7 +793,7 @@ class SocialMediaExtractor @Inject constructor(
 
         val images = probed.filter { it.type == MediaType.IMAGE }
 
-        ResolvedMedia(
+        return ResolvedMedia(
             sourceUrl = rawUrl,
             title = capturedTitle ?: if (videos.isNotEmpty()) "Instagram Reel ($shortcode)" else "Instagram Photo ($shortcode)",
             thumbnailUrl = capturedThumb ?: images.firstOrNull()?.url,
@@ -642,7 +824,7 @@ class SocialMediaExtractor @Inject constructor(
 
     private suspend fun extractFacebook(rawUrl: String): ResolvedMedia? = coroutineScope {
         val resolvedUrl = if (rawUrl.contains("fb.watch", ignoreCase = true) || rawUrl.contains("/share/", ignoreCase = true)) {
-            runCatching { http.probe(rawUrl).finalUrl }.getOrDefault(rawUrl)
+            resolveRedirectUrl(rawUrl)
         } else {
             rawUrl
         }
@@ -1631,5 +1813,12 @@ class SocialMediaExtractor @Inject constructor(
         private const val SOCIAL_API_TIMEOUT_MS = 2_800L
         private const val FAST_PROBE_TIMEOUT_MS = 1_800L
         private const val FAST_AUDIO_PROBE_TIMEOUT_MS = 1_200L
+        internal const val IG_WEB_APP_ID = "936619743392459"
+        private const val IG_DESKTOP_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        private const val IG_MOBILE_UA =
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+        internal const val INSTAGRAM_LOGIN_REQUIRED_MESSAGE =
+            "Instagram login required or private post — open in browser to sign in"
     }
 }

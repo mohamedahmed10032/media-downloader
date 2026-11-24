@@ -23,8 +23,8 @@ object UrlUtils {
         // TikTok share tracking parameters (never CDN signature params)
         "_t", "_r", "is_from_webapp", "sender_device", "tt_from", "share_app_id", "share_link_id"
     )
-    private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels|share/reel)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
-    private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|share/p)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramReelPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:reel|reels)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+    private val instagramPostPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/p/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val instagramTvPattern = Regex("(?:https?://)?(?:www\\.)?(?:instagram\\.com|instagr\\.am)/tv/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
     private val pinterestPinPattern = Regex("(?:https?://)?(?:[a-z0-9-]+\\.)?pinterest\\.[a-z.]+/pin/(?:[^/?#]*--)?(\\d+)", RegexOption.IGNORE_CASE)
     private val twitterStatusPattern = Regex("(?:twitter\\.com|x\\.com)/[^/]+/status/(\\d+)", RegexOption.IGNORE_CASE)
@@ -268,6 +268,34 @@ object UrlUtils {
         return lower.contains("/share/") ||
             (h.contains("tiktok.com") && lower.contains("/t/")) ||
             (h.contains("reddit.com") && lower.contains("/s/"))
+    }
+
+    /**
+     * True for major social platforms handled exclusively by dedicated extractors
+     * (`SocialMediaExtractor` / `YouTubeExtractor`). These domains must NEVER fall through
+     * into generic HTML scraping or movie-portal `StreamingPortalResolver` ("Checking watch servers...").
+     */
+    fun isDedicatedSocialPlatformUrl(url: String): Boolean {
+        val h = host(url)?.lowercase().orEmpty()
+        if (h.isBlank()) return false
+        return h.contains("instagram.com") ||
+            h.contains("instagr.am") ||
+            h.contains("tiktok.com") ||
+            h.contains("youtube.com") ||
+            h.contains("youtu.be") ||
+            h.contains("facebook.com") ||
+            h.contains("fb.watch") ||
+            h.contains("fb.com") ||
+            h.contains("fb.me") ||
+            h.contains("twitter.com") ||
+            h == "x.com" || h.endsWith(".x.com") ||
+            h == "t.co" ||
+            h.contains("pinterest.") ||
+            h == "pin.it" || h.endsWith(".pin.it") ||
+            h.contains("threads.net") ||
+            h.contains("threads.com") ||
+            h.contains("reddit.com") ||
+            h == "redd.it" || h.endsWith(".redd.it")
     }
 
     /** Short lowercase platform slug suitable for indexed filenames (e.g., instagram, pinterest, tiktok). */

@@ -73,11 +73,17 @@ class HeadlessWebExtractor @Inject constructor(
     private val resRegex = Regex("(?:^|[^0-9])(2160|1440|1080|720|540|480|360|240)p?(?:[^0-9]|$)", RegexOption.IGNORE_CASE)
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun extract(targetUrl: String, timeoutMs: Long = 7_500L): ResolvedMedia? = coroutineScope {
+    suspend fun extract(
+        targetUrl: String,
+        timeoutMs: Long = 7_500L,
+        socialEmbedFastMode: Boolean = false
+    ): ResolvedMedia? = coroutineScope {
+        val isSocialFastMode = socialEmbedFastMode || UrlUtils.isDedicatedSocialPlatformUrl(targetUrl)
+        val effectiveTimeoutMs = if (isSocialFastMode) minOf(timeoutMs, SOCIAL_FAST_TIMEOUT_MS) else timeoutMs
         progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
         com.melmeligy.mediadownloader.core.AppLogger.d(
             "Headless",
-            "Start extraction host=${UrlUtils.host(targetUrl)} timeoutMs=$timeoutMs"
+            "Start extraction host=${UrlUtils.host(targetUrl)} timeoutMs=$effectiveTimeoutMs socialFast=$isSocialFastMode"
         )
         val localCaptured = CopyOnWriteArrayList<MediaStreamPayload>()
         val discoveredEmbedUrls = CopyOnWriteArrayList<String>()
@@ -490,7 +496,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
 
                 val elapsed = System.currentTimeMillis() - start
-                if (elapsed >= timeoutMs) break
+                if (elapsed >= effectiveTimeoutMs) break
 
                 val firstVidAt = firstVideoCapturedAtMs.get().takeIf { it >= 0L }
                 val decision = evaluateEarlyExit(
@@ -516,7 +522,9 @@ class HeadlessWebExtractor @Inject constructor(
 
                 // Fast DOM-ready polling (every ~300ms once pageFinished or >= 1.2s):
                 // the instant server tabs / iframes appear in DOM, launch parallel StreamingPortalResolver!
-                if (firstVidAt == null &&
+                // Never run movie-portal polling/server clicking on social platforms.
+                if (!isSocialFastMode &&
+                    firstVidAt == null &&
                     hybridPortalJob == null &&
                     webViewRef != null &&
                     (pageFinished.get() || elapsed >= 1_200L) &&
@@ -532,7 +540,8 @@ class HeadlessWebExtractor @Inject constructor(
 
                 // If page finished and we already have embed URLs in DOM (no Cloudflare stall),
                 // don't wait out the full 7.5s outer timeout — move to promoted embeds after 2.2s.
-                if (firstVidAt == null &&
+                if (!isSocialFastMode &&
+                    firstVidAt == null &&
                     pageFinished.get() &&
                     discoveredEmbedUrls.isNotEmpty() &&
                     elapsed >= OUTER_EMBED_READY_EARLY_BREAK_MS
@@ -541,7 +550,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
 
                 // If Server #0 produced nothing after 1.8s, try clicking the next watch server tab safely
-                if (firstVidAt == null && !triedNextServerTab && elapsed >= NEXT_SERVER_TAB_DELAY_MS) {
+                if (!isSocialFastMode && firstVidAt == null && !triedNextServerTab && elapsed >= NEXT_SERVER_TAB_DELAY_MS) {
                     triedNextServerTab = true
                     progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
                     withContext(dispatchers.main) {
@@ -549,7 +558,7 @@ class HeadlessWebExtractor @Inject constructor(
                     }
                 }
 
-                val remaining = timeoutMs - (System.currentTimeMillis() - start)
+                val remaining = effectiveTimeoutMs - (System.currentTimeMillis() - start)
                 if (remaining <= 0L) break
                 withTimeoutOrNull(minOf(remaining, EARLY_EXIT_TICK_MS)) {
                     wakeSignal.receiveCatching()
@@ -574,7 +583,7 @@ class HeadlessWebExtractor @Inject constructor(
                 "Headless",
                 "Outer pass finished host=${UrlUtils.host(currentPageUrl)} captured=${localCaptured.size} verified=${verifiedStreams.size} interceptedEmbeds=${discoveredEmbedUrls.size}"
             )
-            if (!hasVerifiedOuterVideo && webViewRef != null) {
+            if (!isSocialFastMode && !hasVerifiedOuterVideo && webViewRef != null) {
                 val domEmbeds = collectDomEmbedIframes(webViewRef!!)
                 val allEmbeds = discoveredEmbedUrls + domEmbeds
                 maybeStartHybridPortal(allEmbeds)
@@ -1169,6 +1178,7 @@ class HeadlessWebExtractor @Inject constructor(
         private const val METADATA_SCRAPE_MAX_WAIT_MS = 750L
         internal const val MAX_PROMOTED_EMBEDS = 3
         internal const val PROMOTED_EMBED_TIMEOUT_MS = 4_500L
+        internal const val SOCIAL_FAST_TIMEOUT_MS = 3_800L
 
         private data class MetadataHint(
             val title: String?,
