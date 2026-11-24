@@ -202,13 +202,35 @@ private fun iconFor(type: MediaType): ImageVector = when (type) {
     MediaType.IMAGE -> Icons.Rounded.Image
 }
 
-internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
-    val rawQuality = item.qualityLabel.ifBlank { item.container.uppercase() }
-    val quality = if (item.type == MediaType.VIDEO) {
-        FormatUtils.normalizeQualityLabel(rawQuality)
-    } else {
-        rawQuality
+internal fun formatCompactQualityBadge(rawLabel: String, type: MediaType, container: String): String {
+    val trimmed = rawLabel.trim()
+    val containerUpper = container.trim().uppercase().ifBlank { "FILE" }
+    if (type == MediaType.AUDIO) {
+        return when {
+            trimmed.contains("mp3", ignoreCase = true) || containerUpper == "MP3" -> "MP3"
+            trimmed.contains("m4a", ignoreCase = true) || containerUpper == "M4A" -> "M4A"
+            trimmed.contains("aac", ignoreCase = true) || containerUpper == "AAC" -> "AAC"
+            trimmed.contains("opus", ignoreCase = true) || containerUpper == "OPUS" -> "OPUS"
+            else -> containerUpper
+        }
     }
+    if (type == MediaType.IMAGE) {
+        return containerUpper
+    }
+    val normalized = FormatUtils.normalizeQualityLabel(trimmed)
+    Regex("""(?<!\d)(\d{3,4}p)\b""", RegexOption.IGNORE_CASE).find(normalized)?.let {
+        return it.groupValues[1].lowercase()
+    }
+    return when {
+        normalized.contains("4k", ignoreCase = true) -> "4K"
+        normalized.contains("2k", ignoreCase = true) -> "2K"
+        normalized.isBlank() || normalized.equals("HD Video", ignoreCase = true) -> containerUpper
+        else -> normalized
+    }
+}
+
+internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
+    val quality = formatCompactQualityBadge(item.qualityLabel, item.type, item.container)
     val safeDone = item.downloadedBytes.coerceAtLeast(0L)
     val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
     return when (item.status) {

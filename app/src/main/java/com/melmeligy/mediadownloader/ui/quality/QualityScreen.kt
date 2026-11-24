@@ -67,6 +67,7 @@ import com.melmeligy.mediadownloader.R
 import com.melmeligy.mediadownloader.core.AppError
 import com.melmeligy.mediadownloader.core.Resource
 import com.melmeligy.mediadownloader.core.util.FormatUtils
+import com.melmeligy.mediadownloader.core.util.UrlUtils
 import com.melmeligy.mediadownloader.domain.model.AudioBitrate
 import com.melmeligy.mediadownloader.domain.model.GallerySlide
 import com.melmeligy.mediadownloader.domain.model.MediaStream
@@ -712,12 +713,59 @@ private fun CompactVideoHeader(resolved: ResolvedMedia) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            val sourceSubtitle = remember(resolved.sourceUrl, resolved.extractor, resolved.streams) {
+                val dur = resolved.streams.firstNotNullOfOrNull {
+                    it.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { d -> d > 0L }
+                }
+                formatCleanSourceLabel(resolved.sourceUrl, resolved.extractor, dur)
+            }
             Text(
-                text = resolved.extractor,
+                text = sourceSubtitle,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
+    }
+}
+
+internal fun formatCleanSourceLabel(
+    sourceUrl: String,
+    extractor: String,
+    durationSeconds: Long? = null
+): String {
+    val host = UrlUtils.host(sourceUrl)?.lowercase()?.removePrefix("www.")?.removePrefix("m.").orEmpty()
+    val brand = when {
+        host.contains("youtube.com") || host.contains("youtu.be") -> "YouTube"
+        host.contains("tiktok.com") -> "TikTok"
+        host.contains("instagram.com") || host.contains("instagr.am") -> "Instagram"
+        host.contains("facebook.com") || host.contains("fb.watch") || host.contains("fb.com") || host.contains("fb.me") -> "Facebook"
+        host.contains("twitter.com") || host == "x.com" || host.endsWith(".x.com") || host == "t.co" -> "X"
+        host.contains("vimeo.com") -> "Vimeo"
+        host.contains("dailymotion.com") || host == "dai.ly" -> "Dailymotion"
+        host.contains("soundcloud.com") -> "SoundCloud"
+        host.contains("archive.org") -> "Internet Archive"
+        host.contains("pinterest.") || host == "pin.it" -> "Pinterest"
+        host.contains("threads.net") || host.contains("threads.com") -> "Threads"
+        host.contains("reddit.com") || host == "redd.it" -> "Reddit"
+        host.isNotBlank() -> host
+        else -> {
+            val cleanExt = extractor.trim()
+            val isInternal = cleanExt.equals("Smart Extractor", ignoreCase = true) ||
+                cleanExt.equals("Browser Stream", ignoreCase = true) ||
+                cleanExt.equals("Live Stream", ignoreCase = true) ||
+                cleanExt.equals("Web page", ignoreCase = true) ||
+                cleanExt.equals("HLS stream", ignoreCase = true) ||
+                cleanExt.equals("DASH stream", ignoreCase = true) ||
+                cleanExt.equals("Direct media", ignoreCase = true)
+            if (cleanExt.isNotBlank() && !isInternal) cleanExt else "Web"
+        }
+    }
+    return if (durationSeconds != null && durationSeconds > 0L) {
+        "$brand · ${FormatUtils.formatEta(durationSeconds)}"
+    } else {
+        brand
     }
 }
 

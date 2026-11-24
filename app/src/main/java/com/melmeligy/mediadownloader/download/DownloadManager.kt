@@ -612,27 +612,31 @@ class DownloadManager private constructor(
                 thumbnailCache != null &&
                 !thumbnailCache.hasCachedThumbnail(item.id)
             ) {
-                if (item.isHls && midDownloadFrameStage < 1) {
-                    val rawTsSeg0 = File(stagingDir(), "hls_parts_dl_${item.id}_raw.ts/seg_0.part")
-                    val legacySeg0 = File(stagingDir(), "hls_parts_${staging.nameWithoutExtension}/seg_0.part")
-                    val firstSeg = when {
-                        rawTsSeg0.exists() && rawTsSeg0.length() > 0L -> rawTsSeg0
-                        legacySeg0.exists() && legacySeg0.length() > 0L -> legacySeg0
-                        else -> null
+                if (item.isHls) {
+                    val hlsDirs = listOf(
+                        File(stagingDir(), "hls_parts_dl_${item.id}_raw.ts"),
+                        File(stagingDir(), "hls_parts_${staging.nameWithoutExtension}")
+                    )
+                    val nextHlsStage = when {
+                        midDownloadFrameStage < 1 && hasHlsThumbProbeCandidate(hlsDirs) -> 1
+                        midDownloadFrameStage == 1 && (downloaded >= 3 * 1024 * 1024L || (total > 0L && downloaded >= total)) -> 2
+                        midDownloadFrameStage == 2 && (downloaded >= 10 * 1024 * 1024L || (total > 0L && downloaded >= total)) -> 3
+                        else -> 0
                     }
-                    if (firstSeg != null) {
-                        midDownloadFrameStage = 1
+                    if (nextHlsStage > midDownloadFrameStage) {
+                        midDownloadFrameStage = nextHlsStage
                         queueScope.launch(dispatchers.io) {
                             if (currentControlIntent() != ControlIntent.CANCEL && !thumbnailCache.hasCachedThumbnail(item.id)) {
-                                val extracted = thumbnailCache.extractVideoFrameThumbnail(item.id, firstSeg)
+                                val extracted = extractHlsMidDownloadFrame(item.id, hlsDirs, thumbnailCache)
                                 persistCachedThumbnail(extracted)
                             }
                         }
                     }
-                } else if (!item.isHls) {
+                } else {
                     val nextStage = when {
                         midDownloadFrameStage < 1 && (downloaded >= 64 * 1024L || (total > 0L && downloaded >= total)) -> 1
                         midDownloadFrameStage == 1 && (downloaded >= 2 * 1024 * 1024L || (total > 0L && downloaded >= total)) -> 2
+                        midDownloadFrameStage == 2 && (downloaded >= 10 * 1024 * 1024L || (total > 0L && downloaded >= total)) -> 3
                         else -> 0
                     }
                     if (nextStage > midDownloadFrameStage) {
@@ -1398,6 +1402,132 @@ class DownloadManager private constructor(
             }
             val text = if (indeterminate) suffix else "$percent% · $suffix"
             return Triple(text, percent, indeterminate)
+        }
+
+        internal fun hasHlsThumbProbeCandidate(partsDirs: List<File>): Boolean {
+            val dir = partsDirs.firstOrNull { it.isDirectory } ?: return false
+            val seg0 = File(dir, "seg_0.part").takeIf { it.exists() && it.length() > 0L }
+            val laterExists = (1..5).any { idx ->
+                val f = File(dir, "seg_$idx.part")
+                f.exists() && f.length() > 0L
+            }
+            if (seg0 != null && looksLikeFmp4InitSegment(seg0)) {
+                return laterExists
+            }
+            return seg0 != null || laterExists
+        }
+
+        internal fun looksLikeFmp4InitSegment(file: File): Boolean {
+            if (!file.exists() || file.length() < 12L) return false
+            return runCatching {
+                val readLen = minOf(file.length(), 65_536L).toInt()
+                val buf = ByteArray(readLen)
+                file.inputStream().use { input ->
+                    var offset = 0
+                    while (offset < readLen) {
+                        val n = input.read(buf, offset, readLen - offset)
+                        if (n <= 0) break
+                        offset += n
+                    }
+                    if (offset < 12) return@runCatching false
+                    val isFtyp = buf[4] == 'f'.code.toByte() &&
+                        buf[5] == 't'.code.toByte() &&
+                        buf[6] == 'y'.code.toByte() &&
+                        buf[7] == 'p'.code.toByte()
+                    if (!isFtyp) return@runCatching false
+                    val hasMdat = containsAsciiTag(buf, offset, "mdat")
+                    !hasMdat
+                }
+            }.getOrDefault(false)
+        }
+
+        private fun containsAsciiTag(buf: ByteArray, length: Int, tag: String): Boolean {
+            val needle = tag.toByteArray(Charsets.US_ASCII)
+            if (needle.isEmpty() || length < needle.size) return false
+            outer@ for (i in 0..(length - needle.size)) {
+                for (j in needle.indices) {
+                    if (buf[i + j] != needle[j]) continue@outer
+                }
+                return true
+            }
+            return false
+        }
+
+        private fun looksLikeMpegTs(file: File): Boolean = runCatching {
+            if (!file.exists() || file.length() < 189L) return@runCatching false
+            val buf = ByteArray(189)
+            file.inputStream().use { it.read(buf) } >= 189 &&
+                buf[0] == 0x47.toByte() && buf[188] == 0x47.toByte()
+        }.getOrDefault(false)
+
+        internal suspend fun extractHlsMidDownloadFrame(
+            downloadId: Long,
+            partsDirs: List<File>,
+            thumbnailCache: DownloadThumbnailCache
+        ): File? {
+            val dir = partsDirs.firstOrNull { it.isDirectory } ?: return null
+            val seg0 = File(dir, "seg_0.part").takeIf { it.exists() && it.length() > 0L }
+            val laterSegs = (1..5).mapNotNull { idx ->
+                File(dir, "seg_$idx.part").takeIf { it.exists() && it.length() > 0L }
+            }
+
+            // fMP4 HLS: seg_0.part is an init-only ftyp/moov header with 0 video frames.
+            // Concatenate seg_0.part + first available media segment into a temp .mp4 probe file.
+            if (seg0 != null && looksLikeFmp4InitSegment(seg0)) {
+                for (mediaSeg in laterSegs.take(3)) {
+                    val tempProbe = File(dir, ".thumb_probe_${downloadId}_${System.nanoTime()}.mp4")
+                    try {
+                        tempProbe.outputStream().use { out ->
+                            seg0.inputStream().use { it.copyTo(out) }
+                            mediaSeg.inputStream().use { it.copyTo(out) }
+                        }
+                        val extracted = thumbnailCache.extractVideoFrameThumbnail(downloadId, tempProbe)
+                        if (extracted != null) return extracted
+                    } catch (_: Throwable) {
+                        // Try next segment
+                    } finally {
+                        runCatching { tempProbe.delete() }
+                    }
+                }
+                return null
+            }
+
+            // Standard MPEG-TS or standalone segments: try seg_0..seg_5, retrying with proper .ts/.mp4
+            // probe extension if the raw .part filename fails sniffing.
+            val candidates = buildList {
+                if (seg0 != null) add(seg0)
+                addAll(laterSegs)
+            }.take(4)
+
+            for (seg in candidates) {
+                val direct = thumbnailCache.extractVideoFrameThumbnail(downloadId, seg)
+                if (direct != null) return direct
+
+                val ext = if (looksLikeMpegTs(seg)) "ts" else "mp4"
+                val tempProbe = File(dir, ".thumb_probe_${downloadId}_${System.nanoTime()}.$ext")
+                try {
+                    seg.inputStream().use { input ->
+                        tempProbe.outputStream().use { out ->
+                            val buf = ByteArray(16_384)
+                            var copied = 0L
+                            val maxProbeBytes = 2L * 1024L * 1024L
+                            while (copied < maxProbeBytes) {
+                                val n = input.read(buf)
+                                if (n <= 0) break
+                                out.write(buf, 0, n)
+                                copied += n
+                            }
+                        }
+                    }
+                    val probed = thumbnailCache.extractVideoFrameThumbnail(downloadId, tempProbe)
+                    if (probed != null) return probed
+                } catch (_: Throwable) {
+                    // Try next segment
+                } finally {
+                    runCatching { tempProbe.delete() }
+                }
+            }
+            return null
         }
     }
 }

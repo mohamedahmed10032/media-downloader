@@ -529,17 +529,23 @@ class DownloadThumbnailCache internal constructor(
             }
 
             val cookieFromManager = runCatching {
-                val cm = CookieManager.getInstance()
+                val lookup = cookieLookupForTests ?: { target: String ->
+                    runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
+                }
                 val thumbCookie = thumbnailUrl?.takeIf { it.startsWith("http", ignoreCase = true) }
-                    ?.let { cm.getCookie(UrlUtils.encodeNonAsciiUrl(it)) }
+                    ?.let { lookup(UrlUtils.encodeNonAsciiUrl(it)) }
                     ?.takeIf { it.isNotBlank() }
-                thumbCookie ?: effectiveReferer?.let { cm.getCookie(it) }?.takeIf { it.isNotBlank() }
+                val sourceCookie = sourceUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+                    ?.let { lookup(UrlUtils.encodeNonAsciiUrl(it)) }
+                    ?.takeIf { it.isNotBlank() }
+                val refCookie = effectiveReferer?.let { lookup(it) }?.takeIf { it.isNotBlank() }
+                listOfNotNull(thumbCookie, sourceCookie, refCookie).firstOrNull()
             }.getOrNull()
 
             val effectiveCookie = if (isCrossDomainEmbedLeak) {
                 cookieFromManager
             } else {
-                streamCookie ?: cookieFromManager
+                cookieFromManager ?: streamCookie
             }?.let { sanitizeAsciiHeader(it) }?.takeIf { it.isNotBlank() }
 
             if (!effectiveCookie.isNullOrBlank()) {
@@ -549,6 +555,8 @@ class DownloadThumbnailCache internal constructor(
             out["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
             return out
         }
+
+        internal var cookieLookupForTests: ((String) -> String?)? = null
 
         fun buildThumbnailHeadersFromJson(
             sourceUrl: String,

@@ -116,13 +116,17 @@ class HeadlessWebExtractor @Inject constructor(
             view: WebView,
             pageUrlForResolve: String,
             tempEngine: MediaInterceptionEngine,
-            isFinalPass: Boolean
+            isFinalPass: Boolean,
+            onDone: (() -> Unit)? = null
         ) {
-            if (destroyed.get()) return
+            if (destroyed.get()) {
+                onDone?.invoke()
+                return
+            }
             if (isFinalPass) {
                 metadataScrapeTriggered.set(true)
             }
-            runCatching {
+            val evaluated = runCatching {
                 val pageViewTitle = view.title?.trim()
                 if (!pageViewTitle.isNullOrBlank() &&
                     !pageViewTitle.startsWith("http") &&
@@ -132,23 +136,24 @@ class HeadlessWebExtractor @Inject constructor(
                     capturedTitleRef.set(pageViewTitle)
                 }
                 view.evaluateJavascript(METADATA_SCRAPE_JS) { jsonStr ->
-                    if (destroyed.get()) return@evaluateJavascript
-                    runCatching {
-                        val unquoted = (org.json.JSONTokener(jsonStr ?: "").nextValue() as? String)
-                            ?: jsonStr?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"")
-                        if (!unquoted.isNullOrBlank() && unquoted.startsWith("{")) {
-                            val obj = org.json.JSONObject(unquoted)
-                            obj.optString("t").trim().takeIf {
-                                it.isNotBlank() && !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl)
-                            }?.let { capturedTitleRef.set(it) }
-                            HtmlThumbnailExtractor.resolveValidImageCandidate(
-                                obj.optString("i").trim(),
-                                pageUrlForResolve
-                            )?.let { capturedThumbRef.set(it) }
-                            val t = capturedTitleRef.get()
-                            val th = capturedThumbRef.get()
-                            if (!t.isNullOrBlank() || !th.isNullOrBlank()) {
-                                tempEngine.updatePageMetadata(t, th, targetUrl)
+                    if (!destroyed.get()) {
+                        runCatching {
+                            val unquoted = (org.json.JSONTokener(jsonStr ?: "").nextValue() as? String)
+                                ?: jsonStr?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"")
+                            if (!unquoted.isNullOrBlank() && unquoted.startsWith("{")) {
+                                val obj = org.json.JSONObject(unquoted)
+                                obj.optString("t").trim().takeIf {
+                                    it.isNotBlank() && !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl)
+                                }?.let { capturedTitleRef.set(it) }
+                                HtmlThumbnailExtractor.resolveValidImageCandidate(
+                                    obj.optString("i").trim(),
+                                    pageUrlForResolve
+                                )?.let { capturedThumbRef.set(it) }
+                                val t = capturedTitleRef.get()
+                                val th = capturedThumbRef.get()
+                                if (!t.isNullOrBlank() || !th.isNullOrBlank()) {
+                                    tempEngine.updatePageMetadata(t, th, targetUrl)
+                                }
                             }
                         }
                     }
@@ -158,8 +163,33 @@ class HeadlessWebExtractor @Inject constructor(
                         metadataScrapeCompleted.set(true)
                     }
                     wakeSignal.trySend(Unit)
+                    onDone?.invoke()
                 }
             }
+            if (evaluated.isFailure) {
+                onDone?.invoke()
+            }
+        }
+
+        suspend fun ensureOuterMetadataScraped(
+            view: WebView?,
+            tempEngine: MediaInterceptionEngine,
+            maxWaitMs: Long = 380L
+        ) {
+            if (view == null || destroyed.get() || activePromotedEmbedUrl.get() != null) return
+            if (hasValidTitle() && hasValidThumb()) return
+            val doneCh = Channel<Unit>(Channel.CONFLATED)
+            withContext(dispatchers.main) {
+                scrapeMetadataFromWebView(
+                    view = view,
+                    pageUrlForResolve = currentPageUrl,
+                    tempEngine = tempEngine,
+                    isFinalPass = true,
+                    onDone = { doneCh.trySend(Unit) }
+                )
+            }
+            withTimeoutOrNull(maxWaitMs) { doneCh.receiveCatching() }
+            doneCh.close()
         }
 
         suspend fun collectDomEmbedIframes(view: WebView): List<String> {
@@ -524,6 +554,12 @@ class HeadlessWebExtractor @Inject constructor(
                 withTimeoutOrNull(minOf(remaining, EARLY_EXIT_TICK_MS)) {
                     wakeSignal.receiveCatching()
                 }
+            }
+
+            // Capture outer-page title/poster BEFORE leaving the outer page (either for embed promotion
+            // or for returning early via hybridPortalJob).
+            if (!hasValidThumb() || !hasValidTitle()) {
+                ensureOuterMetadataScraped(webViewRef, tempEngineRef)
             }
 
             // Inline-verify any outer-page candidates BEFORE deciding whether to promote embed servers!
@@ -1432,6 +1468,7 @@ class HeadlessWebExtractor @Inject constructor(
                 "if(window.__dlScanNow) window.__dlScanNow();" +
                 "function abs(u){if(!u)return '';try{var r=new URL(u,location.href).href;return /^https?:\\/\\//i.test(r)?r:'';}catch(e){return '';}}" +
                 "function cssUrl(s){if(!s)return '';var m=s.match(/url\\(\\s*(?:'([^']+)'|\"([^\"]+)\"|([^)'\"\\s]+))\\s*\\)/i);return m?(m[1]||m[2]||m[3]||''):'';}" +
+                "function firstSrcset(s){if(!s)return '';var p=s.split(',')[0]||'';return p.trim().split(/\\s+/)[0]||'';}" +
                 "var sels=['meta[property=\"og:image:secure_url\"]','meta[property=\"og:image\"]','meta[property=\"og:image:url\"]','meta[name=\"og:image\"]','meta[name=\"twitter:image\"]','meta[property=\"twitter:image\"]','meta[name=\"twitter:image:src\"]','meta[itemprop=\"thumbnailUrl\"]','meta[itemprop=\"image\"]','meta[name=\"thumbnail\"]'];" +
                 "var img='';" +
                 "for(var s=0;s<sels.length&&!img;s++){var m=document.querySelector(sels[s]);if(m&&m.content)img=abs(m.content);}" +
@@ -1439,9 +1476,9 @@ class HeadlessWebExtractor @Inject constructor(
                 "if(!img){var v=document.querySelector('video[poster],video[data-poster]');if(v)img=abs(v.getAttribute('poster')||v.getAttribute('data-poster'));}" +
                 "if(!img){var p=document.querySelector('[data-poster],[data-poster-url],[data-thumb],[data-thumbnail],[data-bg],[data-bg-src],[data-lazy-bg],[data-image-src],[data-background]');if(p)img=abs(p.getAttribute('data-poster')||p.getAttribute('data-poster-url')||p.getAttribute('data-thumb')||p.getAttribute('data-thumbnail')||p.getAttribute('data-bg')||p.getAttribute('data-bg-src')||p.getAttribute('data-lazy-bg')||p.getAttribute('data-image-src')||p.getAttribute('data-background'));}" +
                 "if(!img){try{var lds=document.querySelectorAll('script[type=\"application/ld+json\"]');for(var i=0;i<lds.length&&!img;i++){var d=JSON.parse(lds[i].textContent||'{}');var arr=Array.isArray(d)?d:(d['@graph']?[d].concat(d['@graph']):[d]);for(var j=0;j<arr.length&&!img;j++){var it=arr[j]||{};var c=it.thumbnailUrl||it.image||it.primaryImageOfPage||it.thumbnail;if(Array.isArray(c))c=c[0];if(c&&typeof c==='object')c=c.contentUrl||c.url||c['@id'];if(typeof c==='string'&&c)img=abs(c);}}}catch(e){}}" +
-                "if(!img){var cn=document.querySelectorAll('.BG--Mycima-Single,.Separate--Poster,.BG--GridItem,.Thumb--GridItem,.PosterBlock,.wecima,.mycima,.Poster,.poster,.Single--Poster,.jw-preview,.vjs-poster,.plyr__poster,[data-lazy-style],[style*=\"--image\"],[style*=\"background-image\"]');for(var k=0;k<cn.length&&!img;k++){var st=(cn[k].getAttribute('data-lazy-style')||'')+' '+(cn[k].getAttribute('style')||'');var cu=cssUrl(st);if(!cu&&window.getComputedStyle){try{var cs=window.getComputedStyle(cn[k]);cu=cssUrl((cs.backgroundImage||'')+' '+(cs.getPropertyValue('--image')||''));}catch(e){}}if(cu&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(cu))img=abs(cu);}}" +
-                "if(!img){var sts=document.querySelectorAll('style');for(var x=0;x<sts.length&&!img;x++){var sm=(sts[x].textContent||'').match(/(?:BG--Mycima-Single|Single--Poster|Separate--Poster|Poster|--image)[^}]{0,400}?url\\(\\s*(?:'([^']+)'|\"([^\"]+)\"|([^)'\"\\s]+))\\s*\\)/i);if(sm){img=abs(sm[1]||sm[2]||sm[3]||'');}}}" +
-                "if(!img){var ims=document.querySelectorAll('.Poster img,.poster img,.Single--Poster img,.Separate--Poster img,.PosterBlock img,.thumb img,.thumbnail img,img.wp-post-image,img[class*=\"poster\" i],img[class*=\"thumb\" i],img[class*=\"cover\" i]');for(var n=0;n<ims.length&&!img;n++){var ci=ims[n].getAttribute('data-lazy-src')||ims[n].getAttribute('data-src')||ims[n].getAttribute('data-original')||ims[n].currentSrc||ims[n].src;if(ci&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(ci))img=abs(ci);}}" +
+                "if(!img){var cn=document.querySelectorAll('.Poster--Single-begin,.BG--Poster,.BG--Mycima-Single,.Separate--Poster,.BG--GridItem,.Thumb--GridItem,.PosterBlock,.wecima,.mycima,.Poster,.poster,.Single--Poster,.jw-preview,.vjs-poster,.plyr__poster,[data-lazy-style],[style*=\"--img\"],[style*=\"--image\"],[style*=\"background-image\"]');for(var k=0;k<cn.length&&!img;k++){var st=(cn[k].getAttribute('data-lazy-style')||'')+' '+(cn[k].getAttribute('style')||'');var cu=cssUrl(st);if(!cu&&window.getComputedStyle){try{var cs=window.getComputedStyle(cn[k]);cu=cssUrl((cs.backgroundImage||'')+' '+(cs.getPropertyValue('--image')||'')+' '+(cs.getPropertyValue('--img')||''));}catch(e){}}if(cu&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(cu))img=abs(cu);}}" +
+                "if(!img){var sts=document.querySelectorAll('style');for(var x=0;x<sts.length&&!img;x++){var sm=(sts[x].textContent||'').match(/(?:Poster--Single-begin|BG--Poster|BG--Mycima-Single|Single--Poster|Separate--Poster|Poster|--image|--img)[^}]{0,400}?url\\(\\s*(?:'([^']+)'|\"([^\"]+)\"|([^)'\"\\s]+))\\s*\\)/i);if(sm){img=abs(sm[1]||sm[2]||sm[3]||'');}}}" +
+                "if(!img){var ims=document.querySelectorAll('.Poster--Single-begin img,.BG--Poster img,.Poster img,.poster img,.Single--Poster img,.Separate--Poster img,.PosterBlock img,.thumb img,.thumbnail img,img.wp-post-image,img[class*=\"poster\" i],img[class*=\"thumb\" i],img[class*=\"cover\" i]');for(var n=0;n<ims.length&&!img;n++){var ci=ims[n].getAttribute('data-lazy-src')||ims[n].getAttribute('data-src')||ims[n].getAttribute('data-original')||firstSrcset(ims[n].getAttribute('data-srcset')||ims[n].getAttribute('srcset')||'')||ims[n].currentSrc||ims[n].src;if(ci&&!/logo|favicon|avatar|icon|sprite|placeholder|blank/i.test(ci))img=abs(ci);}}" +
                 "var ogTitle=document.querySelector('meta[property=\"og:title\"],meta[name=\"twitter:title\"]');" +
                 "var h1=document.querySelector('h1');" +
                 "var bestTitle=(ogTitle&&ogTitle.content)||(h1&&h1.innerText)||document.title||'';" +

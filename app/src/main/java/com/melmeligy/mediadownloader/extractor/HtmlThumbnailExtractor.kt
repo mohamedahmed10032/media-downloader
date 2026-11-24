@@ -51,6 +51,8 @@ object HtmlThumbnailExtractor {
 
     private val CSS_POSTER_ELEMENT_SELECTORS = listOf(
         ".BG--Mycima-Single",
+        ".Poster--Single-begin",
+        ".BG--Poster",
         ".Separate--Poster",
         ".BG--GridItem",
         ".Thumb--GridItem",
@@ -73,10 +75,15 @@ object HtmlThumbnailExtractor {
         "[class*=Cover]",
         "[class*=cover]",
         "[data-lazy-style]",
-        "[data-style]"
+        "[data-style]",
+        "[style*=\"--img\"]",
+        "[style*=\"--image\"]",
+        "[style*=\"background-image\"]"
     )
 
     private val DOM_POSTER_IMG_SELECTORS = listOf(
+        ".Poster--Single-begin img",
+        ".BG--Poster img",
         ".Poster img",
         ".poster img",
         ".Single--Poster img",
@@ -107,7 +114,7 @@ object HtmlThumbnailExtractor {
     )
 
     private val INLINE_STYLE_POSTER_RULE_REGEX = Regex(
-        """(?:BG--Mycima-Single|Single--Poster|Separate--Poster|Poster|jw-preview|vjs-poster|plyr__poster|--image)[^\}]{0,400}?url\(\s*(?:'([^']+)'|"([^"]+)"|([^)'"\s]+))\s*\)""",
+        """(?:BG--Mycima-Single|Poster--Single-begin|BG--Poster|Single--Poster|Separate--Poster|Poster|jw-preview|vjs-poster|plyr__poster|--image|--img)[^\}]{0,400}?url\(\s*(?:'([^']+)'|"([^"]+)"|([^)'"\s]+))\s*\)""",
         RegexOption.IGNORE_CASE
     )
 
