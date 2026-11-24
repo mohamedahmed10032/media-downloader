@@ -72,7 +72,11 @@ class DownloadRepositoryImpl @Inject constructor(
         }
 
     override suspend fun setError(id: Long, error: AppError) = withContext(dispatchers.io) {
-        dao.setError(id, error.name, now())
+        dao.setError(id, error.encodeForStorage(null), now())
+    }
+
+    override suspend fun setError(id: Long, error: AppError, detail: String?) = withContext(dispatchers.io) {
+        dao.setError(id, error.encodeForStorage(detail), now())
     }
 
     override suspend fun incrementRetry(id: Long) = withContext(dispatchers.io) {

@@ -32,13 +32,16 @@ class BrowserViewModel @Inject constructor(
     private val downloadManager: com.melmeligy.mediadownloader.download.DownloadManager,
     private val settingsRepository: SettingsRepository,
     private val streamSizeRefiner: com.melmeligy.mediadownloader.extractor.StreamSizeRefiner,
-    private val thumbnailCache: com.melmeligy.mediadownloader.download.DownloadThumbnailCache
+    private val thumbnailCache: com.melmeligy.mediadownloader.download.DownloadThumbnailCache,
+    private val progressTracker: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker
 ) : ViewModel() {
 
     private var nextId = 2L
 
     val settings: StateFlow<AppSettings> = settingsRepository.settings
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
+
+    val loadingStage: StateFlow<String> = progressTracker.stage
 
     /** Everything the interception layer found on the page currently being viewed. */
     val detections: StateFlow<List<MediaStreamPayload>> = interceptionEngine.detections
@@ -70,6 +73,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        progressTracker.reset()
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
 
@@ -78,6 +82,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        progressTracker.reset()
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
         }
@@ -89,7 +94,8 @@ class BrowserViewModel @Inject constructor(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
-                com.melmeligy.mediadownloader.core.Resource.Error(e.error)
+                val detail = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
+                com.melmeligy.mediadownloader.core.Resource.Error(e.error, detail)
             } catch (e: Exception) {
                 com.melmeligy.mediadownloader.core.Resource.Error(
                     com.melmeligy.mediadownloader.core.AppError.GENERIC,
@@ -226,5 +232,12 @@ class BrowserViewModel @Inject constructor(
 
     fun deleteBookmark(id: Long) = viewModelScope.launch {
         bookmarkRepository.delete(id)
+    }
+
+    fun setAdBlockEnabledForUrl(url: String, enabled: Boolean) {
+        val host = AppSettings.normalizeAdBlockHost(url) ?: return
+        viewModelScope.launch {
+            settingsRepository.setAdBlockEnabledForHost(host, enabled)
+        }
     }
 }

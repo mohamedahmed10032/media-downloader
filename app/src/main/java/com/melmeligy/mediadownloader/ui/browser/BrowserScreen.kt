@@ -31,8 +31,10 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.GppMaybe
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Tab
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -105,6 +107,7 @@ fun BrowserScreen(
     val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
     val detections by viewModel.detections.collectAsStateWithLifecycle()
     val formatState by viewModel.formatState.collectAsStateWithLifecycle()
+    val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
     val appSettings by viewModel.settings.collectAsStateWithLifecycle()
     val engine = remember { viewModel.engine() }
 
@@ -120,6 +123,13 @@ fun BrowserScreen(
     var showTabs by remember { mutableStateOf(false) }
     var showBookmarks by remember { mutableStateOf(false) }
     var showFormatSheet by remember { mutableStateOf(false) }
+
+    val disabledAdBlockHostsRef = remember {
+        java.util.concurrent.atomic.AtomicReference(appSettings.adBlockDisabledHosts)
+    }
+    disabledAdBlockHostsRef.set(appSettings.adBlockDisabledHosts)
+    val currentHost = com.melmeligy.mediadownloader.domain.model.AppSettings.normalizeAdBlockHost(currentUrl)
+    val isAdBlockEnabledForCurrentSite = appSettings.isAdBlockEnabledFor(currentUrl)
 
     val webView = remember {
         WebView(context).apply {
@@ -147,7 +157,13 @@ fun BrowserScreen(
                 BlobBridge.NAME
             )
 
-            webViewClient = object : SniffingWebViewClient(engine) {
+            webViewClient = object : SniffingWebViewClient(
+                engine = engine,
+                isSubResourceAdBlockEnabledForPage = { pageUrl ->
+                    val host = com.melmeligy.mediadownloader.domain.model.AppSettings.normalizeAdBlockHost(pageUrl)
+                    host == null || host !in disabledAdBlockHostsRef.get()
+                }
+            ) {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest?): Boolean {
                     return super.shouldOverrideUrlLoading(view, request)
                 }
@@ -300,6 +316,44 @@ fun BrowserScreen(
                     )
                 },
                 actions = {
+                    if (currentHost != null) {
+                        IconButton(
+                            onClick = {
+                                val nextEnabled = !isAdBlockEnabledForCurrentSite
+                                val updatedHosts = if (nextEnabled) {
+                                    disabledAdBlockHostsRef.get() - currentHost
+                                } else {
+                                    disabledAdBlockHostsRef.get() + currentHost
+                                }
+                                disabledAdBlockHostsRef.set(updatedHosts)
+                                viewModel.setAdBlockEnabledForUrl(currentUrl, nextEnabled)
+                                android.widget.Toast.makeText(
+                                    context,
+                                    if (nextEnabled) {
+                                        "Ad-blocker enabled for $currentHost"
+                                    } else {
+                                        "Ad-blocker paused for $currentHost (popups still blocked)"
+                                    },
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                                webView.reload()
+                            }
+                        ) {
+                            Icon(
+                                imageVector = if (isAdBlockEnabledForCurrentSite) Icons.Rounded.Shield else Icons.Rounded.GppMaybe,
+                                contentDescription = if (isAdBlockEnabledForCurrentSite) {
+                                    "Ad-blocker active for $currentHost"
+                                } else {
+                                    "Ad-blocker paused for $currentHost"
+                                },
+                                tint = if (isAdBlockEnabledForCurrentSite) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                    }
                     IconButton(onClick = { webView.reload() }) {
                         Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
                     }
@@ -441,11 +495,18 @@ fun BrowserScreen(
                     state = formatState,
                     url = currentUrl,
                     useShimmerLoading = true,
+                    loadingMessage = loadingStage,
                     defaultVideoQuality = appSettings.defaultVideoQuality,
                     defaultAudioBitrate = appSettings.defaultAudioBitrate,
                     onRetry = { openChooseFormatSheet() },
                     onOpenInBrowser = null,
                     onDownload = { stream ->
+                        runCatching {
+                            webView.evaluateJavascript(
+                                "(function(){try{document.querySelectorAll('video,audio').forEach(function(m){try{m.pause();}catch(e){}});}catch(e){}})();",
+                                null
+                            )
+                        }
                         viewModel.downloadStream(stream) {
                             showFormatSheet = false
                             android.widget.Toast.makeText(

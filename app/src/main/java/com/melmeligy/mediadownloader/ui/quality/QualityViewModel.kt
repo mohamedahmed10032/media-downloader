@@ -146,6 +146,18 @@ class QualityViewModel : ViewModel {
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
         progressTracker.reset()
+
+        // Synchronous cache fast-path: render immediately without flashing the skeleton loader.
+        if (!forceRetry) {
+            val cached = (mediaRepository as? MediaRepositoryImpl)?.peekCached(targetUrl)
+            if (cached != null) {
+                _state.value = Resource.Success(cached)
+                launchBackgroundSizeRefinement(cached, normalizedTarget)
+                launchBackgroundThumbnailCaching(cached, normalizedTarget)
+                return
+            }
+        }
+
         val job = viewModelScope.launch {
             _state.value = Resource.Loading
             runCatching { settingsRepository.current() }
@@ -154,7 +166,13 @@ class QualityViewModel : ViewModel {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: MediaException) {
-                Resource.Error(e.error)
+                val explicit = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
+                val diagnostic = explicit
+                    ?: progressTracker.peekDiagnosticReason()
+                    ?: if (e.error == AppError.NO_MEDIA_FOUND) {
+                        "No playable video or audio stream was exposed by this page."
+                    } else null
+                Resource.Error(e.error, diagnostic)
             } catch (e: Exception) {
                 Resource.Error(AppError.GENERIC, e.message)
             }

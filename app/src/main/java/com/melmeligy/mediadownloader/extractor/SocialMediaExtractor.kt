@@ -47,8 +47,14 @@ import javax.xml.parsers.DocumentBuilderFactory
 @Singleton
 class SocialMediaExtractor @Inject constructor(
     private val http: ExtractorHttp,
-    private val headlessWebExtractor: HeadlessWebExtractor
+    private val headlessWebExtractor: HeadlessWebExtractor,
+    private val progressTracker: ExtractionProgressTracker
 ) : MediaExtractor {
+
+    constructor(
+        http: ExtractorHttp,
+        headlessWebExtractor: HeadlessWebExtractor
+    ) : this(http, headlessWebExtractor, ExtractionProgressTracker())
 
     override val name = "Social Media"
     override val priority = 95
@@ -94,13 +100,19 @@ class SocialMediaExtractor @Inject constructor(
 
     override suspend fun extract(url: String): ResolvedMedia? = withContext(Dispatchers.IO) {
         if (!canHandle(url) && !UrlUtils.isShortOrRedirectUrl(url)) return@withContext null
-        val workingUrl = if (UrlUtils.isShortOrRedirectUrl(url)) {
+        progressTracker.update(ExtractionProgressTracker.STAGE_FETCHING)
+        val rawHost = UrlUtils.host(url)?.lowercase().orEmpty()
+        // TikTok short links (vt.tiktok.com / vm.tiktok.com) are accepted directly by tikwm, so do NOT
+        // block sequentially on redirect resolution; race tikwm against redirect + HTML hydration in parallel.
+        val isTikTokRaw = rawHost.contains("tiktok.com")
+        val workingUrl = if (!isTikTokRaw && UrlUtils.isShortOrRedirectUrl(url)) {
             resolveRedirectUrl(url)
         } else {
             url
         }
         if (!canHandle(workingUrl) && !canHandle(url)) return@withContext null
         val host = UrlUtils.host(workingUrl)?.lowercase().orEmpty()
+        progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
         val timeoutMs = if (host.contains("pinterest.") || host.contains("pin.it")) 14_000L else 10_000L
         val fastResult = try {
             withTimeoutOrNull(timeoutMs) {
@@ -155,23 +167,33 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        val probeFinal = withTimeoutOrNull(REDIRECT_PROBE_TIMEOUT_MS) {
+        // Fast single-hop Location-header check (followRedirects = false, zero body download)
+        val singleHop = withTimeoutOrNull(REDIRECT_PROBE_TIMEOUT_MS) {
             withCancellableHttpCalls(timeoutMs = REDIRECT_PROBE_TIMEOUT_MS) {
-                runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
+                runCatching { http.resolveRedirectLocation(rawUrl) }.getOrNull()
             }
         }
-        val resolved = if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http") && probeFinal != rawUrl) {
-            UrlUtils.cleanSocialUrl(probeFinal)
+        val resolved = if (!singleHop.isNullOrBlank() && singleHop.startsWith("http") && singleHop != rawUrl) {
+            UrlUtils.cleanSocialUrl(singleHop)
         } else {
-            val getFinal = withTimeoutOrNull(REDIRECT_GET_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = REDIRECT_GET_TIMEOUT_MS) {
-                    runCatching { http.resolveFinalUrl(rawUrl) }.getOrNull()
+            val probeFinal = withTimeoutOrNull(REDIRECT_PROBE_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = REDIRECT_PROBE_TIMEOUT_MS) {
+                    runCatching { http.probe(rawUrl).finalUrl }.getOrNull()
                 }
             }
-            if (!getFinal.isNullOrBlank() && getFinal.startsWith("http") && getFinal != rawUrl) {
-                UrlUtils.cleanSocialUrl(getFinal)
+            if (!probeFinal.isNullOrBlank() && probeFinal.startsWith("http") && probeFinal != rawUrl) {
+                UrlUtils.cleanSocialUrl(probeFinal)
             } else {
-                UrlUtils.cleanSocialUrl(probeFinal?.takeIf { it.startsWith("http") } ?: rawUrl)
+                val getFinal = withTimeoutOrNull(REDIRECT_GET_TIMEOUT_MS) {
+                    withCancellableHttpCalls(timeoutMs = REDIRECT_GET_TIMEOUT_MS) {
+                        runCatching { http.resolveFinalUrl(rawUrl) }.getOrNull()
+                    }
+                }
+                if (!getFinal.isNullOrBlank() && getFinal.startsWith("http") && getFinal != rawUrl) {
+                    UrlUtils.cleanSocialUrl(getFinal)
+                } else {
+                    UrlUtils.cleanSocialUrl(probeFinal?.takeIf { it.startsWith("http") } ?: rawUrl)
+                }
             }
         }
 
@@ -490,19 +512,9 @@ class SocialMediaExtractor @Inject constructor(
 
         if (rawStreams.isEmpty()) return@coroutineScope null
 
-        // Probe exact file sizes in parallel with bounded timeout
-        val probed = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
-            rawStreams.values.take(10).map { stream ->
-                async(Dispatchers.IO) {
-                    runCatching {
-                        val info = http.probe(stream.url, defaultHeaders)
-                        if (info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
-                    }.getOrDefault(stream)
-                }
-            }.awaitAll()
-        }.filter { (it.sizeBytes ?: Long.MAX_VALUE) > 10_000L }
-
-        if (probed.isEmpty()) return@coroutineScope null
+        // Return formats immediately without blocking on HEAD/Range size probes;
+        // StreamSizeRefiner populates missing sizes asynchronously in the background.
+        val probed = rawStreams.values.take(10).toList()
 
         val rawAudios = probed.filter { it.type == MediaType.AUDIO }
             .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
@@ -727,17 +739,9 @@ class SocialMediaExtractor @Inject constructor(
             return@coroutineScope null
         }
 
-        // Probe exact sizes
-        val probed = rawStreams.values.take(10).map { stream ->
-            async {
-                runCatching {
-                    val info = http.probe(stream.url, desktopHeaders)
-                    if (info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
-                }.getOrDefault(stream)
-            }
-        }.awaitAll().filter { (it.sizeBytes ?: Long.MAX_VALUE) > 10_000L }
-
-        if (probed.isEmpty()) return@coroutineScope null
+        // Return formats immediately without blocking on HEAD/Range size probes;
+        // StreamSizeRefiner populates missing sizes asynchronously in the background.
+        val probed = rawStreams.values.take(10).toList()
 
         val rawAudios = probed.filter { it.type == MediaType.AUDIO }
             .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
@@ -819,42 +823,40 @@ class SocialMediaExtractor @Inject constructor(
     // =========================================================================
 
     private suspend fun extractTikTok(rawUrl: String): ResolvedMedia? = coroutineScope {
-        val canonicalUrl = UrlUtils.cleanSocialUrl(
-            if (UrlUtils.isShortOrRedirectUrl(rawUrl)) {
-                resolveRedirectUrl(rawUrl)
-            } else {
-                rawUrl
-            }
-        )
+        val cleanedRaw = UrlUtils.cleanSocialUrl(rawUrl)
+        val isShortLink = UrlUtils.isShortOrRedirectUrl(rawUrl)
 
         val desktopHeaders = mapOf(
             "User-Agent" to TIKTOK_DESKTOP_UA,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language" to "en-US,en;q=0.9"
         )
-        val tikTokBaseCdnHeaders = LinkedHashMap<String, String>().apply {
+        fun buildBaseCdnHeaders(targetUrl: String): Map<String, String> = LinkedHashMap<String, String>().apply {
             put("User-Agent", TIKTOK_DESKTOP_UA)
             put("Referer", "https://www.tiktok.com/")
             put("Origin", "https://www.tiktok.com")
-            http.cookieHeaderFor(canonicalUrl)?.takeIf { it.isNotBlank() }?.let { put("Cookie", it) }
+            http.cookieHeaderFor(targetUrl)?.takeIf { it.isNotBlank() }?.let { put("Cookie", it) }
         }
 
         // If tikwm recently returned Cloudflare 403/429, go straight to HTML Hydration with 0ms API wait
         if (clockMs() < tikwmBlockedUntilMs) {
+            val resolvedUrl = if (isShortLink) resolveRedirectUrl(rawUrl) else cleanedRaw
             return@coroutineScope extractTikTokViaHtmlHydration(
                 rawUrl = rawUrl,
-                canonicalUrl = canonicalUrl,
+                canonicalUrl = resolvedUrl,
                 desktopHeaders = desktopHeaders,
-                tikTokBaseCdnHeaders = tikTokBaseCdnHeaders
+                tikTokBaseCdnHeaders = buildBaseCdnHeaders(resolvedUrl)
             )
         }
 
-        // Parallel race: start tikwm API (short timeout) and HTML Hydration simultaneously.
-        // First healthy winner returns immediately and cancels the losing branch + socket.
+        // Parallel race (first-valid-wins):
+        // - apiJob hits tikwm immediately with rawUrl (tikwm natively accepts vt.tiktok.com/vm.tiktok.com).
+        // - htmlJob resolves short redirect (single-hop Location header) if needed and fetches HTML hydration concurrently.
+        // First valid winner returns immediately and cancels the losing branch + underlying TCP socket.
         val raceChannel = Channel<ResolvedMedia?>(capacity = 2)
         val apiJob = launch(Dispatchers.IO) {
             val res = try {
-                extractTikTokViaTikwmApi(rawUrl, canonicalUrl)
+                extractTikTokViaTikwmApi(rawUrl, cleanedRaw)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
@@ -864,11 +866,12 @@ class SocialMediaExtractor @Inject constructor(
         }
         val htmlJob = launch(Dispatchers.IO) {
             val res = try {
+                val resolvedUrl = if (isShortLink) resolveRedirectUrl(rawUrl) else cleanedRaw
                 extractTikTokViaHtmlHydration(
                     rawUrl = rawUrl,
-                    canonicalUrl = canonicalUrl,
+                    canonicalUrl = resolvedUrl,
                     desktopHeaders = desktopHeaders,
-                    tikTokBaseCdnHeaders = tikTokBaseCdnHeaders
+                    tikTokBaseCdnHeaders = buildBaseCdnHeaders(resolvedUrl)
                 )
             } catch (ce: CancellationException) {
                 throw ce
@@ -909,7 +912,11 @@ class SocialMediaExtractor @Inject constructor(
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (me: MediaException) {
-                    if (me.error == AppError.GEO_BLOCKED || me.message?.contains("429") == true) {
+                    if (me.error == AppError.ACCESS_DENIED ||
+                        me.error == AppError.GEO_BLOCKED ||
+                        me.error == AppError.SERVER_ERROR ||
+                        me.message?.contains("429") == true
+                    ) {
                         tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
                     }
                     null
@@ -927,20 +934,13 @@ class SocialMediaExtractor @Inject constructor(
         val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: return@coroutineScope null
         val data = root.optJSONObject("data") ?: return@coroutineScope null
 
-        val apiMusicUrl = data.optString("music").takeIf { it.startsWith("http") }
         val hasImages = (data.optJSONArray("images")?.length() ?: 0) > 0
         if (hasImages) {
-            val apiMusicProbe = if (apiMusicUrl != null) {
-                withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                    withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                        runCatching { http.probe(apiMusicUrl) }.getOrNull()
-                    }
-                }
-            } else null
+            // Zero blocking probes: emit photo slides + audio immediately; StreamSizeRefiner refines sizes asynchronously.
             val parsedPhotos = SocialMediaGalleryParsers.parseTikTokPhotoFromApiData(
                 data = data,
                 postId = UrlUtils.extractPostId(canonicalUrl),
-                musicProbe = apiMusicProbe,
+                musicProbe = null,
                 headers = mapOf("Referer" to "https://www.tiktok.com/")
             )
             if (parsedPhotos != null && parsedPhotos.slides.isNotEmpty()) {
@@ -948,37 +948,12 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        val hdPlay = data.optString("hdplay").takeIf { it.startsWith("http") }
-        val play = data.optString("play").takeIf { it.startsWith("http") }
-        val apiHdSize = data.optLong("hd_size", 0L).takeIf { it > 0L }
-        val apiPlaySize = data.optLong("size", 0L).takeIf { it > 0L }
-        val knownSameApiSize = apiHdSize != null && apiPlaySize != null && apiHdSize == apiPlaySize
-
-        // Only probe video streams when JSON size is actually missing; run music & video probes in parallel
-        val (hdProbe, playProbe, musicProbe) = withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
-            val hdDef = if (hdPlay != null && !knownSameApiSize && apiHdSize == null) {
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(hdPlay) }.getOrNull() }
-                }
-            } else null
-            val playDef = if (play != null && !knownSameApiSize && apiPlaySize == null) {
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(play) }.getOrNull() }
-                }
-            } else null
-            val musicDef = if (apiMusicUrl != null) {
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) { runCatching { http.probe(apiMusicUrl) }.getOrNull() }
-                }
-            } else null
-            Triple(hdDef?.await(), playDef?.await(), musicDef?.await())
-        }
-
+        // Zero blocking probes: emit video & audio formats immediately so the sheet renders without delay.
         val streams = SocialMediaGalleryParsers.buildTikTokVideoAndAudioStreams(
             data = data,
-            hdProbe = hdProbe,
-            playProbe = playProbe,
-            musicProbe = musicProbe
+            hdProbe = null,
+            playProbe = null,
+            musicProbe = null
         )
         if (streams.isEmpty()) return@coroutineScope null
 
@@ -1004,12 +979,7 @@ class SocialMediaExtractor @Inject constructor(
                 runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
             }
         }
-        val html = fetchedHtml?.html
-            ?: withTimeoutOrNull(TIKTOK_HTML_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = TIKTOK_HTML_TIMEOUT_MS) {
-                    runCatching { http.fetchString(canonicalUrl, desktopHeaders) }.getOrNull()
-                }
-            }.orEmpty()
+        val html = fetchedHtml?.html.orEmpty()
         if (html.isBlank()) return@coroutineScope null
 
         val cdnHeaders = LinkedHashMap<String, String>(tikTokBaseCdnHeaders).apply {
@@ -1020,98 +990,25 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        // Photo Mode Slideshow from Hydration JSON (desc title, cover, all slides + music audio, CDN headers)
+        // Photo Mode Slideshow from Hydration JSON (zero blocking audio probe; StreamSizeRefiner fills size asynchronously)
         val parsedPhotoHtml = SocialMediaGalleryParsers.parseTikTokPhotoFromHydrationHtml(
             html = html,
             postId = UrlUtils.extractPostId(canonicalUrl),
             headers = cdnHeaders
         )
         if (parsedPhotoHtml != null && parsedPhotoHtml.slides.isNotEmpty()) {
-            val probedAudio = if (parsedPhotoHtml.audioStreams.isNotEmpty()) {
-                val primaryAudioUrl = parsedPhotoHtml.audioStreams.first().url
-                val musicDuration = parsedPhotoHtml.audioStreams.first().headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-                val mProbe = withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                    withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                        runCatching { http.probe(primaryAudioUrl, cdnHeaders) }.getOrNull()
-                    }
-                }
-                if (mProbe != null) {
-                    SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
-                        musicUrl = primaryAudioUrl,
-                        musicDurationSec = musicDuration,
-                        musicProbe = mProbe,
-                        baseHeaders = cdnHeaders,
-                        idPrefix = "tt-photo-a"
-                    )
-                } else parsedPhotoHtml.audioStreams
-            } else emptyList()
             return@coroutineScope buildGalleryResolvedMedia(
                 rawUrl = rawUrl,
                 extractorName = "TikTok",
-                parsed = parsedPhotoHtml.copy(audioStreams = probedAudio)
+                parsed = parsedPhotoHtml
             )
         }
 
         // Full structured __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON video + multi-quality bitrateInfo + music.
-        // Rely directly on JSON DataSize/Width/Height without redundant probes unless sizeBytes is missing.
+        // Zero blocking HEAD/Range probes before returning ResolvedMedia; StreamSizeRefiner refines missing sizes asynchronously.
         val parsedVideoPost = SocialMediaGalleryParsers.parseTikTokVideoFromHydrationHtml(html, cdnHeaders)
         if (parsedVideoPost != null) {
-            val firstAudio = parsedVideoPost.audioStreams.firstOrNull()
-            val needsVideoProbe = parsedVideoPost.videoStreams.take(3).any { it.sizeBytes == null || it.sizeBytes <= 0L }
-            val (probedVideos, audioProbe) = if (needsVideoProbe || firstAudio != null) {
-                withCancellableHttpCalls(timeoutMs = FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                    val videoProbeDefs = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
-                        if (idx < 3 && (stream.sizeBytes == null || stream.sizeBytes <= 0L)) {
-                            async(Dispatchers.IO) {
-                                withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                                    runCatching { http.probe(stream.url, cdnHeaders) }.getOrNull()
-                                }
-                            }
-                        } else null
-                    }
-                    val audioProbeDef = if (firstAudio != null) {
-                        async(Dispatchers.IO) {
-                            withTimeoutOrNull(FAST_AUDIO_PROBE_TIMEOUT_MS) {
-                                runCatching { http.probe(firstAudio.url, cdnHeaders) }.getOrNull()
-                            }
-                        }
-                    } else null
-
-                    val updatedVideos = parsedVideoPost.videoStreams.mapIndexed { idx, stream ->
-                        val info = videoProbeDefs[idx]?.await()
-                        if (info != null) {
-                            val updatedHeaders = LinkedHashMap<String, String>(stream.headers).apply {
-                                if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
-                            }
-                            stream.copy(
-                                url = info.finalUrl.takeIf { it.startsWith("http") } ?: stream.url,
-                                sizeBytes = info.contentLength.takeIf { it > 0L } ?: stream.sizeBytes,
-                                headers = updatedHeaders
-                            )
-                        } else {
-                            stream
-                        }
-                    }
-                    updatedVideos to audioProbeDef?.await()
-                }
-            } else {
-                parsedVideoPost.videoStreams to null
-            }
-
-            val probedAudios = if (firstAudio != null) {
-                if (audioProbe != null) {
-                    val dur = firstAudio.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-                    SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
-                        musicUrl = firstAudio.url,
-                        musicDurationSec = dur,
-                        musicProbe = audioProbe,
-                        baseHeaders = cdnHeaders,
-                        idPrefix = "tt-page-a"
-                    )
-                } else parsedVideoPost.audioStreams
-            } else emptyList()
-
-            val allStreams = probedVideos + probedAudios
+            val allStreams = parsedVideoPost.videoStreams + parsedVideoPost.audioStreams
             if (allStreams.isNotEmpty()) {
                 return@coroutineScope ResolvedMedia(
                     sourceUrl = rawUrl,
@@ -1124,7 +1021,7 @@ class SocialMediaExtractor @Inject constructor(
             }
         }
 
-        // Legacy surface fallback when __UNIVERSAL_DATA_FOR_REHYDRATION__ wrapper is absent
+        // Legacy surface fallback when __UNIVERSAL_DATA_FOR_REHYDRATION__ wrapper is absent (zero blocking probes)
         val playAddrRegex = Regex("\"playAddr\"\\s*:\\s*\"([^\"]+)\"")
         val playUrl = playAddrRegex.find(html)?.groupValues?.getOrNull(1)?.let { unescape(it) }
         val musicRegex = Regex("\"playUrl\"\\s*:\\s*\"([^\"]+)\"")
@@ -1137,41 +1034,24 @@ class SocialMediaExtractor @Inject constructor(
             ?.takeUnless { it.equals("TikTok", ignoreCase = true) || it.startsWith("TikTok - Make Your Day", ignoreCase = true) }
         val title = descTitle ?: htmlTitle ?: "TikTok Video"
 
-        val (vInfo, mInfo) = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
-            val videoProbeDef = if (playUrl != null && playUrl.startsWith("http")) {
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(FAST_PROBE_TIMEOUT_MS) { runCatching { http.probe(playUrl, cdnHeaders) }.getOrNull() }
-                }
-            } else null
-            val musicProbeDef = if (musicUrl != null && musicUrl.startsWith("http")) {
-                async(Dispatchers.IO) {
-                    withTimeoutOrNull(FAST_PROBE_TIMEOUT_MS) { runCatching { http.probe(musicUrl, cdnHeaders) }.getOrNull() }
-                }
-            } else null
-            videoProbeDef?.await() to musicProbeDef?.await()
-        }
-
         val streams = mutableListOf<MediaStream>()
         if (playUrl != null && playUrl.startsWith("http")) {
-            val streamHeaders = LinkedHashMap<String, String>(cdnHeaders).apply {
-                if (vInfo?.acceptsRanges == true) put("X-Internal-Accepts-Ranges", "true")
-            }
             streams += MediaStream(
                 id = "tt-page-v",
-                url = vInfo?.finalUrl?.takeIf { it.startsWith("http") } ?: playUrl,
+                url = playUrl,
                 type = MediaType.VIDEO,
                 container = "mp4",
                 label = "High quality (720p HD)",
                 height = 720,
-                sizeBytes = vInfo?.contentLength?.takeIf { it > 0 },
+                sizeBytes = null,
                 isHls = false,
-                headers = streamHeaders
+                headers = cdnHeaders
             )
         }
         if (musicUrl != null && musicUrl.startsWith("http")) {
             streams += SocialMediaGalleryParsers.buildTikTokAudioStreamsFromUrl(
                 musicUrl = musicUrl,
-                musicProbe = mInfo,
+                musicProbe = null,
                 baseHeaders = cdnHeaders,
                 idPrefix = "tt-page-a"
             )
@@ -1195,9 +1075,9 @@ class SocialMediaExtractor @Inject constructor(
     // =========================================================================
 
     private suspend fun extractTwitter(rawUrl: String): ResolvedMedia? = coroutineScope {
-        val match = twitterStatusRegex.find(rawUrl) ?: return@coroutineScope null
-        val user = match.groupValues[1]
-        val statusId = match.groupValues[2]
+        val m = twitterStatusRegex.find(rawUrl) ?: return@coroutineScope null
+        val user = m.groupValues[1]
+        val statusId = m.groupValues[2]
 
         val apis = listOf(
             "https://api.vxtwitter.com/$user/status/$statusId",
@@ -1244,19 +1124,12 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         if (parsed.videoStreams.isNotEmpty()) {
-            val probedVideos = withCancellableHttpCalls(timeoutMs = FAST_PROBE_TIMEOUT_MS) {
-                parsed.videoStreams.map { stream ->
-                    async(Dispatchers.IO) {
-                        val info = runCatching { http.probe(stream.url) }.getOrNull()
-                        if (info != null && info.contentLength > 0) stream.copy(sizeBytes = info.contentLength) else stream
-                    }
-                }.awaitAll()
-            }
+            // Return immediately without blocking on size probes; StreamSizeRefiner refines sizes asynchronously.
             return@coroutineScope ResolvedMedia(
                 sourceUrl = rawUrl,
                 title = parsed.title ?: "X Video (@$user)",
                 thumbnailUrl = parsed.thumbnailUrl,
-                streams = probedVideos,
+                streams = parsed.videoStreams,
                 extractor = "X / Twitter",
                 postId = statusId
             )
@@ -1580,17 +1453,11 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         if (parsed.videoStreams.isNotEmpty()) {
-            val probed = parsed.videoStreams.map { v ->
-                async {
-                    val info = runCatching { http.probe(v.url, headers) }.getOrNull()
-                    if (info != null && info.contentLength > 0) v.copy(sizeBytes = info.contentLength) else v
-                }
-            }.awaitAll()
             return@coroutineScope ResolvedMedia(
                 sourceUrl = rawUrl,
                 title = parsed.title ?: "Threads Video",
                 thumbnailUrl = parsed.thumbnailUrl,
-                streams = probed,
+                streams = parsed.videoStreams,
                 extractor = "Threads",
                 postId = parsed.postId
             )

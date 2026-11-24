@@ -102,6 +102,31 @@ class SecureSettingsStore internal constructor(
         putBoolean(KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE, organize)
     }
 
+    override suspend fun setAdBlockEnabledForHost(host: String, enabled: Boolean) {
+        val normalized = AppSettings.normalizeAdBlockHost(host) ?: return
+        stateMutex.withLock {
+            val updated = withContext(dispatchers.io) {
+                val p = getPrefs()
+                val currentSet = readDisabledAdBlockHosts(p).toMutableSet()
+                if (enabled) {
+                    currentSet.remove(normalized)
+                } else {
+                    currentSet.add(normalized)
+                }
+                p.edit().apply {
+                    if (currentSet.isEmpty()) {
+                        remove(KEY_AD_BLOCK_DISABLED_HOSTS)
+                    } else {
+                        putString(KEY_AD_BLOCK_DISABLED_HOSTS, currentSet.sorted().joinToString("\n"))
+                    }
+                }.commit()
+                readAll(p)
+            }
+            state.value = updated
+            initialized = true
+        }
+    }
+
     private suspend fun getPrefs(): SharedPreferences {
         cachedPrefs?.let { return it }
         return prefsMutex.withLock {
@@ -133,6 +158,13 @@ class SecureSettingsStore internal constructor(
         }
     }
 
+    private fun readDisabledAdBlockHosts(prefs: SharedPreferences): Set<String> {
+        val raw = prefs.getString(KEY_AD_BLOCK_DISABLED_HOSTS, null) ?: return emptySet()
+        return raw.lineSequence()
+            .mapNotNull { AppSettings.normalizeAdBlockHost(it) }
+            .toSet()
+    }
+
     private fun readAll(prefs: SharedPreferences): AppSettings = AppSettings(
         themeMode = prefs.getString(KEY_THEME, null)?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() }
             ?: ThemeMode.DARK,
@@ -148,7 +180,8 @@ class SecureSettingsStore internal constructor(
             prefs.getString(KEY_SAVE_SUBFOLDER, Constants.SHARED_SUBFOLDER) ?: Constants.SHARED_SUBFOLDER
         ),
         customSaveTreeUri = prefs.getString(KEY_CUSTOM_SAVE_TREE_URI, null)?.trim()?.takeIf { it.isNotEmpty() },
-        customSaveOrganizeByType = prefs.getBoolean(KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE, false)
+        customSaveOrganizeByType = prefs.getBoolean(KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE, false),
+        adBlockDisabledHosts = readDisabledAdBlockHosts(prefs)
     )
 
     private fun createPrefs(): SharedPreferences = try {
@@ -181,5 +214,6 @@ class SecureSettingsStore internal constructor(
         const val KEY_SAVE_SUBFOLDER = "save_subfolder"
         const val KEY_CUSTOM_SAVE_TREE_URI = "custom_save_tree_uri"
         const val KEY_CUSTOM_SAVE_ORGANIZE_BY_TYPE = "custom_save_organize_by_type"
+        const val KEY_AD_BLOCK_DISABLED_HOSTS = "ad_block_disabled_hosts"
     }
 }

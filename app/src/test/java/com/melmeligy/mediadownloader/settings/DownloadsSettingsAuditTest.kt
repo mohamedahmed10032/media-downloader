@@ -683,6 +683,12 @@ class DownloadsSettingsAuditTest {
         override suspend fun setCustomSaveOrganizeByType(organize: Boolean) {
             state.value = state.value.copy(customSaveOrganizeByType = organize)
         }
+        override suspend fun setAdBlockEnabledForHost(host: String, enabled: Boolean) {
+            val normalized = AppSettings.normalizeAdBlockHost(host) ?: return
+            val next = if (enabled) state.value.adBlockDisabledHosts - normalized
+            else state.value.adBlockDisabledHosts + normalized
+            state.value = state.value.copy(adBlockDisabledHosts = next)
+        }
     }
 
     private class InMemoryDownloadRepository : DownloadRepository {

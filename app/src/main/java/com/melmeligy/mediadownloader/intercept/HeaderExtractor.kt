@@ -26,11 +26,19 @@ object HeaderExtractor {
         "x-requested-with"
     )
 
-    fun fromRequest(request: WebResourceRequest, pageUrl: String?): Map<String, String> {
+    fun fromRequest(
+        request: WebResourceRequest,
+        pageUrl: String?,
+        userAgent: String? = null
+    ): Map<String, String> {
         val out = LinkedHashMap<String, String>()
 
         request.requestHeaders.forEach { (key, value) ->
             if (key.lowercase() in WANTED && value.isNotBlank()) out[normalize(key)] = value
+        }
+
+        if (!out.containsKey("User-Agent") && !userAgent.isNullOrBlank()) {
+            out["User-Agent"] = userAgent
         }
 
         if (!out.containsKey("Cookie")) {
@@ -45,10 +53,6 @@ object HeaderExtractor {
         }
 
         val effectiveReferer = out["Referer"] ?: pageUrl
-        if (!out.containsKey("Origin") && !effectiveReferer.isNullOrBlank()) {
-            originOf(effectiveReferer)?.let { out["Origin"] = it }
-        }
-
         if (!out.containsKey("Cookie") && !effectiveReferer.isNullOrBlank()) {
             runCatching { CookieManager.getInstance().getCookie(effectiveReferer) }
                 .getOrNull()
@@ -69,7 +73,6 @@ object HeaderExtractor {
         out["User-Agent"] = userAgent?.takeIf { it.isNotBlank() } ?: Constants.DEFAULT_USER_AGENT
         if (!pageUrl.isNullOrBlank()) {
             out["Referer"] = pageUrl
-            originOf(pageUrl)?.let { out["Origin"] = it }
         }
         return out
     }
@@ -77,13 +80,6 @@ object HeaderExtractor {
     fun defaultUserAgent(context: Context): String =
         runCatching { WebSettings.getDefaultUserAgent(context) }
             .getOrDefault(Constants.DEFAULT_USER_AGENT)
-
-    private fun originOf(pageUrl: String): String? = runCatching {
-        val uri = Uri.parse(pageUrl)
-        val scheme = uri.scheme
-        val host = uri.host
-        if (scheme.isNullOrBlank() || host.isNullOrBlank()) null else "$scheme://$host"
-    }.getOrNull()
 
     private fun normalize(key: String): String =
         key.split('-').joinToString("-") { part -> part.replaceFirstChar { it.uppercase() } }

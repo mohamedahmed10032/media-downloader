@@ -12,6 +12,8 @@ class MediaRepositoryImpl @Inject constructor(
 ) : MediaRepository {
     override suspend fun resolve(url: String): ResolvedMedia = registry.resolve(url)
 
+    fun peekCached(url: String): ResolvedMedia? = registry.peekCached(url)
+
     fun invalidateCache(url: String) = registry.invalidate(url)
 
     fun updateCached(media: ResolvedMedia) = registry.updateCache(media)

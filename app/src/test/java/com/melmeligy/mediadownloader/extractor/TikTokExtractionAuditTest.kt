@@ -336,8 +336,8 @@ class TikTokExtractionAuditTest {
         assertEquals("https://www.tiktok.com/", resolved.gallerySlides[0].headers["Referer"])
         assertTrue("Slideshow ResolvedMedia must expose attached audio stream", resolved.hasAudio)
         val audioStream = resolved.streams.first { it.type == MediaType.AUDIO }
-        assertEquals(320_000L, audioStream.sizeBytes)
         assertEquals("mp3", audioStream.container)
+        verify(exactly = 0) { mockHttp.probe("https://v16m.tiktokcdn.com/audio.mp3", any()) }
     }
 
     @Test
@@ -478,9 +478,8 @@ class TikTokExtractionAuditTest {
         assertNotNull(resolved)
         val stream = resolved!!.streams.single()
         assertEquals(1080, stream.height)
-        assertEquals(4_812_345L, stream.sizeBytes)
-        assertEquals("true", stream.headers["X-Internal-Accepts-Ranges"])
+        assertEquals(null, stream.sizeBytes)
         assertEquals("ttwid=c1; tt_chain_token=c2", stream.headers["Cookie"])
-        verify(exactly = 1) { mockHttp.probe(match { it.contains("no-size-1080") }, any()) }
+        verify(exactly = 0) { mockHttp.probe(match { it.contains("no-size-1080") }, any()) }
     }
 }

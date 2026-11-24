@@ -55,6 +55,7 @@ fun ErrorState(
     message: String,
     icon: ImageVector,
     modifier: Modifier = Modifier,
+    detail: String? = null,
     onRetry: (() -> Unit)? = null
 ) {
     Box(modifier = modifier.padding(24.dp), contentAlignment = Alignment.Center) {
@@ -74,6 +75,14 @@ fun ErrorState(
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurface
             )
+            if (!detail.isNullOrBlank()) {
+                Text(
+                    text = detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             if (onRetry != null) {
                 Button(onClick = onRetry) { Text("Try again") }
             }

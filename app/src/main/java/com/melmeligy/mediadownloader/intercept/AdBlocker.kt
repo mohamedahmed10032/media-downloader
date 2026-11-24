@@ -109,6 +109,62 @@ object AdBlocker {
         "yandex.ru"
     )
 
+    /**
+     * Standard ad/analytics hosts commonly probed by anti-adblock scripts (e.g. WeCima).
+     * Never blocked in WebView `shouldInterceptRequest` so anti-adblock modals do not trigger,
+     * while still filtered out of captured media streams and popup redirects.
+     */
+    val ANTI_ADBLOCK_BAIT_HOSTS = setOf(
+        "googlesyndication.com",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "doubleclick.net"
+    )
+
+    /**
+     * Known video player / embed host tokens that must never be blocked as ads even if a
+     * third-party host list ever adds a matching domain.
+     */
+    val PROTECTED_EMBED_HOST_TOKENS = listOf(
+        "earnvids",
+        "vidhide",
+        "filemoon",
+        "byse",
+        "voe",
+        "dood",
+        "mixdrop",
+        "m1xdrop",
+        "savefiles",
+        "streamwish",
+        "streamtape",
+        "uqload",
+        "lulustream",
+        "vidguard",
+        "filelions",
+        "vidmoly",
+        "upstream",
+        "streamlare",
+        "vtube",
+        "vidoza",
+        "mp4upload",
+        "goodstream",
+        "vembed",
+        "wecima",
+        "mycima",
+        "okstream",
+        "updown"
+    )
+
+    private val POPUP_REDIRECT_PATH_MARKERS = listOf(
+        "/popunder",
+        "/out/click",
+        "/afu.php",
+        "/go.php",
+        "/click.php",
+        "/adclick",
+        "/redirect/ad"
+    )
+
     private val initialized = AtomicBoolean(false)
     private val blockedHosts: MutableSet<String> = ConcurrentHashMap.newKeySet<String>().apply {
         addAll(BUILTIN_AD_HOSTS)
@@ -120,19 +176,91 @@ object AdBlocker {
         runCatching {
             context.assets.open("ad_block_host").bufferedReader().useLines { lines ->
                 lines.forEach { raw ->
-                    val cleaned = raw.substringBefore('#').trim().lowercase()
-                    if (cleaned.isNotEmpty() && !cleaned.contains(' ')) {
-                        blockedHosts.add(cleaned.removePrefix("www."))
+                    val cleaned = raw.substringBefore('#').trim().lowercase().removePrefix("www.")
+                    if (cleaned.isNotEmpty() && !cleaned.contains(' ') && !isProtectedEmbedHost(cleaned)) {
+                        blockedHosts.add(cleaned)
                     }
                 }
             }
         }
     }
 
+    /** True if [rawHost] belongs to a known video player / embed host that must never be ad-blocked. */
+    fun isProtectedEmbedHost(rawHost: String?): Boolean {
+        val normalized = normalizeHost(rawHost) ?: return false
+        return PROTECTED_EMBED_HOST_TOKENS.any { token ->
+            normalized == token ||
+                normalized.startsWith("$token.") ||
+                normalized.contains(".$token.") ||
+                normalized.contains(token)
+        }
+    }
+
+    /** True if [rawUrl] targets a standard anti-adblock bait script host. */
+    fun isAntiAdblockBait(rawUrl: String?): Boolean {
+        if (rawUrl.isNullOrBlank()) return false
+        val host = extractHost(rawUrl.trim()) ?: return false
+        return matchesHostSet(host, ANTI_ADBLOCK_BAIT_HOSTS)
+    }
+
+    /**
+     * Sub-resource blocking policy for WebView `shouldInterceptRequest`.
+     *
+     * - Passes through standard anti-adblock bait scripts (`googlesyndication.com`,
+     *   `google-analytics.com`, `googletagmanager.com`, `doubleclick.net`) so anti-adblock
+     *   overlays are not triggered.
+     * - Respects per-site disabled hosts (`disabledHosts`).
+     * - Never blocks protected video embed hosts.
+     */
+    fun shouldBlockSubResource(
+        rawUrl: String?,
+        pageUrl: String? = null,
+        disabledHosts: Set<String> = emptySet()
+    ): Boolean {
+        if (rawUrl.isNullOrBlank()) return false
+        if (disabledHosts.isNotEmpty()) {
+            val pageHost = normalizeHost(pageUrl)
+            if (pageHost != null && pageHost in disabledHosts) return false
+        }
+        if (isAntiAdblockBait(rawUrl)) return false
+        return isAd(rawUrl)
+    }
+
+    /**
+     * Popup / redirect blocking policy for `shouldOverrideUrlLoading` (always ON regardless
+     * of per-site ad-block toggle).
+     *
+     * Blocks `intent://`, `market://`, `javascript:` and other non-HTTP(S) schemes, known ad
+     * domains, and cross-domain ad/popunder redirect paths.
+     */
+    fun shouldBlockPopupOrRedirect(rawUrl: String?, currentPageUrl: String? = null): Boolean {
+        if (rawUrl.isNullOrBlank()) return false
+        val trimmed = rawUrl.trim()
+        if (!(trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true))) {
+            return true
+        }
+        if (isAd(trimmed)) return true
+
+        val targetHost = normalizeHost(trimmed)
+        if (targetHost != null && isProtectedEmbedHost(targetHost)) return false
+
+        val currentHost = normalizeHost(currentPageUrl)
+        val isCrossDomain = currentHost != null && targetHost != null &&
+            hostFamily(currentHost) != hostFamily(targetHost)
+        if (isCrossDomain) {
+            val lower = trimmed.lowercase()
+            if (POPUP_REDIRECT_PATH_MARKERS.any { lower.contains(it) }) {
+                return true
+            }
+        }
+        return false
+    }
+
     fun isAd(rawUrl: String?): Boolean {
         if (rawUrl.isNullOrBlank()) return false
         val trimmed = rawUrl.trim()
         val host = extractHost(trimmed) ?: return false
+        if (isProtectedEmbedHost(host)) return false
         if (isBlockedHost(host)) return true
 
         val lower = trimmed.lowercase()
@@ -140,10 +268,26 @@ object AdBlocker {
     }
 
     fun isBlockedHost(rawHost: String): Boolean {
+        val normalized = normalizeHost(rawHost) ?: return false
+        if (isProtectedEmbedHost(normalized)) return false
+        return matchesHostSet(normalized, blockedHosts)
+    }
+
+    fun normalizeHost(urlOrHost: String?): String? {
+        if (urlOrHost.isNullOrBlank()) return null
+        val trimmed = urlOrHost.trim()
+        val host = if (trimmed.contains("://")) extractHost(trimmed) else trimmed
+        return host?.trim()?.lowercase()?.removePrefix("www.")?.trimEnd('.')?.takeIf { it.isNotEmpty() }
+    }
+
+    fun createEmptyResponse(): WebResourceResponse =
+        WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+
+    private fun matchesHostSet(rawHost: String, hostSet: Set<String>): Boolean {
         var current = rawHost.trim().lowercase().removePrefix("www.").trimEnd('.')
         if (current.isEmpty()) return false
         while (true) {
-            if (blockedHosts.contains(current)) return true
+            if (hostSet.contains(current)) return true
             val dot = current.indexOf('.')
             if (dot < 0) return false
             current = current.substring(dot + 1)
@@ -151,8 +295,10 @@ object AdBlocker {
         }
     }
 
-    fun createEmptyResponse(): WebResourceResponse =
-        WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+    private fun hostFamily(normalizedHost: String): String {
+        val parts = normalizedHost.split('.')
+        return if (parts.size >= 2) "${parts[parts.size - 2]}.${parts[parts.size - 1]}" else normalizedHost
+    }
 
     private fun extractHost(url: String): String? {
         runCatching {

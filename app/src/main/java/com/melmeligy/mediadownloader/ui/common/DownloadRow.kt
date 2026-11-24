@@ -203,7 +203,12 @@ private fun iconFor(type: MediaType): ImageVector = when (type) {
 }
 
 internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
-    val quality = item.qualityLabel.ifBlank { item.container.uppercase() }
+    val rawQuality = item.qualityLabel.ifBlank { item.container.uppercase() }
+    val quality = if (item.type == MediaType.VIDEO) {
+        FormatUtils.normalizeQualityLabel(rawQuality)
+    } else {
+        rawQuality
+    }
     val safeDone = item.downloadedBytes.coerceAtLeast(0L)
     val safeTotal = if (item.totalBytes > 0L) maxOf(item.totalBytes, safeDone) else 0L
     return when (item.status) {
@@ -225,9 +230,31 @@ internal fun formatDownloadPrimaryStatus(item: DownloadItem): String {
         }
         DownloadStatus.PAUSED -> "$quality · Paused (${FormatUtils.formatPercent(item.progress)})"
         DownloadStatus.COMPLETED -> "$quality · ${FormatUtils.formatBytes(item.totalBytes.coerceAtLeast(safeDone))}"
-        DownloadStatus.FAILED -> "Failed · tap retry"
+        DownloadStatus.FAILED -> formatFailedStatus(item.errorType)
         DownloadStatus.CANCELED -> "Canceled"
     }
+}
+
+internal fun formatFailedStatus(rawErrorType: String?): String {
+    if (rawErrorType.isNullOrBlank()) return "Failed · tap retry"
+    val (code, detail) = com.melmeligy.mediadownloader.core.AppError.decodeFromStorage(rawErrorType)
+    val shortDetail = detail?.trim()?.take(48)?.takeIf { it.isNotEmpty() }
+    val reason = when (code) {
+        com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ->
+            if (shortDetail != null) "Access denied ($shortDetail)" else "Access denied"
+        com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK -> "Link expired"
+        com.melmeligy.mediadownloader.core.AppError.SERVER_ERROR ->
+            if (shortDetail != null) "Server error ($shortDetail)" else "Server error"
+        com.melmeligy.mediadownloader.core.AppError.NO_INTERNET -> "No internet"
+        com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED -> "Unavailable in region"
+        com.melmeligy.mediadownloader.core.AppError.INSUFFICIENT_STORAGE -> "Not enough storage"
+        com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND -> "Media not found"
+        com.melmeligy.mediadownloader.core.AppError.UNSUPPORTED_SITE -> "Unsupported site"
+        com.melmeligy.mediadownloader.core.AppError.INVALID_LINK -> "Invalid link"
+        com.melmeligy.mediadownloader.core.AppError.GENERIC ->
+            if (shortDetail != null) "Failed ($shortDetail)" else "Failed"
+    }
+    return "$reason · tap retry"
 }
 
 internal fun isolateBidiForDisplay(text: String): String {

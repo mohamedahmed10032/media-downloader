@@ -459,7 +459,7 @@ object BlobBridge {
   });
 
   /* 2. Watch XHR/fetch for dynamic manifests & get_media JSON ------------ */
-  var mediaPattern = /\.(m3u8|mpd|mp4|m4a|mp3|webm|mov|aac)(\?|#|${'$'})/i;
+  var mediaPattern = /(?:\.(m3u8|mpd|mp4|m4a|mp3|webm|mov|aac)(\?|#|${'$'})|\/(?:hls\d?|m3u8)\/[^"'\s]+\.(?:txt|m3u)(\?|#|${'$'})|\/(?:master|index|playlist)\.txt(\?|#|${'$'}))/i;
 
   function scanJsonMediaResponse(text, meta) {
     safe(function () {
@@ -936,6 +936,26 @@ object BlobBridge {
             }
           }
         }
+      }
+    });
+
+    // E2. Embed player globals: window.links ({hls2, hls3, hls4, hls}) & Mixdrop window.MDCore.wurl
+    safe(function () {
+      if (window.links && typeof window.links === 'object') {
+        var linkKeys = ['hls2', 'hls3', 'hls4', 'hls', 'file', 'src'];
+        for (var lk = 0; lk < linkKeys.length; lk++) {
+          var lKey = linkKeys[lk];
+          var lVal = window.links[lKey];
+          if (lVal && typeof lVal === 'string') {
+            var lMime = lKey.indexOf('hls') === 0 ? 'application/x-mpegURL' : '';
+            reportAuthoritative(lVal, lMime, 0, meta.title, meta.thumb, meta.duration);
+            foundCount++;
+          }
+        }
+      }
+      if (window.MDCore && typeof window.MDCore === 'object' && typeof window.MDCore.wurl === 'string' && window.MDCore.wurl) {
+        reportAuthoritative(window.MDCore.wurl, 'video/mp4', 0, meta.title, meta.thumb, meta.duration);
+        foundCount++;
       }
     });
 

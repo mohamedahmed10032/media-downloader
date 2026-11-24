@@ -25,7 +25,8 @@ object JsUnpacker {
         val url: String,
         val label: String = "",
         val width: Int? = null,
-        val height: Int? = null
+        val height: Int? = null,
+        val isHlsHint: Boolean = false
     )
 
     data class PlayerConfigResult(
@@ -70,18 +71,30 @@ object JsUnpacker {
     )
 
     private val PLAYERJS_FILE_REGEX = Regex(
-        """(?:["']?(?:file|source|src|hls|m3u8|mp4)["']?\s*:\s*(['"])([^'"]{8,4000})\1)""",
+        """(?:["']?(?:file|source|src|hls|hls2|hls3|hls4|m3u8|mp4)["']?\s*:\s*(['"])([^'"]{6,4000})\1)""",
         RegexOption.IGNORE_CASE
     )
     private val PLAYERJS_TAGGED_URL_REGEX = Regex(
-        """\[([^\]]{1,32})]\s*(https?://[^,\s"'<>]+)"""
+        """\[([^\]]{1,32})]\s*((?:https?:)?//[^,\s"'<>]+|/[^,\s"'<>]+)"""
     )
     private val SOURCE_OBJ_REGEX = Regex(
-        """\{[^{}]{0,500}?(?:["']?(?:file|src|url)["']?\s*:\s*['"](https?://[^'"]+)['"])[^{}]{0,500}?\}""",
+        """\{[^{}]{0,500}?(?:["']?(?:file|src|url)["']?\s*:\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"])[^{}]{0,500}?\}""",
         RegexOption.IGNORE_CASE
     )
     private val SOURCE_LABEL_REGEX = Regex(
         """(?:["']?(?:label|res|size|title|quality)["']?\s*:\s*['"]?([0-9]{3,4}p?|4k|2k|fhd|hd|sd)['"]?)""",
+        RegexOption.IGNORE_CASE
+    )
+    private val LINKS_OBJECT_REGEX = Regex(
+        """(?:(?:var|let|const)\s+)?links\s*[:=]\s*\{([^{}]{1,4000})\}""",
+        RegexOption.IGNORE_CASE
+    )
+    private val LINKS_ENTRY_REGEX = Regex(
+        """["']?(hls\d*|file|mp4|src|source)["']?\s*:\s*(['"])([^'"]{4,2000})\2""",
+        RegexOption.IGNORE_CASE
+    )
+    private val MDCORE_WURL_REGEX = Regex(
+        """MDCore\.wurl\s*=\s*(['"])([^'"]{6,2000})\1""",
         RegexOption.IGNORE_CASE
     )
 
@@ -237,9 +250,13 @@ object JsUnpacker {
 
     /**
      * Extracts stream URLs, quality hints, duration, and poster from PlayerJS, JWPlayer,
-     * Plyr, Clappr, and Video.js scripts (both raw HTML and unpacked JS).
+     * Plyr, Clappr, Video.js, `links = {"hls2":...,"hls3":...,"hls4":...}`, and `MDCore.wurl`
+     * scripts (both raw HTML and unpacked JS).
+     *
+     * When [baseUrl] is supplied, protocol-relative (`//...`) and root-relative (`/...`)
+     * stream URLs are resolved against [baseUrl].
      */
-    fun extractPlayerConfigs(text: String): PlayerConfigResult {
+    fun extractPlayerConfigs(text: String, baseUrl: String? = null): PlayerConfigResult {
         if (text.isBlank()) return PlayerConfigResult()
         val sanitized = stripAdFields(text)
         val unescaped = unescapeJs(sanitized)
@@ -250,6 +267,7 @@ object JsUnpacker {
             .maxOrNull()
 
         val posterUrl = POSTER_REGEX.find(unescaped)?.groupValues?.getOrNull(1)
+            ?.let { resolveRelativeStreamUrl(it, baseUrl) }
             ?.takeIf { !AdBlocker.isAd(it) }
 
         val cfgWidth = WIDTH_REGEX.find(unescaped)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -259,13 +277,31 @@ object JsUnpacker {
 
         val sources = LinkedHashMap<String, ExtractedSource>()
 
-        fun addIfMedia(rawUrl: String, label: String = "", width: Int? = null, height: Int? = null) {
-            val cleaned = unescapeJs(rawUrl.trim())
-            if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) return
-            if (AdBlocker.isAd(cleaned) || MediaSniffer.isPreviewOrAdUrl(cleaned)) return
-            if (MediaSniffer.isHexCipherUrl(cleaned)) return
-            val lower = cleaned.lowercase()
-            val isMediaCandidate = lower.contains(".m3u8") ||
+        fun addIfMedia(
+            rawUrl: String,
+            label: String = "",
+            width: Int? = null,
+            height: Int? = null,
+            isHlsHint: Boolean = false,
+            allowOpaqueStreamPath: Boolean = false
+        ) {
+            val resolved = resolveRelativeStreamUrl(unescapeJs(rawUrl.trim()), baseUrl) ?: return
+            if (!resolved.startsWith("http://") && !resolved.startsWith("https://")) return
+            if (AdBlocker.isAd(resolved) || MediaSniffer.isPreviewOrAdUrl(resolved)) return
+            if (MediaSniffer.isHexCipherUrl(resolved)) return
+            val lower = resolved.lowercase()
+            val pathNoQuery = lower.substringBefore('?').substringBefore('#')
+            if (pathNoQuery.endsWith(".jpg") || pathNoQuery.endsWith(".jpeg") || pathNoQuery.endsWith(".png") ||
+                pathNoQuery.endsWith(".webp") || pathNoQuery.endsWith(".vtt") || pathNoQuery.endsWith(".srt") ||
+                pathNoQuery.endsWith(".xml") || pathNoQuery.endsWith(".css") || pathNoQuery.endsWith(".js") ||
+                pathNoQuery.endsWith(".svg") || pathNoQuery.endsWith(".ico")
+            ) return
+
+            val disguisedHls = MediaSniffer.isDisguisedHlsUrl(resolved)
+            val isMediaCandidate = allowOpaqueStreamPath ||
+                isHlsHint ||
+                disguisedHls ||
+                lower.contains(".m3u8") ||
                 lower.contains(".mpd") ||
                 lower.contains(".mp4") ||
                 lower.contains(".webm") ||
@@ -274,24 +310,63 @@ object JsUnpacker {
                 lower.contains(".m4a") ||
                 lower.contains("/get_video?") ||
                 lower.contains("/hls/") ||
-                lower.contains("/hls2/")
+                lower.contains("/hls2/") ||
+                lower.contains("/hls3/") ||
+                lower.contains("/hls4/")
             if (!isMediaCandidate) return
-            if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
-                lower.endsWith(".webp") || lower.endsWith(".vtt") || lower.endsWith(".srt") ||
-                lower.endsWith(".xml") || lower.endsWith(".css") || lower.endsWith(".js")
-            ) return
 
-            val key = MediaSniffer.dedupeKey(cleaned)
-            val normHeight = normalizeVideoHeight(width, height) ?: UrlUtils.inferResolution(cleaned, label)
+            val effectiveHlsHint = isHlsHint || disguisedHls || lower.contains(".m3u8")
+            val key = MediaSniffer.dedupeKey(resolved)
+            val normHeight = normalizeVideoHeight(width, height) ?: UrlUtils.inferResolution(resolved, label)
             val existing = sources[key]
-            if (existing == null || (existing.height == null && normHeight != null)) {
+            if (existing == null || (existing.height == null && normHeight != null) || (!existing.isHlsHint && effectiveHlsHint)) {
                 sources[key] = ExtractedSource(
-                    url = cleaned,
+                    url = resolved,
                     label = label.ifBlank { existing?.label.orEmpty() },
                     width = width ?: existing?.width,
-                    height = normHeight ?: existing?.height
+                    height = normHeight ?: existing?.height,
+                    isHlsHint = effectiveHlsHint || (existing?.isHlsHint == true)
                 )
             }
+        }
+
+        // 0a. Unpacked `links = {"hls2":"...", "hls3":"...", "hls4":"..."}` (EarnVids, Byse, VidHide, SaveFiles, StreamWish)
+        LINKS_OBJECT_REGEX.findAll(unescaped).forEach { blockMatch ->
+            val body = blockMatch.groupValues[1]
+            val entries = LINKS_ENTRY_REGEX.findAll(body)
+                .map { it.groupValues[1].lowercase() to it.groupValues[3].trim() }
+                .sortedBy { (key, _) ->
+                    when (key) {
+                        "hls2" -> 0
+                        "hls3" -> 1
+                        "hls4" -> 2
+                        "hls" -> 3
+                        else -> 4
+                    }
+                }
+                .toList()
+            for ((key, rawVal) in entries) {
+                val isHlsKey = key.startsWith("hls")
+                addIfMedia(
+                    rawUrl = rawVal,
+                    width = cfgWidth,
+                    height = cfgHeight,
+                    isHlsHint = isHlsKey,
+                    allowOpaqueStreamPath = true
+                )
+            }
+        }
+
+        // 0b. Mixdrop / m1xdrop `MDCore.wurl = "//..."`
+        MDCORE_WURL_REGEX.findAll(unescaped).forEach { match ->
+            val rawVal = match.groupValues[2].trim()
+            addIfMedia(
+                rawUrl = rawVal,
+                width = cfgWidth,
+                height = cfgHeight,
+                isHlsHint = rawVal.contains(".m3u8", ignoreCase = true) || MediaSniffer.isDisguisedHlsUrl(rawVal),
+                allowOpaqueStreamPath = true
+            )
         }
 
         // 1. Structured `{file/src/url: "...", label/res: "..."}` objects
@@ -304,21 +379,26 @@ object JsUnpacker {
             addIfMedia(url, label, w ?: cfgWidth, h ?: cfgHeight)
         }
 
-        // 2. PlayerJS & JWPlayer direct `file: "..."` / `source: "..."` properties
+        // 2. PlayerJS & JWPlayer direct `file: "..."` / `source: "..."` / `hls2: "..."` properties
         PLAYERJS_FILE_REGEX.findAll(unescaped).forEach { match ->
+            val fullProp = match.value.lowercase()
+            val isHlsProp = fullProp.startsWith("hls") || fullProp.startsWith("\"hls") || fullProp.startsWith("'hls") ||
+                fullProp.startsWith("m3u8") || fullProp.startsWith("\"m3u8") || fullProp.startsWith("'m3u8")
             val rawVal = match.groupValues[2].trim()
             val taggedMatches = PLAYERJS_TAGGED_URL_REGEX.findAll(rawVal).toList()
             if (taggedMatches.isNotEmpty()) {
                 taggedMatches.forEach { tm ->
                     val tag = tm.groupValues[1].trim()
                     val url = tm.groupValues[2].trim()
-                    addIfMedia(url, label = tag)
+                    addIfMedia(url, label = tag, isHlsHint = isHlsProp)
                 }
-            } else if (rawVal.startsWith("http://") || rawVal.startsWith("https://")) {
+            } else if (rawVal.startsWith("http://") || rawVal.startsWith("https://") ||
+                rawVal.startsWith("//") || rawVal.startsWith("/")
+            ) {
                 // Handle PlayerJS `or` fallback separator (`url1 or url2`)
                 val parts = rawVal.split(Regex("""\s+or\s+""", RegexOption.IGNORE_CASE))
                 parts.forEach { part ->
-                    addIfMedia(part.trim(), width = cfgWidth, height = cfgHeight)
+                    addIfMedia(part.trim(), width = cfgWidth, height = cfgHeight, isHlsHint = isHlsProp)
                 }
             }
         }
@@ -328,6 +408,32 @@ object JsUnpacker {
             durationSec = durationSec,
             posterUrl = posterUrl
         )
+    }
+
+    internal fun resolveRelativeStreamUrl(rawUrl: String, baseUrl: String?): String? {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.startsWith("javascript:", ignoreCase = true) ||
+            trimmed.startsWith("data:", ignoreCase = true) ||
+            trimmed.startsWith("about:", ignoreCase = true)
+        ) {
+            return null
+        }
+        return when {
+            trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("//") -> {
+                val scheme = baseUrl?.substringBefore("://", "")
+                    ?.takeIf { it.equals("http", ignoreCase = true) || it.equals("https", ignoreCase = true) }
+                    ?: "https"
+                "$scheme:$trimmed"
+            }
+            trimmed.startsWith("/") && !baseUrl.isNullOrBlank() -> {
+                UrlUtils.resolveUrl(baseUrl, trimmed).takeIf {
+                    it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+                }
+            }
+            else -> null
+        }
     }
 
     /**
@@ -491,23 +597,8 @@ object JsUnpacker {
      * `1920x800` -> `1080`) and portrait resolutions (`720x1280` -> `720`) into canonical
      * quality heights so the format picker and Default Video Quality preference match accurately.
      */
-    fun normalizeVideoHeight(width: Int?, height: Int?): Int? {
-        if (width != null && width > 0 && height != null && height > 0) {
-            if (height > width) {
-                // Portrait (e.g. 720x1280 -> 720p)
-                return width
-            }
-            // Widescreen cinema aspect ratios (2.0:1 / 2.39:1 / 2.40:1)
-            return when {
-                width >= 3800 && height in 1400..2160 -> 2160
-                width >= 2500 && height in 960..1440 -> 1440
-                width >= 1880 && height in 740..1080 -> 1080
-                width >= 1240 && height in 480..720 -> 720
-                else -> height
-            }
-        }
-        return height?.takeIf { it > 0 }
-    }
+    fun normalizeVideoHeight(width: Int?, height: Int?): Int? =
+        com.melmeligy.mediadownloader.core.util.FormatUtils.normalizeQualityHeight(width, height)
 
     private fun isUsefulMediaUrl(url: String): Boolean {
         if (!url.startsWith("http://") && !url.startsWith("https://")) return false

@@ -33,6 +33,9 @@ interface DownloadRepository {
     suspend fun requeue(id: Long, resetRetryCount: Boolean = false)
     suspend fun updateProgress(id: Long, downloaded: Long, total: Long, speed: Long, eta: Long)
     suspend fun setError(id: Long, error: AppError)
+    suspend fun setError(id: Long, error: AppError, detail: String?) {
+        setError(id, error)
+    }
     suspend fun incrementRetry(id: Long)
     suspend fun setCompleted(id: Long, contentUri: String, total: Long)
     suspend fun delete(id: Long)
@@ -61,4 +64,5 @@ interface SettingsRepository {
     suspend fun setSaveSubfolder(name: String)
     suspend fun setCustomSaveTreeUri(treeUri: String?)
     suspend fun setCustomSaveOrganizeByType(organize: Boolean)
+    suspend fun setAdBlockEnabledForHost(host: String, enabled: Boolean)
 }

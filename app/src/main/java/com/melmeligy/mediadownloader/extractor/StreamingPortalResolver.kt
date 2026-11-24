@@ -158,6 +158,39 @@ class StreamingPortalResolver(
     }
 
     /**
+     * Fast hybrid entry point used by [HeadlessWebExtractor]: accepts embed/server URLs scraped
+     * directly from the live WebView DOM (e.g. `.WatchServersList [data-url]` or `<iframe>`s) and
+     * unpacks + verifies them concurrently over OkHttp with the WebView's cookies & User-Agent.
+     */
+    suspend fun resolveDirectEmbedUrls(
+        pageUrl: String,
+        embedUrls: Collection<String>,
+        baseHeaders: Map<String, String>
+    ): PortalExtractionResult = withContext(Dispatchers.IO) {
+        if (embedUrls.isEmpty()) return@withContext PortalExtractionResult(emptyList())
+        val visitedEmbeds = ConcurrentHashMap.newKeySet<String>()
+        val idCounter = AtomicInteger(0)
+        val seen = HashSet<String>()
+        val jobs = mutableListOf<ServerJob>()
+        embedUrls.forEachIndexed { idx, raw ->
+            val decoded = decodeBase64UrlIfEncoded(raw)
+            val resolved = normalizeEmbedUrl(pageUrl, decoded) ?: return@forEachIndexed
+            if (isBlockedOrNonPlayerEmbed(resolved)) return@forEachIndexed
+            if (seen.add(dedupeEmbedKey(resolved))) {
+                jobs.add(ServerJob.DirectEmbed(resolved, "Embed ${idx + 1}", pageUrl))
+            }
+        }
+        if (jobs.isEmpty()) return@withContext PortalExtractionResult(emptyList())
+        val (streams, poster) = executeServerJobs(
+            jobs = jobs.take(MAX_SERVERS),
+            baseHeaders = baseHeaders,
+            visitedEmbeds = visitedEmbeds,
+            idCounter = idCounter
+        )
+        PortalExtractionResult(streams = streams, posterUrl = poster)
+    }
+
+    /**
      * Discovers same-host `/watch/` and `/download/` sub-pages from a movie or episode info page,
      * ordering watch pages first and avoiding unrelated sidebar movie links.
      */
@@ -168,6 +201,12 @@ class StreamingPortalResolver(
 
         val watchLinks = LinkedHashSet<String>()
         val downloadLinks = LinkedHashSet<String>()
+
+        val currentSlug = extractTrailingSlug(currentPath)
+        val isEpisodeOrFilmPage = currentPath.startsWith("/episode/") ||
+            currentPath.startsWith("/film/") ||
+            currentPath.startsWith("/series/") ||
+            currentPath.startsWith("/movie/")
 
         doc.select("a[href]").forEach { el ->
             val rawHref = el.absUrl("href").ifBlank { el.attr("href") }.trim()
@@ -180,21 +219,58 @@ class StreamingPortalResolver(
             if (hrefPath == currentPath || hrefPath.isEmpty()) return@forEach
 
             val isChildPath = currentPath.length > 1 && hrefPath.startsWith("$currentPath/")
+            val hrefSlug = extractTrailingSlug(hrefPath)
+            val isPrefixSwappedWatch = isEpisodeOrFilmPage &&
+                hrefPath.startsWith("/watch/") &&
+                currentSlug.isNotEmpty() &&
+                hrefSlug == currentSlug
             val tail = hrefPath.substringAfterLast('/').lowercase()
             val textAndClass = "${el.text()} ${el.className()} ${el.id()}".lowercase()
 
-            val isWatch = tail in setOf("watch", "play", "stream", "servers", "player") ||
+            val isWatch = isPrefixSwappedWatch ||
+                tail in setOf("watch", "play", "stream", "servers", "player") ||
                 (isChildPath && (textAndClass.contains("مشاهدة") || textAndClass.contains("مشاهده") || textAndClass.contains("watch")))
             val isDownload = tail in setOf("download", "downloads") ||
                 (isChildPath && (textAndClass.contains("تحميل") || textAndClass.contains("download")))
 
             when {
-                isWatch && (isChildPath || hrefPath.contains("/watch")) -> watchLinks.add(rawHref)
+                isWatch && (isChildPath || isPrefixSwappedWatch || hrefPath.contains("/watch")) -> watchLinks.add(rawHref)
                 isDownload && (isChildPath || hrefPath.contains("/download")) -> downloadLinks.add(rawHref)
             }
         }
 
         return (watchLinks.take(1) + downloadLinks.take(1)).distinct()
+    }
+
+    private fun extractTrailingSlug(normalizedPath: String): String {
+        val clean = normalizedPath.trim('/')
+        if (clean.isEmpty()) return ""
+        val firstSlash = clean.indexOf('/')
+        return if (firstSlash > 0 && firstSlash + 1 < clean.length) {
+            clean.substring(firstSlash + 1)
+        } else {
+            clean
+        }
+    }
+
+    private fun decodeBase64UrlIfEncoded(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) || trimmed.startsWith("//")) {
+            return trimmed
+        }
+        if (trimmed.length < 16 || !trimmed.matches(Regex("^[A-Za-z0-9+/=_-]+$"))) {
+            return trimmed
+        }
+        val decoded = runCatching {
+            val normalized = trimmed.replace('-', '+').replace('_', '/')
+            val pad = (4 - normalized.length % 4) % 4
+            String(java.util.Base64.getDecoder().decode(normalized + "=".repeat(pad)), StandardCharsets.UTF_8).trim()
+        }.getOrNull()
+        return if (decoded != null && (decoded.startsWith("http://", true) || decoded.startsWith("https://", true) || decoded.startsWith("//"))) {
+            decoded
+        } else {
+            trimmed
+        }
     }
 
     private fun collectServerJobs(
@@ -206,7 +282,8 @@ class StreamingPortalResolver(
         val seenDirectUrls = HashSet<String>()
 
         fun addDirect(rawUrl: String, serverName: String) {
-            val resolved = normalizeEmbedUrl(pageUrl, rawUrl) ?: return
+            val decoded = decodeBase64UrlIfEncoded(rawUrl)
+            val resolved = normalizeEmbedUrl(pageUrl, decoded) ?: return
             if (isBlockedOrNonPlayerEmbed(resolved)) return
             if (seenDirectUrls.add(dedupeEmbedKey(resolved))) {
                 jobs.add(ServerJob.DirectEmbed(resolved, serverName, pageUrl))
@@ -224,7 +301,7 @@ class StreamingPortalResolver(
             }
         }
 
-        // 2. Static server buttons/tabs with direct embed URLs in data-* attributes
+        // 2. Static server buttons/tabs with direct or Base64-encoded embed URLs in data-* attributes
         val directAttrSelectors = listOf(
             "data-embed", "data-watch", "data-url", "data-iframe", "data-link", "data-player", "data-src"
         )
@@ -234,11 +311,20 @@ class StreamingPortalResolver(
                     el.tagName().equals("script", ignoreCase = true) ||
                     el.tagName().equals("link", ignoreCase = true)
                 ) return@forEach
-                val raw = el.attr(attr).trim()
-                if (raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("//")) {
+                val raw = decodeBase64UrlIfEncoded(el.attr(attr).trim())
+                if (raw.startsWith("http://", true) || raw.startsWith("https://", true) || raw.startsWith("//")) {
                     val label = el.text().trim().take(32).ifBlank { "Server" }
                     addDirect(raw, label)
                 }
+            }
+        }
+
+        // 2b. WeCima direct download links (.List--Download--Wecima--Single a[href])
+        doc.select(".List--Download--Wecima--Single a[href]").forEach { a ->
+            val href = decodeBase64UrlIfEncoded(a.absUrl("href").ifBlank { a.attr("href") }.trim())
+            if (href.startsWith("http://", true) || href.startsWith("https://", true) || href.startsWith("//")) {
+                val label = a.text().trim().take(32).ifBlank { "WeCima Download" }
+                addDirect(href, label)
             }
         }
 
@@ -415,6 +501,11 @@ class StreamingPortalResolver(
                 }
                 if (outcome.streams.isNotEmpty()) {
                     collectedStreams += outcome.streams
+                    val hasMultiQualityHls = collectedStreams.any { it.isHls } &&
+                        collectedStreams.mapNotNull { it.height }.distinct().size >= 2
+                    if (hasMultiQualityHls) {
+                        break
+                    }
                     if (firstWinDeadlineMs == null) {
                         if (remaining == 0) break
                         firstWinDeadlineMs = System.currentTimeMillis() + SIBLING_MERGE_GRACE_MS
@@ -476,12 +567,22 @@ class StreamingPortalResolver(
         val dedupe = dedupeEmbedKey(embedUrl)
         if (!visited.add(dedupe)) return@coroutineScope PortalExtractionResult(emptyList())
 
-        // Direct media URL inside iframe/mirror
-        val directExt = UrlUtils.fileExtension(embedUrl)
+        // Direct media URL inside iframe/mirror (e.g. .m3u8 or WeCima .List--Download--Wecima--Single .mp4 link)
+        val directExt = UrlUtils.fileExtension(embedUrl)?.lowercase()
         if (directExt == "m3u8") {
             val h = buildStreamHeadersForHost(parentUrl, baseHeaders)
             val expanded = runCatching { hlsExtractor.extractVerified(embedUrl, h) }.getOrNull()
             return@coroutineScope PortalExtractionResult(expanded?.streams.orEmpty())
+        }
+        if (directExt in setOf("mp4", "mkv", "webm", "mov", "m4v")) {
+            val h = buildStreamHeadersForHost(parentUrl, baseHeaders)
+            val directStreams = materializeCandidate(
+                cand = JsUnpacker.ExtractedSource(url = embedUrl, label = serverName),
+                headers = h,
+                serverName = serverName,
+                idCounter = idCounter
+            )
+            return@coroutineScope PortalExtractionResult(directStreams)
         }
 
         val fetchHeaders = buildHopHeaders(embedUrl, parentUrl, baseHeaders)
@@ -496,6 +597,10 @@ class StreamingPortalResolver(
         val streamHeaders = buildStreamHeadersForHost(embedUrl, baseHeaders)
 
         val unpackedBlocks = JsUnpacker.unpackAll(embedHtml)
+        com.melmeligy.mediadownloader.core.AppLogger.d(
+            "Portal",
+            "Hop depth=$depth host=${UrlUtils.host(embedUrl)} html=${embedHtml.length}B unpacked=${unpackedBlocks.size}"
+        )
         val combinedScriptText = buildString {
             append(embedHtml)
             for (block in unpackedBlocks) {
@@ -504,7 +609,7 @@ class StreamingPortalResolver(
             }
         }
 
-        val playerCfg = JsUnpacker.extractPlayerConfigs(combinedScriptText)
+        val playerCfg = JsUnpacker.extractPlayerConfigs(combinedScriptText, baseUrl = embedUrl)
         val durationHeaders = if (playerCfg.durationSec != null && playerCfg.durationSec > 0L) {
             streamHeaders + ("X-Internal-Duration-Seconds" to playerCfg.durationSec.toString())
         } else {
@@ -512,7 +617,13 @@ class StreamingPortalResolver(
         }
 
         val candidates = LinkedHashMap<String, JsUnpacker.ExtractedSource>()
-        fun addCandidate(url: String, label: String = "", width: Int? = null, height: Int? = null) {
+        fun addCandidate(
+            url: String,
+            label: String = "",
+            width: Int? = null,
+            height: Int? = null,
+            isHlsHint: Boolean = false
+        ) {
             val resolved = UrlUtils.resolveUrl(embedUrl, url.trim())
             val cleaned = MediaSniffer.cleanMediaUrl(resolved)
             if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) return
@@ -520,20 +631,22 @@ class StreamingPortalResolver(
             if (MediaSniffer.isHexCipherUrl(cleaned)) return
             val key = MediaSniffer.dedupeKey(cleaned)
             val normH = JsUnpacker.normalizeVideoHeight(width, height) ?: UrlUtils.inferResolution(cleaned, label)
+            val effectiveHlsHint = isHlsHint || cleaned.contains(".m3u8", ignoreCase = true) || MediaSniffer.isDisguisedHlsUrl(cleaned)
             val existing = candidates[key]
-            if (existing == null || (existing.height == null && normH != null)) {
+            if (existing == null || (existing.height == null && normH != null) || (!existing.isHlsHint && effectiveHlsHint)) {
                 candidates[key] = JsUnpacker.ExtractedSource(
                     url = cleaned,
                     label = label.ifBlank { existing?.label.orEmpty() },
                     width = width ?: existing?.width,
-                    height = normH ?: existing?.height
+                    height = normH ?: existing?.height,
+                    isHlsHint = effectiveHlsHint || (existing?.isHlsHint == true)
                 )
             }
         }
 
-        // 1. PlayerJS / JWPlayer / Plyr / Clappr / Video.js sources
+        // 1. PlayerJS / JWPlayer / Plyr / Clappr / Video.js / links={hls2..4} / MDCore.wurl sources
         playerCfg.sources.forEach { src ->
-            addCandidate(src.url, src.label, src.width, src.height)
+            addCandidate(src.url, src.label, src.width, src.height, src.isHlsHint)
         }
 
         // 2. Streamtape robotlink / ideoolink
@@ -544,6 +657,11 @@ class StreamingPortalResolver(
         // 3. Base64 atob() & hex-escaped URLs
         JsUnpacker.decodeObfuscatedUrls(combinedScriptText).forEach { obfUrl ->
             addCandidate(obfUrl, label = "")
+        }
+
+        // 3b. Doodstream /pass_md5/<hash>/<token> dynamic stream token endpoint
+        resolveDoodstreamPassMd5(embedUrl, combinedScriptText, streamHeaders)?.let { doodUrl ->
+            addCandidate(doodUrl, label = serverName.ifBlank { "Doodstream" })
         }
 
         // 4. HTML5 <video>/<source> elements inside the embed DOM
@@ -559,7 +677,7 @@ class StreamingPortalResolver(
             val stripped = JsUnpacker.stripAdFields(combinedScriptText)
                 .replace("\\/", "/")
                 .replace("\\u002F", "/", ignoreCase = true)
-            m3u8Regex.findAll(stripped).take(3).forEach { addCandidate(it.value) }
+            m3u8Regex.findAll(stripped).take(3).forEach { addCandidate(it.value, isHlsHint = true) }
             mpdRegex.findAll(stripped).take(2).forEach { addCandidate(it.value) }
             directVideoRegex.findAll(stripped).take(4).forEach { addCandidate(it.value) }
         }
@@ -579,6 +697,10 @@ class StreamingPortalResolver(
                 }
             }.awaitAll().flatten()
 
+            com.melmeligy.mediadownloader.core.AppLogger.d(
+                "Portal",
+                "Hop depth=$depth host=${UrlUtils.host(embedUrl)} candidates=${candidates.size} verified=${resolvedStreams.size}"
+            )
             if (resolvedStreams.isNotEmpty()) {
                 return@coroutineScope PortalExtractionResult(
                     streams = resolvedStreams,
@@ -681,7 +803,10 @@ class StreamingPortalResolver(
             if (serverName.isNotBlank()) put("X-Internal-Server-Name", serverName)
         }
 
-        if (url.contains(".m3u8", ignoreCase = true)) {
+        val isHlsCandidate = url.contains(".m3u8", ignoreCase = true) ||
+            cand.isHlsHint ||
+            MediaSniffer.isDisguisedHlsUrl(url)
+        if (isHlsCandidate) {
             val expanded = runCatching {
                 hlsExtractor.extractVerified(url, taggedHeaders, cand.height)
             }.getOrNull()
@@ -694,7 +819,11 @@ class StreamingPortalResolver(
                     )
                 }
             }
-            return emptyList()
+            // Disguised .txt / extensionless HLS candidates must never fall through to progressive probe
+            val ext = UrlUtils.fileExtension(url)?.lowercase()
+            if (url.contains(".m3u8", ignoreCase = true) || ext == "txt" || ext.isNullOrEmpty() || MediaSniffer.isDisguisedHlsUrl(url)) {
+                return emptyList()
+            }
         }
 
         if (url.contains(".mpd", ignoreCase = true)) {
@@ -772,7 +901,9 @@ class StreamingPortalResolver(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
-                if (me.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED) continue
+                if (me.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ||
+                    me.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+                ) continue
                 return null
             } catch (_: Exception) {
                 return null
@@ -866,7 +997,44 @@ class StreamingPortalResolver(
     private fun urlEncode(value: String): String =
         URLEncoder.encode(value, StandardCharsets.UTF_8.name())
 
+    /**
+     * Resolves Doodstream's dynamic `/pass_md5/<hash>/<token>` endpoint:
+     * fetches the base media URL with `Referer: embedUrl`, then appends a 10-char random string
+     * plus `?token=<token>&expiry=<epochMs>` matching Doodstream's client-side `makePlay()` script.
+     */
+    internal suspend fun resolveDoodstreamPassMd5(
+        embedUrl: String,
+        scriptText: String,
+        streamHeaders: Map<String, String>
+    ): String? {
+        val passMatch = DOOD_PASS_MD5_REGEX.find(scriptText) ?: return null
+        val passPath = passMatch.groupValues[1]
+        val token = DOOD_TOKEN_REGEX.find(scriptText)?.groupValues?.getOrNull(1)
+            ?: passPath.substringAfterLast('/').takeIf { it.isNotBlank() }
+            ?: return null
+        val passUrl = UrlUtils.resolveUrl(embedUrl, passPath)
+        val passHeaders = LinkedHashMap<String, String>(streamHeaders).apply {
+            put("Referer", embedUrl)
+            put("X-Requested-With", "XMLHttpRequest")
+        }
+        val baseStreamUrl = withTimeoutOrNull(EMBED_HOP_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = EMBED_HOP_TIMEOUT_MS) {
+                runCatching { http.fetchString(passUrl, passHeaders).trim() }.getOrNull()
+            }
+        }?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+            ?: return null
+        val suffixChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        val randomSuffix = buildString(10) {
+            val rnd = java.util.Random()
+            repeat(10) { append(suffixChars[rnd.nextInt(suffixChars.length)]) }
+        }
+        val sep = if (baseStreamUrl.contains("?")) "&" else "?"
+        return "$baseStreamUrl$randomSuffix${sep}token=$token&expiry=${System.currentTimeMillis()}"
+    }
+
     companion object {
+        private val DOOD_PASS_MD5_REGEX = Regex("""['"](/pass_md5/[^'"\s]+)['"]""")
+        private val DOOD_TOKEN_REGEX = Regex("""[?&]token=([A-Za-z0-9_-]+)""")
         const val MAX_EMBED_HOPS = 3
         const val MAX_SERVERS = 8
         const val MAX_CONCURRENT_SERVERS = 6
@@ -874,7 +1042,7 @@ class StreamingPortalResolver(
         const val SERVER_PROBE_TIMEOUT_MS = 4_000L
         const val EMBED_HOP_TIMEOUT_MS = 3_500L
         const val PROGRESSIVE_PROBE_TIMEOUT_MS = 2_200L
-        const val PORTAL_TOTAL_BUDGET_MS = 8_500L
-        const val SIBLING_MERGE_GRACE_MS = 180L
+        const val PORTAL_TOTAL_BUDGET_MS = 5_500L
+        const val SIBLING_MERGE_GRACE_MS = 850L
     }
 }

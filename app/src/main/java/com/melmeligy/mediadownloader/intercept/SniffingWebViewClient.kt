@@ -17,13 +17,19 @@ import android.webkit.WebViewClient
  * `onPageFinished` (to re-arm after single-page-app navigations).
  */
 open class SniffingWebViewClient(
-    private val engine: MediaInterceptionEngine
+    private val engine: MediaInterceptionEngine,
+    private val isSubResourceAdBlockEnabledForPage: (String?) -> Boolean = { true }
 ) : WebViewClient() {
+
+    @Volatile
+    private var lastEmbedIframeUrl: String? = null
+
+    @Volatile
+    private var liveUserAgent: String? = null
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest?): Boolean {
         val url = request?.url?.toString() ?: return false
-        if (!(url.startsWith("http://") || url.startsWith("https://"))) return true
-        if (AdBlocker.isAd(url)) return true
+        if (AdBlocker.shouldBlockPopupOrRedirect(url, engine.currentPageUrl)) return true
         return false
     }
 
@@ -32,7 +38,22 @@ open class SniffingWebViewClient(
         request: WebResourceRequest
     ): WebResourceResponse? {
         val url = request.url.toString()
-        if (!request.isForMainFrame && AdBlocker.isAd(url)) {
+        val accept = request.requestHeaders["Accept"]
+        if (!request.isForMainFrame &&
+            accept?.contains("text/html", ignoreCase = true) == true &&
+            (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) &&
+            !AdBlocker.isAd(url)
+        ) {
+            val pageHost = AdBlocker.normalizeHost(engine.currentPageUrl)
+            val subHost = AdBlocker.normalizeHost(url)
+            if (subHost != null && subHost != pageHost) {
+                lastEmbedIframeUrl = url
+            }
+        }
+        if (!request.isForMainFrame &&
+            isSubResourceAdBlockEnabledForPage(engine.currentPageUrl) &&
+            AdBlocker.shouldBlockSubResource(url)
+        ) {
             return AdBlocker.createEmptyResponse()
         }
         runCatching { sniff(request, url) }
@@ -48,11 +69,12 @@ open class SniffingWebViewClient(
         val type = MediaSniffer.classify(url, accept)
         if (!MediaSniffer.isMedia(type)) return
 
+        val fallbackReferer = lastEmbedIframeUrl ?: engine.currentPageUrl
         engine.submit(
             MediaStreamPayload(
                 url = url,
                 streamType = type,
-                headersMap = HeaderExtractor.fromRequest(request, engine.currentPageUrl),
+                headersMap = HeaderExtractor.fromRequest(request, fallbackReferer, liveUserAgent),
                 pageUrl = engine.currentPageUrl,
                 mimeType = accept
             )
@@ -60,12 +82,15 @@ open class SniffingWebViewClient(
     }
 
     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+        lastEmbedIframeUrl = null
+        runCatching { liveUserAgent = view.settings?.userAgentString?.takeIf { it.isNotBlank() } }
         engine.onPageChanged(url, view.title)
         super.onPageStarted(view, url, favicon)
         injectBridge(view)
     }
 
     override fun onPageFinished(view: WebView, url: String?) {
+        runCatching { liveUserAgent = view.settings?.userAgentString?.takeIf { it.isNotBlank() } }
         engine.onPageChanged(url, view.title)
         super.onPageFinished(view, url)
         injectBridge(view)

@@ -320,7 +320,7 @@ class HlsSegmentDownloader @Inject constructor(
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
         } catch (e: MediaException) {
-            if (e.error != AppError.GEO_BLOCKED) throw e
+            if (e.error != AppError.ACCESS_DENIED && e.error != AppError.GEO_BLOCKED) throw e
             for (alt in ExtractorHttp.buildRelaxedHeaderVariants(primaryHeaders, includeBareNoReferer = true)) {
                 val text = try {
                     http.fetchString(url, alt)
@@ -329,8 +329,8 @@ class HlsSegmentDownloader @Inject constructor(
                 } catch (_: Exception) {
                     null
                 }
-                if (!text.isNullOrBlank() && text.contains("#EXTM3U")) {
-                    return text to alt
+                if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
+                    return text!! to alt
                 }
             }
             throw e
@@ -375,8 +375,8 @@ class HlsSegmentDownloader @Inject constructor(
                         throw SegmentHttpException(response.code, http.mapHttpError(response.code), retryAfterMs)
                     }
                     val ct = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-                    if (ct.startsWith("text/html") || ct.startsWith("application/xhtml")) {
-                        throw MediaException(AppError.EXPIRED_LINK, "HLS segment returned HTML instead of media")
+                    if (ct.startsWith("text/html") || ct.startsWith("application/xhtml") || ct.startsWith("application/json")) {
+                        throw MediaException(AppError.EXPIRED_LINK, "HLS segment returned HTML/JSON instead of media")
                     }
                     val body = response.body ?: throw MediaException(AppError.GENERIC, "Empty segment")
                     val serverIgnoredRange = rangeLen != null && rangeLen > 0L && response.code == 200
@@ -402,11 +402,18 @@ class HlsSegmentDownloader @Inject constructor(
                                 boundedInput
                             }
 
+                            var checkedSignature = false
                             effectiveInput.use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
                                     val read = input.read(buffer)
                                     if (read == -1) break
+                                    if (!checkedSignature) {
+                                        checkedSignature = true
+                                        if (!isValidSegmentPrefix(buffer, read, ct, isAesEncrypted = keyBytes != null)) {
+                                            throw MediaException(AppError.EXPIRED_LINK, "HLS segment returned HTML/JSON error page")
+                                        }
+                                    }
                                     output.write(buffer, 0, read)
                                     attemptBytes += read
                                     written.addAndGet(read.toLong())
@@ -444,7 +451,11 @@ class HlsSegmentDownloader @Inject constructor(
                 currentCoroutineContext().ensureActive()
                 if (attemptBytes > 0) written.addAndGet(-attemptBytes)
                 runCatching { File(partFile.parentFile, "${partFile.name}.tmp").delete() }
-                if (e.error == AppError.GEO_BLOCKED || e.error == AppError.NO_MEDIA_FOUND || e.error == AppError.EXPIRED_LINK) {
+                if (e.error == AppError.ACCESS_DENIED ||
+                    e.error == AppError.GEO_BLOCKED ||
+                    e.error == AppError.NO_MEDIA_FOUND ||
+                    e.error == AppError.EXPIRED_LINK
+                ) {
                     throw e
                 }
                 if (attempt >= maxRetries) throw e
@@ -555,8 +566,82 @@ class HlsSegmentDownloader @Inject constructor(
         discontinuityBlock = discontinuityBlock
     )
 
-    private companion object {
-        const val CONCURRENT_SEGMENTS = 5
-        const val AES_128_KEY_SIZE = 16
+    companion object {
+        private const val CONCURRENT_SEGMENTS = 5
+        private const val AES_128_KEY_SIZE = 16
+
+        /**
+         * Validates the leading bytes of an HLS segment so disguised `image/` or `text/plain`
+         * MPEG-TS (`0x47`), fMP4 (`ftyp`/`moof`/`styp`), and decrypted AES-128 segments are
+         * accepted while HTML (`<!doctype`, `<html`) and JSON (`{`, `[`) error pages are rejected.
+         */
+        internal fun isValidSegmentPrefix(
+            bytes: ByteArray,
+            length: Int,
+            contentType: String,
+            isAesEncrypted: Boolean
+        ): Boolean {
+            if (length <= 0) return false
+            val sampleLen = minOf(length, 64)
+            // 1. Check ASCII prefix for HTML / JSON error pages (skipping leading whitespace / BOM)
+            var idx = 0
+            if (sampleLen >= 3 &&
+                (bytes[0].toInt() and 0xFF) == 0xEF &&
+                (bytes[1].toInt() and 0xFF) == 0xBB &&
+                (bytes[2].toInt() and 0xFF) == 0xBF
+            ) {
+                idx = 3
+            }
+            while (idx < sampleLen && bytes[idx].toInt().let { it == ' '.code || it == '\t'.code || it == '\r'.code || it == '\n'.code }) {
+                idx++
+            }
+            if (idx < sampleLen) {
+                val headText = String(bytes, idx, sampleLen - idx, Charsets.ISO_8859_1).lowercase()
+                if (headText.startsWith("<!doctype") ||
+                    headText.startsWith("<html") ||
+                    headText.startsWith("<head") ||
+                    headText.startsWith("<body") ||
+                    headText.startsWith("<script") ||
+                    headText.startsWith("<?xml")
+                ) {
+                    return false
+                }
+                if ((headText.startsWith("{") || headText.startsWith("[")) &&
+                    (headText.contains("\"error\"") || headText.contains("\"message\"") || headText.contains("\"status\"") || headText.contains("\"code\""))
+                ) {
+                    return false
+                }
+            }
+
+            // 2. If content-type is disguised (image/* or text/plain), verify binary media signature
+            val ct = contentType.lowercase()
+            if (ct.startsWith("image/") || ct.startsWith("text/plain")) {
+                // MPEG-TS sync byte (0x47 at offset 0 or after a small disguised PNG/GIF/JPEG wrapper header)
+                val tsSyncFound = (bytes[0].toInt() and 0xFF) == 0x47 ||
+                    (0 until minOf(length, 32)).any { off ->
+                        (bytes[off].toInt() and 0xFF) == 0x47 &&
+                            (off + 188 >= length || (bytes[off + 188].toInt() and 0xFF) == 0x47)
+                    }
+                if (tsSyncFound) return true
+
+                // fMP4 box signature at bytes 4..7 (ftyp, moof, styp, sidx, mdat)
+                if (length >= 8) {
+                    val box = String(bytes, 4, 4, Charsets.ISO_8859_1)
+                    if (box == "ftyp" || box == "moof" || box == "styp" || box == "sidx" || box == "mdat") {
+                        return true
+                    }
+                }
+
+                // Decrypted AES-128 segments or ID3-prefixed AAC/TS segments
+                if (isAesEncrypted) return true
+                if (length >= 3 && bytes[0] == 'I'.code.toByte() && bytes[1] == 'D'.code.toByte() && bytes[2] == '3'.code.toByte()) {
+                    return true
+                }
+                // Reject plain ASCII text error pages served as text/plain
+                if (ct.startsWith("text/plain")) return false
+            }
+
+            return true
+        }
     }
 }

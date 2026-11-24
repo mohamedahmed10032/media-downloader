@@ -14,6 +14,8 @@ fun AppError.asMessage(): String = stringResource(
         AppError.NO_MEDIA_FOUND -> R.string.error_no_media_found
         AppError.UNSUPPORTED_SITE -> R.string.error_unsupported_site
         AppError.GEO_BLOCKED -> R.string.error_geo_blocked
+        AppError.ACCESS_DENIED -> R.string.error_access_denied
+        AppError.SERVER_ERROR -> R.string.error_server_error
         AppError.EXPIRED_LINK -> R.string.error_expired_link
         AppError.INSUFFICIENT_STORAGE -> R.string.error_insufficient_storage
         AppError.GENERIC -> R.string.error_generic

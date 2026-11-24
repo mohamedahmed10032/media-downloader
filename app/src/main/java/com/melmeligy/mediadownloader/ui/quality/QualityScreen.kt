@@ -231,6 +231,7 @@ fun ChooseFormatStateContent(
                 message = state.error.asMessage(),
                 icon = Icons.Rounded.SearchOff,
                 modifier = Modifier.fillMaxWidth(),
+                detail = state.detail,
                 onRetry = onRetry
             )
             if (onOpenInBrowser != null && shouldShowOpenInBrowserOnError(state.error, url, hasOpenInBrowserCallback = true)) {
@@ -880,13 +881,13 @@ internal fun prepareSnaptubeStreams(
     // and deduplicate streams that resolve to the exact same URL or identical byte size.
     val seenVideoUrls = HashSet<String>()
     val seenVideoSizes = HashSet<Long>()
-    val rawVideos = resolved.streams
+    val filteredRawVideos = resolved.streams
         .filter { it.type == MediaType.VIDEO }
         .distinctBy { it.id }
-        .sortedWith(
-            compareBy<MediaStream> { it.height ?: Int.MAX_VALUE }
-                .thenBy { it.sizeBytes ?: Long.MAX_VALUE }
-        )
+        .map { v ->
+            val normH = FormatUtils.normalizeQualityHeight(v.width, v.height)
+            if (normH != null && normH != v.height) v.copy(height = normH) else v
+        }
         .filter { v ->
             val cleanUrlKey = com.melmeligy.mediadownloader.intercept.MediaSniffer.dedupeKey(v.url)
             if (!seenVideoUrls.add(cleanUrlKey)) return@filter false
@@ -896,6 +897,26 @@ internal fun prepareSnaptubeStreams(
             }
             true
         }
+    // Deduplicate variants that snap to the same standard quality tier, keeping higher bitrate/width/size
+    val dedupedByTier = filteredRawVideos
+        .groupBy { it.height }
+        .flatMap { (tier, group) ->
+            if (tier == null || group.size <= 1) {
+                group
+            } else {
+                val best = group.maxWithOrNull(
+                    compareBy<MediaStream> { it.bitrateKbps ?: 0 }
+                        .thenBy { it.width ?: 0 }
+                        .thenBy { it.sizeBytes ?: 0L }
+                )
+                listOfNotNull(best)
+            }
+        }
+    val rawVideos = dedupedByTier
+        .sortedWith(
+            compareBy<MediaStream> { it.height ?: Int.MAX_VALUE }
+                .thenBy { it.sizeBytes ?: Long.MAX_VALUE }
+        )
         .map { v ->
             val h = v.height
             val normalizedLabel = when {
@@ -906,9 +927,11 @@ internal fun prepareSnaptubeStreams(
                 h != null && h == 480 -> "480p"
                 h != null && h <= 360 -> "Fast (${h}p)"
                 h != null -> "${h}p"
-                v.label.startsWith("High quality (") || (v.label.startsWith("Fast (") && v.label.endsWith("p)")) -> v.label
+                v.label.startsWith("High quality (") || (v.label.startsWith("Fast (") && v.label.endsWith("p)")) ->
+                    FormatUtils.normalizeQualityLabel(v.label, v.width, v.height)
                 v.label == "Auto (HLS)" -> "Auto"
-                v.label.isNotBlank() && !v.label.startsWith("Variant") -> v.label
+                v.label.isNotBlank() && !v.label.startsWith("Variant") ->
+                    FormatUtils.normalizeQualityLabel(v.label, v.width, v.height)
                 else -> "Video"
             }
             v.copy(label = normalizedLabel)

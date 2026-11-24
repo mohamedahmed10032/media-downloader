@@ -10,9 +10,34 @@ enum class AppError {
     NO_MEDIA_FOUND,
     UNSUPPORTED_SITE,
     GEO_BLOCKED,
+    ACCESS_DENIED,
+    SERVER_ERROR,
     EXPIRED_LINK,
     INSUFFICIENT_STORAGE,
-    GENERIC
+    GENERIC;
+
+    /** Encodes `CODE|detail` into `downloads.errorType` without requiring a Room schema bump. */
+    fun encodeForStorage(detail: String? = null): String {
+        val cleaned = detail?.trim()
+            ?.replace('\n', ' ')
+            ?.replace('\r', ' ')
+            ?.take(120)
+            ?.takeIf { it.isNotEmpty() && !it.equals(name, ignoreCase = true) }
+        return if (cleaned != null) "$name|$cleaned" else name
+    }
+
+    companion object {
+        /** Decodes either legacy bare `CODE` or `CODE|detail` stored in `downloads.errorType`. */
+        fun decodeFromStorage(raw: String?): Pair<AppError, String?> {
+            val trimmed = raw?.trim().orEmpty()
+            if (trimmed.isEmpty()) return GENERIC to null
+            val pipeIdx = trimmed.indexOf('|')
+            val codePart = if (pipeIdx >= 0) trimmed.substring(0, pipeIdx).trim() else trimmed
+            val detailPart = if (pipeIdx >= 0) trimmed.substring(pipeIdx + 1).trim().takeIf { it.isNotEmpty() } else null
+            val parsed = runCatching { valueOf(codePart) }.getOrDefault(GENERIC)
+            return parsed to detailPart
+        }
+    }
 }
 
 /** Exception carrying a typed [AppError] so it can be mapped to a friendly message. */

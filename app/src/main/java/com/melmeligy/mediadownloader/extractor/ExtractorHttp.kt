@@ -167,6 +167,16 @@ class ExtractorHttp {
             .build()
     }
 
+    private val noRedirectClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .readTimeout(2, TimeUnit.SECONDS)
+            .callTimeout(2200, TimeUnit.MILLISECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+    }
+
     @Inject
     constructor(client: OkHttpClient, service: RawContentService) {
         this.client = client
@@ -426,6 +436,53 @@ class ExtractorHttp {
     }
 
     /**
+     * Single-hop redirect resolver (`followRedirects = false`) that reads ONLY the `Location`
+     * response header via `HEAD` (falling back to ranged `GET` `bytes=0-0` on HTTP 405) with
+     * zero response-body download. Returns `null` if [url] did not return a 3xx redirect.
+     */
+    fun resolveRedirectLocation(url: String, headers: Map<String, String> = emptyMap()): String? {
+        val safeUrl = UrlUtils.encodeNonAsciiUrl(url.trim())
+        val effectiveClient = clientWithScopedTimeout(noRedirectClient)
+        val headReq = buildRequest(safeUrl, headers)
+            .header("X-Internal-Download", "true")
+            .head()
+            .build()
+        return try {
+            executeTracked(effectiveClient, headReq) { response ->
+                val loc = response.header("Location")?.trim()
+                if (response.code in 300..399 && !loc.isNullOrBlank()) {
+                    return@executeTracked UrlUtils.resolveUrl(safeUrl, loc)
+                }
+                val finalReqUrl = response.request.url.toString()
+                if (finalReqUrl.isNotBlank() && finalReqUrl != safeUrl && finalReqUrl != url.trim()) {
+                    return@executeTracked finalReqUrl
+                }
+                if (response.code == 405) {
+                    val getReq = buildRequest(safeUrl, headers)
+                        .header("Range", "bytes=0-0")
+                        .header("X-Internal-Download", "true")
+                        .get()
+                        .build()
+                    return@executeTracked executeTracked(effectiveClient, getReq) { getResp ->
+                        val getLoc = getResp.header("Location")?.trim()
+                        if (getResp.code in 300..399 && !getLoc.isNullOrBlank()) {
+                            UrlUtils.resolveUrl(safeUrl, getLoc)
+                        } else {
+                            val getFinal = getResp.request.url.toString()
+                            if (getFinal.isNotBlank() && getFinal != safeUrl && getFinal != url.trim()) getFinal else null
+                        }
+                    }
+                }
+                null
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * Resolves HTTP redirects for short links (e.g. `pin.it`, `t.co`, `fb.watch`) via a standard
      * GET request without downloading the body, falling back to [url] on error.
      */
@@ -570,9 +627,10 @@ class ExtractorHttp {
     }
 
     fun mapHttpError(code: Int): MediaException = when (code) {
-        401, 403 -> MediaException(AppError.GEO_BLOCKED, "HTTP $code")
+        401, 403 -> MediaException(AppError.ACCESS_DENIED, "HTTP $code")
         404 -> MediaException(AppError.NO_MEDIA_FOUND, "HTTP $code")
         410 -> MediaException(AppError.EXPIRED_LINK, "HTTP $code")
+        429, in 500..599 -> MediaException(AppError.SERVER_ERROR, "HTTP $code")
         else -> MediaException(AppError.GENERIC, "HTTP $code")
     }
 

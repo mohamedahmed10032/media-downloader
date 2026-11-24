@@ -104,13 +104,53 @@ class HtmlMediaExtractor @Inject constructor(
     override suspend fun extract(url: String): ResolvedMedia? =
         extractWithHeaders(url, emptyMap(), allowHeadlessFallback = true)
 
+    internal var cookieProvider: (String) -> String? = { target ->
+        runCatching { CookieManager.getInstance().getCookie(target) }.getOrNull()
+    }
+    internal var clockMs: () -> Long = { System.currentTimeMillis() }
+
     suspend fun extractWithHeaders(
         url: String,
         customHeaders: Map<String, String> = emptyMap(),
         allowHeadlessFallback: Boolean = true
     ): ResolvedMedia? = withContext(Dispatchers.IO) {
         progressTracker.update(ExtractionProgressTracker.STAGE_FETCHING)
+        val host = UrlUtils.host(url)?.lowercase().orEmpty()
+        com.melmeligy.mediadownloader.core.AppLogger.d("HtmlExtractor", "Stage 1 fetch start host=$host")
         val pageHeaders = buildPageHeaders(url, customHeaders)
+        val hasCfClearance = pageHeaders["Cookie"].orEmpty().contains("cf_clearance=", ignoreCase = true)
+        if (hasCfClearance && host.isNotEmpty()) {
+            clearCloudflareChallengeHint(host)
+        }
+
+        // Short-TTL Cloudflare fast-skip: if this host just returned HTTP 403 (cf-mitigated) and
+        // CookieManager has no cf_clearance yet, jump straight to HeadlessWebExtractor instead of
+        // wasting time on another blocked plain-HTTP fetch.
+        if (allowHeadlessFallback && host.isNotEmpty() && !hasCfClearance && isCloudflareChallengeHintActive(host)) {
+            com.melmeligy.mediadownloader.core.AppLogger.d(
+                "HtmlExtractor",
+                "Skipping blocked static fetch for host=$host (active CF challenge hint, no cf_clearance)"
+            )
+            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            val headlessResult = try {
+                headlessWebExtractor.extract(url)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (cookieProvider(url).orEmpty().contains("cf_clearance=", ignoreCase = true)) {
+                clearCloudflareChallengeHint(host)
+            }
+            if (headlessResult == null && progressTracker.peekDiagnosticReason().isNullOrBlank()) {
+                progressTracker.setDiagnosticReason(
+                    "Site blocked direct access (Cloudflare / HTTP 403) — open in browser to load the player."
+                )
+            }
+            return@withContext headlessResult
+        }
+
+        var staticFetchFailureNote: String? = null
         val html = try {
             withTimeoutOrNull(INITIAL_PAGE_TIMEOUT_MS) {
                 withCancellableHttpCalls(timeoutMs = INITIAL_PAGE_TIMEOUT_MS) {
@@ -119,20 +159,48 @@ class HtmlMediaExtractor @Inject constructor(
             }.orEmpty()
         } catch (ce: CancellationException) {
             throw ce
+        } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
+            if (me.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED && host.isNotEmpty() && !hasCfClearance) {
+                markCloudflareChallengeHint(host)
+            }
+            staticFetchFailureNote = when (me.error) {
+                com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ->
+                    "Site blocked direct access (Cloudflare / HTTP 403) — open in browser to load the player."
+                com.melmeligy.mediadownloader.core.AppError.SERVER_ERROR ->
+                    "Site returned a temporary server error — try again or open in browser."
+                else -> me.message?.takeIf { it.isNotBlank() && it != me.error.name }
+            }
+            ""
         } catch (_: Exception) {
             ""
         }
         if (html.isBlank()) {
-            return@withContext if (allowHeadlessFallback) {
-                progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
-                try {
-                    headlessWebExtractor.extract(url)
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                    null
+            com.melmeligy.mediadownloader.core.AppLogger.d(
+                "HtmlExtractor",
+                "Stage 1 static fetch empty host=$host headlessFallback=$allowHeadlessFallback note=$staticFetchFailureNote"
+            )
+            if (!allowHeadlessFallback) {
+                staticFetchFailureNote?.let { progressTracker.setDiagnosticReason(it) }
+                return@withContext null
+            }
+            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            val headlessResult = try {
+                headlessWebExtractor.extract(url)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (host.isNotEmpty() && cookieProvider(url).orEmpty().contains("cf_clearance=", ignoreCase = true)) {
+                clearCloudflareChallengeHint(host)
+            }
+            if (headlessResult == null && staticFetchFailureNote != null) {
+                val existingDiag = progressTracker.peekDiagnosticReason()
+                if (existingDiag.isNullOrBlank() || existingDiag.startsWith("Page loaded without")) {
+                    progressTracker.setDiagnosticReason(staticFetchFailureNote)
                 }
-            } else null
+            }
+            return@withContext headlessResult
         }
 
         val parsed = parseHtml(
@@ -144,11 +212,16 @@ class HtmlMediaExtractor @Inject constructor(
         val hasVideoOrAudio = parsed?.streams?.any {
             it.type == MediaType.VIDEO || it.type == MediaType.AUDIO
         } == true
+        com.melmeligy.mediadownloader.core.AppLogger.d(
+            "HtmlExtractor",
+            "Stage 1 static parse host=${UrlUtils.host(url)} streams=${parsed?.streams?.size ?: 0} hasVideoOrAudio=$hasVideoOrAudio"
+        )
         if (parsed != null && hasVideoOrAudio) {
             return@withContext parsed
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            com.melmeligy.mediadownloader.core.AppLogger.d("HtmlExtractor", "Stage 2 headless fallback start host=${UrlUtils.host(url)}")
             val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
             val fallbackTitle = parsed?.title?.takeIf {
                 !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
@@ -173,11 +246,19 @@ class HtmlMediaExtractor @Inject constructor(
                     headless.title
                 }
                 val mergedThumb = headless.thumbnailUrl?.takeIf { it.isNotBlank() } ?: fallbackThumb
+                com.melmeligy.mediadownloader.core.AppLogger.d(
+                    "HtmlExtractor",
+                    "Stage 2 headless succeeded host=${UrlUtils.host(url)} streams=${headless.streams.size}"
+                )
                 return@withContext headless.copy(
                     title = mergedTitle,
                     thumbnailUrl = mergedThumb
                 )
             }
+            com.melmeligy.mediadownloader.core.AppLogger.w(
+                "HtmlExtractor",
+                "Stage 2 headless returned no playable streams host=${UrlUtils.host(url)} reason=${progressTracker.peekDiagnosticReason()}"
+            )
         }
         parsed?.takeIf { it.streams.isNotEmpty() }
     }
@@ -1447,24 +1528,40 @@ class HtmlMediaExtractor @Inject constructor(
         return false
     }
 
-    private fun buildPageHeaders(url: String, customHeaders: Map<String, String>): Map<String, String> {
+    internal fun buildPageHeaders(url: String, customHeaders: Map<String, String>): Map<String, String> {
         val merged = LinkedHashMap<String, String>()
+        merged["User-Agent"] = HeadlessWebExtractor.lastWebViewUserAgent
         merged["Referer"] = url
-        runCatching {
-            val uri = java.net.URI(UrlUtils.encodeNonAsciiUrl(url))
-            val scheme = uri.scheme
-            val host = uri.host
-            if (!scheme.isNullOrBlank() && !host.isNullOrBlank()) {
-                merged["Origin"] = if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
-            }
-        }
-        runCatching {
-            CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() }?.let {
-                merged["Cookie"] = it
-            }
+        cookieProvider(url)?.takeIf { it.isNotBlank() }?.let {
+            merged["Cookie"] = it
         }
         merged.putAll(customHeaders)
         return merged
+    }
+
+    internal fun markCloudflareChallengeHint(host: String) {
+        val key = host.trim().lowercase().removePrefix("www.")
+        if (key.isNotEmpty()) {
+            cfChallengeHints[key] = clockMs() + CF_HINT_TTL_MS
+        }
+    }
+
+    internal fun clearCloudflareChallengeHint(host: String) {
+        val key = host.trim().lowercase().removePrefix("www.")
+        if (key.isNotEmpty()) {
+            cfChallengeHints.remove(key)
+        }
+    }
+
+    internal fun isCloudflareChallengeHintActive(host: String): Boolean {
+        val key = host.trim().lowercase().removePrefix("www.")
+        if (key.isEmpty()) return false
+        val expiresAt = cfChallengeHints[key] ?: return false
+        if (clockMs() >= expiresAt) {
+            cfChallengeHints.remove(key, expiresAt)
+            return false
+        }
+        return true
     }
 
     private fun qualityAttr(el: Element, fallback: String): String {
@@ -1519,10 +1616,16 @@ class HtmlMediaExtractor @Inject constructor(
         MediaType.IMAGE -> "Image"
     }
 
-    private companion object {
-        const val MAX_SIZE_PROBES = 10
-        const val INITIAL_PAGE_TIMEOUT_MS = 6_000L
-        const val IFRAME_FALLBACK_TIMEOUT_MS = 3_500L
-        const val DIRECT_PROBE_TIMEOUT_MS = 2_000L
+    companion object {
+        private const val MAX_SIZE_PROBES = 10
+        private const val INITIAL_PAGE_TIMEOUT_MS = 6_000L
+        private const val IFRAME_FALLBACK_TIMEOUT_MS = 3_500L
+        private const val DIRECT_PROBE_TIMEOUT_MS = 2_000L
+        internal const val CF_HINT_TTL_MS = 180_000L
+        private val cfChallengeHints = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+        internal fun clearAllCloudflareHintsForTests() {
+            cfChallengeHints.clear()
+        }
     }
 }

@@ -655,13 +655,7 @@ fun NeutralSheetLoadingSkeleton(
             ),
             color = MaterialTheme.colorScheme.onSurface
         )
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "Fetching available formats…",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
         androidx.compose.material3.LinearProgressIndicator(
             modifier = Modifier
                 .fillMaxWidth()

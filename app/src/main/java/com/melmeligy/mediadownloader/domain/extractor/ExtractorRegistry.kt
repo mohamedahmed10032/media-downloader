@@ -126,6 +126,20 @@ class ExtractorRegistry @Inject constructor(
         }
     }
 
+    /** Synchronous cache lookup so UI sheets can render cached results with zero skeleton flash. */
+    fun peekCached(rawUrl: String): ResolvedMedia? {
+        val url = UrlUtils.normalize(rawUrl) ?: return null
+        val cached = cache[url] ?: return null
+        val now = clockMs()
+        if (now - cached.cachedAtMs >= cacheTtlMs) {
+            cache.remove(url, cached)
+            return null
+        }
+        val hasFreshIntercepted = !cached.usedIntercepted &&
+            extractors.any { it.priority >= INTERCEPTED_PRIORITY_THRESHOLD && it.canHandle(url) }
+        return if (hasFreshIntercepted) null else cached.media
+    }
+
     /** Removes any cached result for [rawUrl] (used on explicit user Retry or fresh browser capture). */
     fun invalidate(rawUrl: String) {
         val trimmed = rawUrl.trim()
@@ -145,7 +159,7 @@ class ExtractorRegistry @Inject constructor(
             key = key,
             media = media,
             now = now,
-            usedIntercepted = prev?.usedIntercepted ?: (media.extractor == "Live Stream")
+            usedIntercepted = prev?.usedIntercepted ?: (media.extractor == "Browser Stream" || media.extractor == "Live Stream")
         )
     }
 
@@ -223,10 +237,14 @@ class ExtractorRegistry @Inject constructor(
             throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
         }
 
+        val isExtensionlessWebPage = UrlUtils.fileExtension(url) == null &&
+            willing.any { it.name.equals("Web page", ignoreCase = true) }
+
         val fallback = extractors.filterNot { it.canHandle(url) }.sortedByDescending { it.priority }
         for (extractor in fallback) {
             currentCoroutineContext().ensureActive()
             if (isConfirmedHtml(url)) break
+            if (isExtensionlessWebPage && isDirectOrManifestExtractor(extractor.name)) continue
             try {
                 val result = extractor.extract(url)
                 if (result != null && (result.streams.isNotEmpty() || result.gallerySlides.isNotEmpty())) {
@@ -250,6 +268,11 @@ class ExtractorRegistry @Inject constructor(
         }
 
         throw lastError ?: MediaException(AppError.NO_MEDIA_FOUND)
+    }
+
+    private fun isDirectOrManifestExtractor(extractorName: String): Boolean {
+        val lower = extractorName.lowercase()
+        return lower.contains("hls") || lower.contains("dash") || lower.contains("direct")
     }
 
     private fun preferMoreSpecific(current: MediaException?, candidate: MediaException): MediaException {

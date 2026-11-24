@@ -76,10 +76,10 @@ class SegmentedDownloader @Inject constructor(
         }
 
         val cdnLimit = extractCdnConnectionLimit(url)
-        val effectiveSegments = if (cdnLimit != null) {
-            minOf(segmentCount, cdnLimit)
-        } else {
-            segmentCount
+        val effectiveSegments = when {
+            isTokenizedSingleStreamUrl(url) -> 1
+            cdnLimit != null -> minOf(segmentCount, cdnLimit)
+            else -> segmentCount
         }
 
         val canSegment = ranged && total >= Constants.MIN_SEGMENT_SIZE_BYTES && effectiveSegments > 1
@@ -160,7 +160,7 @@ class SegmentedDownloader @Inject constructor(
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (e: MediaException) {
-                if (e.error == AppError.GEO_BLOCKED) {
+                if (e.error == AppError.ACCESS_DENIED || e.error == AppError.GEO_BLOCKED) {
                     lastPermanent = e
                     continue
                 }
@@ -169,8 +169,12 @@ class SegmentedDownloader @Inject constructor(
             } catch (_: Exception) {
                 return@withContext null
             }
-            if (info.code == 401 || info.code == 403) {
+            if (info.code == 401 || info.code == 403 || info.code == 416 || info.code == 429 || info.code == 503) {
                 lastPermanent = http.mapHttpError(info.code)
+                continue
+            }
+            if (ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
+                lastPermanent = MediaException(AppError.EXPIRED_LINK, "Media URL returned non-media content (${info.contentType})")
                 continue
             }
             return@withContext info to hdrs
@@ -357,7 +361,14 @@ class SegmentedDownloader @Inject constructor(
                     throw ce
                 } catch (e: MediaException) {
                     currentCoroutineContext().ensureActive()
-                    if (e.error == AppError.GEO_BLOCKED && relaxedHeaderQueue.isNotEmpty()) {
+                    val canRelaxHeaders = relaxedHeaderQueue.isNotEmpty() && (
+                        e.error == AppError.ACCESS_DENIED ||
+                            e.error == AppError.GEO_BLOCKED ||
+                            e.error == AppError.SERVER_ERROR ||
+                            (e.error == AppError.EXPIRED_LINK && downloaded.get() == 0L) ||
+                            (e.message?.contains("416") == true && downloaded.get() == 0L)
+                        )
+                    if (canRelaxHeaders) {
                         activeHeaders = relaxedHeaderQueue.removeFirst()
                         continue
                     }
@@ -421,16 +432,40 @@ class SegmentedDownloader @Inject constructor(
     }
 
     private fun isPermanentError(error: AppError): Boolean =
-        error == AppError.GEO_BLOCKED || error == AppError.NO_MEDIA_FOUND || error == AppError.EXPIRED_LINK
+        error == AppError.ACCESS_DENIED ||
+            error == AppError.GEO_BLOCKED ||
+            error == AppError.NO_MEDIA_FOUND ||
+            error == AppError.EXPIRED_LINK
 
     internal fun extractCdnConnectionLimit(url: String): Int? {
         val m = CDN_LIMIT_REGEX.find(url) ?: return null
         return m.groupValues[1].toIntOrNull()?.takeIf { it > 0 }
     }
 
-    private companion object {
-        const val GOOGLE_VIDEO_CHUNK_BYTES = 9_437_184L // 9 MB per ranged request to prevent YouTube CDN throttling
-        const val MAX_IDX_BYTES = 16_384L
-        val CDN_LIMIT_REGEX = Regex("""(?:[?&/,;])limit=(\d+)(?:[&#/,;]|$)""", RegexOption.IGNORE_CASE)
+    companion object {
+        private const val GOOGLE_VIDEO_CHUNK_BYTES = 9_437_184L // 9 MB per ranged request to prevent YouTube CDN throttling
+        private const val MAX_IDX_BYTES = 16_384L
+        private val CDN_LIMIT_REGEX = Regex("""(?:[?&/,;])limit=(\d+)(?:[&#/,;]|$)""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Tokenized movie-mirror URLs (`/get_video`, `/d/`, `token=`) commonly reject parallel
+         * Range connections with HTTP 403/503; default them to single-stream while keeping
+         * multi-segment downloads enabled for YouTube and social CDNs.
+         */
+        internal fun isTokenizedSingleStreamUrl(url: String): Boolean {
+            val lower = url.lowercase()
+            if (lower.contains("googlevideo.com") ||
+                lower.contains("tiktokcdn") ||
+                lower.contains("fbcdn.net") ||
+                lower.contains("cdninstagram.com") ||
+                lower.contains("twimg.com") ||
+                lower.contains("redd.it")
+            ) {
+                return false
+            }
+            return lower.contains("/get_video") ||
+                lower.contains("/d/") ||
+                lower.contains("token=")
+        }
     }
 }

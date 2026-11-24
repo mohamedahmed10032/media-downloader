@@ -362,7 +362,7 @@ class PromptSitesExtractionTest {
             assertEquals("Clean Multi-Quality XV/XNXX Video", resolved.title)
 
             val heights = resolved.streams.filter { it.type == MediaType.VIDEO }.map { it.height }
-            assertEquals("Expected all 6 heights on $domain", listOf(1080, 720, 480, 360, 250, 240), heights)
+            assertEquals("Expected normalized standard heights on $domain", listOf(1080, 720, 480, 360, 240), heights)
             assertTrue(resolved.streams.none { it.url.contains("videopreview") || it.url.contains("rel1") || it.url.contains("rel2") })
         }
     }

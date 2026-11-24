@@ -83,7 +83,9 @@ class HlsExtractor @Inject constructor(
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
         } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
-            if (!allowRelaxedFallback || e.error != com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED) {
+            val isAuthBlocked = e.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ||
+                e.error == com.melmeligy.mediadownloader.core.AppError.GEO_BLOCKED
+            if (!allowRelaxedFallback || !isAuthBlocked) {
                 if (allowRelaxedFallback) return null
                 throw e
             }
@@ -99,8 +101,8 @@ class HlsExtractor @Inject constructor(
             } catch (_: Exception) {
                 null
             }
-            if (!text.isNullOrBlank() && text.contains("#EXTM3U")) {
-                return text to alt
+            if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
+                return text!! to alt
             }
         }
         return null
@@ -109,7 +111,7 @@ class HlsExtractor @Inject constructor(
     private suspend fun verifySegmentDownloadable(
         segmentUrl: String,
         headers: Map<String, String>
-    ): Map<String, String>? {
+    ): Pair<Map<String, String>, HeadInfo>? {
         val candidates = listOf(headers) + ExtractorHttp.buildRelaxedHeaderVariants(headers, includeBareNoReferer = true)
         for (hdrs in candidates) {
             val info = withTimeoutOrNull(SEGMENT_PROBE_TIMEOUT_MS + 250L) {
@@ -117,8 +119,13 @@ class HlsExtractor @Inject constructor(
                     runCatching { http.probe(segmentUrl, hdrs, SEGMENT_PROBE_TIMEOUT_MS) }.getOrNull()
                 }
             } ?: continue
-            if (info.code in 200..299 && !ExtractorHttp.isRejectedMediaContentType(info.contentType)) {
-                return hdrs
+            val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            // Disguised HLS segments frequently return image/* or text/plain; only reject HTML/JSON error pages here.
+            val isHtmlOrJson = ct.startsWith("text/html") ||
+                ct.startsWith("application/xhtml") ||
+                ct.startsWith("application/json")
+            if (info.code in 200..299 && !isHtmlOrJson) {
+                return hdrs to info
             }
             // Only continue relaxing headers on 401/403; 404/410/5xx means the segment itself is dead
             if (info.code != 401 && info.code != 403) {
@@ -139,7 +146,7 @@ class HlsExtractor @Inject constructor(
             ?: return null
         val text = fetched.first
         var effectiveHeaders = fetched.second
-        if (!text.contains("#EXTM3U")) return null
+        if (!com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) return null
 
         val streams = mutableListOf<MediaStream>()
 
@@ -199,7 +206,7 @@ class HlsExtractor @Inject constructor(
                         )
                     }
                 }
-                if (fetchedVar != null && fetchedVar.first.contains("#EXTM3U")) {
+                if (fetchedVar != null && com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(fetchedVar.first)) {
                     probedVariant = candidateVar
                     variantText = fetchedVar.first
                     effectiveHeaders = fetchedVar.second
@@ -215,13 +222,16 @@ class HlsExtractor @Inject constructor(
                 return null
             }
 
+            var verifiedSegProbe: Pair<HlsParsedSegment, HeadInfo>? = null
             if (verifyDownloadable) {
                 val mediaSegs = sanitizedFirstVariant?.segments?.filter { !it.isInitMap }.orEmpty()
                 if (mediaSegs.isEmpty()) return null
-                // Verify an actual segment is fetchable with HTTP 200/206 non-HTML media before winning the race
-                val verifiedHeaders = verifySegmentDownloadable(mediaSegs.first().url, effectiveHeaders)
+                // Verify an interior segment (when available) so the single probe also calibrates bitrate
+                val probeSeg = if (mediaSegs.size >= 3) mediaSegs[mediaSegs.size / 2] else mediaSegs.first()
+                val (verifiedHeaders, headInfo) = verifySegmentDownloadable(probeSeg.url, effectiveHeaders)
                     ?: return null
                 effectiveHeaders = verifiedHeaders
+                verifiedSegProbe = probeSeg to headInfo
             }
 
             val probedDurationSeconds = sanitizedFirstVariant?.totalDurationSec?.roundToLong() ?: 0L
@@ -229,8 +239,7 @@ class HlsExtractor @Inject constructor(
             val headerDurationSeconds = effectiveHeaders["X-Internal-Duration-Seconds"]?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
             val totalDurationSeconds = if (probedDurationSeconds > 0L) probedDurationSeconds else headerDurationSeconds
 
-            // Calibrate peak-only BANDWIDTH estimates against actual interior segment byte-rates
-            // (avoiding seg[0] which is frequently inflated by intro/IDR frames, and defaulting to 1.0x BANDWIDTH)
+            // Calibrate peak-only BANDWIDTH estimates, reusing the single verified segment probe when available
             val peakBandwidthScale = computePeakBandwidthCalibrationScale(
                 firstVariant = probedVariant,
                 sanitizedFirstVariant = sanitizedFirstVariant,
@@ -238,7 +247,8 @@ class HlsExtractor @Inject constructor(
                     it.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull() == null &&
                         it.attrs["BANDWIDTH"]?.toIntOrNull() != null
                 },
-                headers = effectiveHeaders
+                headers = effectiveHeaders,
+                preProbedSegment = verifiedSegProbe
             )
 
             val baseStreamHeaders = if (totalDurationSeconds > 0L) {
@@ -250,10 +260,9 @@ class HlsExtractor @Inject constructor(
             val parsedVariants = rawVariants.mapIndexed { variantIdx, v ->
                 val resolution = v.attrs["RESOLUTION"]
                 var width = resolution?.substringBefore('x')?.toIntOrNull()?.takeIf { it > 0 }
-                var height = resolution?.substringAfter('x')?.toIntOrNull()?.takeIf { it > 0 }
-                if (width != null && height != null) {
-                    height = JsUnpacker.normalizeVideoHeight(width, height)
-                } else if (height != null && width == null) {
+                val rawHeight = resolution?.substringAfter('x')?.toIntOrNull()?.takeIf { it > 0 }
+                var height = com.melmeligy.mediadownloader.core.util.FormatUtils.normalizeQualityHeight(width, rawHeight)
+                if (height != null && width == null) {
                     width = (height * 16) / 9
                 }
 
@@ -272,7 +281,7 @@ class HlsExtractor @Inject constructor(
                         effectiveBandwidth >= 300_000 -> 360
                         else -> 240
                     }
-                    height = hinted ?: bwHeight
+                    height = com.melmeligy.mediadownloader.core.util.FormatUtils.normalizeQualityHeight(width, hinted ?: bwHeight)
                     if (height != null && width == null) {
                         width = (height * 16) / 9
                     }
@@ -338,7 +347,7 @@ class HlsExtractor @Inject constructor(
                 )
             }
 
-            // Collapse duplicate codec renditions of the exact same resolution (preferring H.264/avc1)
+            // Collapse duplicate codec/tier renditions (preferring H.264/avc1, higher bitrate, higher width)
             val deduplicatedVideos = parsedVariants
                 .groupBy { (_, s) -> s.height }
                 .flatMap { (h, group) ->
@@ -348,6 +357,7 @@ class HlsExtractor @Inject constructor(
                         val best = group.maxWithOrNull(
                             compareBy<Pair<Int, MediaStream>> { it.first }
                                 .thenBy { it.second.bitrateKbps ?: 0 }
+                                .thenBy { it.second.width ?: 0 }
                         )
                         listOfNotNull(best?.second)
                     }
@@ -416,7 +426,7 @@ class HlsExtractor @Inject constructor(
                 } else null
 
                 if (verifyDownloadable) {
-                    val verifiedHeaders = verifySegmentDownloadable(mediaSegments.first().url, effectiveHeaders)
+                    val (verifiedHeaders, _) = verifySegmentDownloadable(mediaSegments.first().url, effectiveHeaders)
                         ?: return null
                     effectiveHeaders = verifiedHeaders
                 }
@@ -510,7 +520,8 @@ class HlsExtractor @Inject constructor(
         firstVariant: RawVariant?,
         sanitizedFirstVariant: SanitizedHlsPlaylist?,
         hasPeakOnlyVariants: Boolean,
-        headers: Map<String, String>
+        headers: Map<String, String>,
+        preProbedSegment: Pair<HlsParsedSegment, HeadInfo>? = null
     ): Double {
         if (!hasPeakOnlyVariants || firstVariant == null || sanitizedFirstVariant == null) return 1.0
         val declaredBw = firstVariant.attrs["AVERAGE-BANDWIDTH"]?.toIntOrNull()?.takeIf { it > 0 }
@@ -527,6 +538,15 @@ class HlsExtractor @Inject constructor(
             val totalBytes = sanitizedFirstVariant.segments.sumOf { it.byteRangeLength ?: 0L }
             if (totalBytes > 0L) {
                 val measuredBps = (totalBytes.toDouble() * 8.0 / sanitizedFirstVariant.totalDurationSec) * containerFactor
+                return (measuredBps / declaredBw.toDouble()).coerceIn(MIN_CALIBRATION_SCALE, MAX_CALIBRATION_SCALE)
+            }
+        }
+
+        // Reuse the single verified segment probe when available so we avoid an extra network round-trip
+        if (preProbedSegment != null) {
+            val (seg, head) = preProbedSegment
+            if (head.contentLength > 0L && seg.durationSec > 0.0) {
+                val measuredBps = (head.contentLength.toDouble() / seg.durationSec) * 8.0 * containerFactor
                 return (measuredBps / declaredBw.toDouble()).coerceIn(MIN_CALIBRATION_SCALE, MAX_CALIBRATION_SCALE)
             }
         }

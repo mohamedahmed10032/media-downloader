@@ -56,9 +56,13 @@ object FormatUtils {
     fun formatPercent(progress: Float): String =
         "${(progress.coerceIn(0f, 1f) * 100).toInt()}%"
 
+    private const val MAX_FILENAME_UTF8_BYTES = 180
+
     /**
      * Produces a filesystem-safe file name, stripping characters illegal on Android /
-     * FAT filesystems and trimming length. Never returns an empty string.
+     * FAT filesystems and capping length to [MAX_FILENAME_UTF8_BYTES] UTF-8 bytes without
+     * splitting multi-byte characters (e.g., Arabic/emoji) or leaving trailing dots.
+     * Never returns an empty string.
      */
     fun sanitizeFileName(raw: String, fallback: String = "download"): String {
         val cleaned = raw
@@ -67,7 +71,30 @@ object FormatUtils {
             .replace(Regex("\\s+"), " ")
             .trim('.', ' ')
         val safe = if (cleaned.isBlank()) fallback else cleaned
-        return if (safe.length > 120) safe.substring(0, 120).trim() else safe
+        val capped = truncateUtf8Safe(safe, MAX_FILENAME_UTF8_BYTES).trim('.', ' ')
+        return if (capped.isBlank()) fallback else capped
+    }
+
+    private fun truncateUtf8Safe(input: String, maxBytes: Int): String {
+        if (input.toByteArray(Charsets.UTF_8).size <= maxBytes) return input
+        val sb = StringBuilder(input.length)
+        var bytesUsed = 0
+        var i = 0
+        while (i < input.length) {
+            val cp = input.codePointAt(i)
+            val charCount = Character.charCount(cp)
+            val cpBytes = when {
+                cp <= 0x7F -> 1
+                cp <= 0x7FF -> 2
+                cp <= 0xFFFF -> 3
+                else -> 4
+            }
+            if (bytesUsed + cpBytes > maxBytes) break
+            sb.append(input, i, i + charCount)
+            bytesUsed += cpBytes
+            i += charCount
+        }
+        return sb.toString()
     }
 
     /** True if [value] is within [tolerance] of [target]; small helper for tests/estimates. */
@@ -112,4 +139,64 @@ object FormatUtils {
         }
         return null
     }
+
+    val STANDARD_VIDEO_TIERS: IntArray = intArrayOf(144, 240, 360, 480, 720, 1080, 1440, 2160)
+
+    private val rawPHeightRegex = Regex("""(?<!\d)(\d{3,4})p\b""", RegexOption.IGNORE_CASE)
+
+    /**
+     * Normalizes raw video dimensions (including widescreen/cropped cinema frames like `426x192`,
+     * `640x272`, `682x384`, `854x384`, `1280x536`, `1920x800`, and portrait frames like `720x1280`)
+     * into the nearest standard quality tier (`144, 240, 360, 480, 720, 1080, 1440, 2160`).
+     */
+    fun normalizeQualityHeight(width: Int?, height: Int?): Int? {
+        val w = width?.takeIf { it > 0 }
+        val h = height?.takeIf { it > 0 }
+        val effective = when {
+            w != null && h != null -> {
+                if (h > w) {
+                    // Portrait video (e.g. 720x1280 -> 720p, 1080x1920 -> 1080p)
+                    w
+                } else {
+                    // Landscape / widescreen cinema: compute effective 16:9 height
+                    maxOf(h, kotlin.math.round(w * 9.0 / 16.0).toInt())
+                }
+            }
+            h != null -> h
+            w != null -> kotlin.math.round(w * 9.0 / 16.0).toInt()
+            else -> return null
+        }
+        return snapToStandardTier(effective)
+    }
+
+    private fun snapToStandardTier(effectiveHeight: Int): Int {
+        var best = STANDARD_VIDEO_TIERS[0]
+        var bestDiff = abs(effectiveHeight - best)
+        for (i in 1 until STANDARD_VIDEO_TIERS.size) {
+            val tier = STANDARD_VIDEO_TIERS[i]
+            val diff = abs(effectiveHeight - tier)
+            if (diff <= bestDiff) {
+                best = tier
+                bestDiff = diff
+            }
+        }
+        return best
+    }
+
+    /**
+     * Normalizes any raw video quality label (e.g. `"384p"`, `"Fast (192p)"`, `"536p"`) so
+     * odd widescreen heights never leak into the format sheet or download card.
+     */
+    fun normalizeQualityLabel(rawLabel: String, width: Int? = null, height: Int? = null): String {
+        val trimmed = rawLabel.trim()
+        val match = rawPHeightRegex.find(trimmed)
+        val parsedHeight = height?.takeIf { it > 0 }
+            ?: match?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 }
+        val normalized = normalizeQualityHeight(width, parsedHeight) ?: return trimmed
+        if (match == null) return trimmed
+        val matchedNum = match.groupValues[1].toIntOrNull()
+        if (matchedNum == normalized) return trimmed
+        return trimmed.replaceRange(match.range, "${normalized}p")
+    }
 }
+

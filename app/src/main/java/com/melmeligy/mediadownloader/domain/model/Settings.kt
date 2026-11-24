@@ -29,11 +29,18 @@ data class AppSettings(
     val retryCount: Int = 3,
     val saveSubfolder: String = "MediaDownloader",
     val customSaveTreeUri: String? = null,
-    val customSaveOrganizeByType: Boolean = false
+    val customSaveOrganizeByType: Boolean = false,
+    val adBlockDisabledHosts: Set<String> = emptySet()
 ) {
     /** True when Mode B (custom SAF folder) is active; false for Mode A (Smart Media Folders). */
     val isCustomSaveLocation: Boolean
         get() = !customSaveTreeUri.isNullOrBlank()
+
+    /** True when sub-resource ad-blocking is enabled for [urlOrHost] (popup/redirect blocking is always ON). */
+    fun isAdBlockEnabledFor(urlOrHost: String?): Boolean {
+        val host = normalizeAdBlockHost(urlOrHost) ?: return true
+        return host !in adBlockDisabledHosts
+    }
 
     /** Human-readable summary shown in the Settings -> Downloads -> Save location row. */
     fun saveLocationSummary(): String {
@@ -53,6 +60,23 @@ data class AppSettings(
         const val DEFAULT_SUBFOLDER = "MediaDownloader"
 
         private val ILLEGAL_SEGMENT_CHARS = Regex("""[:*?"<>|\u0000-\u001F]""")
+
+        /** Normalizes a URL or hostname for per-site ad-blocker toggle storage (`lowercase`, no `www.`). */
+        fun normalizeAdBlockHost(urlOrHost: String?): String? {
+            if (urlOrHost.isNullOrBlank()) return null
+            val trimmed = urlOrHost.trim()
+            val rawHost = if (trimmed.contains("://")) {
+                runCatching { java.net.URI(trimmed).host }.getOrNull()
+                    ?: trimmed.substringAfter("://")
+                        .substringBefore('/')
+                        .substringBefore('?')
+                        .substringBefore('#')
+                        .substringBefore(':')
+            } else {
+                trimmed.substringBefore('/').substringBefore('?').substringBefore('#').substringBefore(':')
+            }
+            return rawHost?.trim()?.lowercase()?.removePrefix("www.")?.trimEnd('.')?.takeIf { it.isNotEmpty() }
+        }
 
         /**
          * Sanitizes a user-supplied subfolder path for Android MediaStore `RELATIVE_PATH`.

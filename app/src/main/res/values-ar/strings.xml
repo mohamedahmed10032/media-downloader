@@ -103,6 +103,8 @@
     <string name="error_no_media_found">لم يتم العثور على وسائط قابلة للتحميل في هذا الرابط.</string>
     <string name="error_unsupported_site">هذا المصدر غير مدعوم بعد. يمكنك لصق رابط وسائط مباشر.</string>
     <string name="error_geo_blocked">يبدو أن هذا المحتوى غير متاح في منطقتك.</string>
+    <string name="error_access_denied">رفض الخادم الوصول إلى الرابط. أعد المحاولة للحصول على رابط جديد.</string>
+    <string name="error_server_error">الخادم مشغول أو غير متاح مؤقتاً. يرجى المحاولة لاحقاً.</string>
     <string name="error_expired_link">انتهت صلاحية هذا الرابط. يرجى تحديث المصدر والمحاولة مجدداً.</string>
     <string name="error_insufficient_storage">لا توجد مساحة تخزين كافية لإكمال هذا التحميل.</string>
     <string name="error_generic">حدث خطأ ما. يرجى المحاولة مرة أخرى.</string>

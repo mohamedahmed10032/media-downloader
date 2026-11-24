@@ -74,12 +74,41 @@ class DownloadManager private constructor(
     private val dispatchers: DispatcherProvider,
     private val thumbnailCache: DownloadThumbnailCache?,
     private val availableBytesProvider: (File) -> Long,
+    private val mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>?,
     @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
 
     @Inject
     constructor(
         @ApplicationContext context: Context,
+        repository: DownloadRepository,
+        settingsRepository: SettingsRepository,
+        segmentedDownloader: SegmentedDownloader,
+        hlsDownloader: HlsSegmentDownloader,
+        videoAudioMuxer: VideoAudioMuxer,
+        mediaStoreWriter: MediaStoreWriter,
+        notifier: DownloadNotifier,
+        dispatchers: DispatcherProvider,
+        thumbnailCache: DownloadThumbnailCache,
+        mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>
+    ) : this(
+        context = context,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        segmentedDownloader = segmentedDownloader,
+        hlsDownloader = hlsDownloader,
+        videoAudioMuxer = videoAudioMuxer,
+        mediaStoreWriter = mediaStoreWriter,
+        notifier = notifier,
+        dispatchers = dispatchers,
+        thumbnailCache = thumbnailCache,
+        availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
+        mediaRepository = mediaRepository,
+        marker = true
+    )
+
+    internal constructor(
+        context: Context,
         repository: DownloadRepository,
         settingsRepository: SettingsRepository,
         segmentedDownloader: SegmentedDownloader,
@@ -101,7 +130,8 @@ class DownloadManager private constructor(
         dispatchers = dispatchers,
         thumbnailCache = thumbnailCache,
         availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
-        marker = true
+        mediaRepository = null,
+        marker = false
     )
 
     internal constructor(
@@ -126,6 +156,7 @@ class DownloadManager private constructor(
         dispatchers = dispatchers,
         thumbnailCache = null,
         availableBytesProvider = MediaStoreWriter::queryAvailableBytes,
+        mediaRepository = null,
         marker = false
     )
 
@@ -153,6 +184,36 @@ class DownloadManager private constructor(
         dispatchers = dispatchers,
         thumbnailCache = thumbnailCache,
         availableBytesProvider = availableBytesProvider,
+        mediaRepository = null,
+        marker = false
+    )
+
+    internal constructor(
+        context: Context,
+        repository: DownloadRepository,
+        settingsRepository: SettingsRepository,
+        segmentedDownloader: SegmentedDownloader,
+        hlsDownloader: HlsSegmentDownloader,
+        videoAudioMuxer: VideoAudioMuxer,
+        mediaStoreWriter: MediaStoreWriter,
+        notifier: DownloadNotifier,
+        dispatchers: DispatcherProvider,
+        thumbnailCache: DownloadThumbnailCache?,
+        availableBytesProvider: (File) -> Long,
+        mediaRepository: dagger.Lazy<com.melmeligy.mediadownloader.domain.repository.MediaRepository>?
+    ) : this(
+        context = context,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        segmentedDownloader = segmentedDownloader,
+        hlsDownloader = hlsDownloader,
+        videoAudioMuxer = videoAudioMuxer,
+        mediaStoreWriter = mediaStoreWriter,
+        notifier = notifier,
+        dispatchers = dispatchers,
+        thumbnailCache = thumbnailCache,
+        availableBytesProvider = availableBytesProvider,
+        mediaRepository = mediaRepository,
         marker = false
     )
 
@@ -299,11 +360,80 @@ class DownloadManager private constructor(
             val activeJob = runningJobs[id] ?: retryingJobs[id]
             activeJob?.cancelAndJoin()
             intents.remove(id)
-            if (repository.getById(id) == null) return@withLock
+            val existing = repository.getById(id) ?: return@withLock
+
+            val (errCode, _) = AppError.decodeFromStorage(existing.errorType)
+            val needsFreshLink = errCode == AppError.ACCESS_DENIED ||
+                errCode == AppError.EXPIRED_LINK ||
+                errCode == AppError.GEO_BLOCKED
+            val repo = mediaRepository?.get()
+            if (needsFreshLink &&
+                repo != null &&
+                (existing.sourceUrl.startsWith("http://", ignoreCase = true) ||
+                    existing.sourceUrl.startsWith("https://", ignoreCase = true))
+            ) {
+                val refreshed = runCatching {
+                    (repo as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)
+                        ?.invalidateCache(existing.sourceUrl)
+                    val resolved = withContext(dispatchers.io) {
+                        withTimeoutOrNull(SMART_RETRY_RESOLVE_TIMEOUT_MS) {
+                            repo.resolve(existing.sourceUrl)
+                        }
+                    } ?: return@runCatching null
+                    selectBestRefreshStream(existing, resolved.streams)
+                }.getOrNull()
+
+                if (refreshed != null) {
+                    withContext(dispatchers.io) { cleanupStaging(id, deleteThumbnail = false) }
+                    val existingHeaders = JsonUtils.jsonToMap(existing.headersJson)
+                    val mergedHeaders = LinkedHashMap<String, String>(refreshed.headers).apply {
+                        existingHeaders["X-Internal-Target-Bitrate-Kbps"]?.let { putIfAbsent("X-Internal-Target-Bitrate-Kbps", it) }
+                        existingHeaders["X-Internal-Original-Thumbnail-Url"]?.let { putIfAbsent("X-Internal-Original-Thumbnail-Url", it) }
+                    }
+                    val finalContainer = when {
+                        refreshed.type == MediaType.AUDIO -> refreshed.container
+                        refreshed.isHls -> "mp4"
+                        else -> refreshed.container
+                    }
+                    repository.update(
+                        existing.copy(
+                            remoteUrl = refreshed.url,
+                            container = finalContainer,
+                            qualityLabel = refreshed.label.ifBlank { existing.qualityLabel },
+                            totalBytes = refreshed.sizeBytes ?: existing.totalBytes,
+                            downloadedBytes = 0L,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = -1L,
+                            headersJson = JsonUtils.mapToJson(mergedHeaders),
+                            isHls = refreshed.isHls,
+                            errorType = null,
+                            retryCount = 0,
+                            status = DownloadStatus.QUEUED
+                        )
+                    )
+                    queueSignal.trySend(Unit)
+                    schedule()
+                    return@withLock
+                }
+            }
+
             repository.requeue(id, resetRetryCount = true)
             queueSignal.trySend(Unit)
             schedule()
         }
+    }
+
+    internal fun selectBestRefreshStream(existing: DownloadItem, streams: List<MediaStream>): MediaStream? {
+        if (streams.isEmpty()) return null
+        val sameType = streams.filter { it.type == existing.type }.ifEmpty { streams }
+        val targetHeight = Regex("""(\d{3,4})p""", RegexOption.IGNORE_CASE)
+            .find(existing.qualityLabel)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        if (targetHeight != null) {
+            sameType.firstOrNull { it.height == targetHeight }?.let { return it }
+        }
+        sameType.firstOrNull { it.label.equals(existing.qualityLabel, ignoreCase = true) }?.let { return it }
+        sameType.firstOrNull { it.isHls == existing.isHls }?.let { return it }
+        return sameType.maxByOrNull { it.height ?: 0 } ?: sameType.first()
     }
 
     suspend fun cancel(id: Long) {
@@ -623,7 +753,7 @@ class DownloadManager private constructor(
                     it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
                 }
                 queueScope.launch(dispatchers.io) {
-                    var cached = if (!effectiveThumbCandidate.isNullOrBlank()) {
+                    val cached = if (!effectiveThumbCandidate.isNullOrBlank()) {
                         thumbnailCache.cacheRemoteThumbnail(
                             downloadId = item.id,
                             thumbnailUrl = effectiveThumbCandidate,
@@ -632,18 +762,6 @@ class DownloadManager private constructor(
                         )
                     } else {
                         null
-                    }
-                    if (cached == null &&
-                        item.type == MediaType.VIDEO &&
-                        !item.isHls &&
-                        !thumbnailCache.hasCachedThumbnail(item.id)
-                    ) {
-                        cached = thumbnailCache.extractRemoteVideoFrameThumbnail(
-                            downloadId = item.id,
-                            videoUrl = item.remoteUrl,
-                            sourceUrl = item.sourceUrl,
-                            headers = headers
-                        )
                     }
                     persistCachedThumbnail(cached)
                 }
@@ -1055,10 +1173,11 @@ class DownloadManager private constructor(
         originJob: Job? = null
     ) {
         val error = (e as? MediaException)?.error ?: AppError.GENERIC
+        val errorDetail = e.message?.trim()?.takeIf { it.isNotEmpty() && !it.equals(error.name, ignoreCase = true) }
         val activeIntent = (originJob?.let { jobIntents[it] }) ?: intents[item.id]
         val settings = settingsRepository.current()
         val maxRetries = settings.retryCount.coerceIn(AppSettings.MIN_RETRIES, AppSettings.MAX_RETRIES)
-        val transient = error == AppError.NO_INTERNET || error == AppError.GENERIC
+        val transient = error == AppError.NO_INTERNET || error == AppError.GENERIC || error == AppError.SERVER_ERROR
         if (transient && maxRetries > 0 && item.retryCount < maxRetries && activeIntent == null) {
             val backoffMs = computeRetryBackoffMs(item.retryCount)
             withContext(NonCancellable) {
@@ -1097,7 +1216,11 @@ class DownloadManager private constructor(
                 } else {
                     // Keep cached local thumbnail intact so the failed card still shows the real poster
                     cleanupStaging(item.id, deleteThumbnail = false)
-                    repository.setError(item.id, error)
+                    if (repository is com.melmeligy.mediadownloader.data.repository.DownloadRepositoryImpl) {
+                        repository.setError(item.id, error, errorDetail)
+                    } else {
+                        repository.setError(item.id, error)
+                    }
                     notifier.notifyFailed(item.id, item.title, friendly(error))
                 }
             }
@@ -1188,6 +1311,8 @@ class DownloadManager private constructor(
         AppError.NO_MEDIA_FOUND -> "No media found"
         AppError.UNSUPPORTED_SITE -> "Unsupported source"
         AppError.GEO_BLOCKED -> "Unavailable in your region"
+        AppError.ACCESS_DENIED -> "Access denied by host server"
+        AppError.SERVER_ERROR -> "Host server temporarily busy"
         AppError.EXPIRED_LINK -> "Link expired"
         AppError.INSUFFICIENT_STORAGE -> "Not enough storage"
         AppError.GENERIC -> "Download failed"
@@ -1197,6 +1322,7 @@ class DownloadManager private constructor(
         private const val FOREGROUND_REFRESH_MS = 1000L
         private const val DB_PROGRESS_MIN_INTERVAL_MS = 350L
         private const val MIN_FREE_STORAGE_FLOOR_BYTES = 512L * 1024L
+        private const val SMART_RETRY_RESOLVE_TIMEOUT_MS = 8_000L
         private val STAGING_ITEM_ID_REGEX = Regex("""^(?:hls_parts_)?dl_(\d+)(?:[._]|$)""")
 
         internal fun extractStagingItemId(fileName: String): Long? =

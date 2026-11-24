@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -51,6 +52,8 @@ import dagger.hilt.android.AndroidEntryPoint
 @AndroidEntryPoint
 class ShareDialogActivity : ComponentActivity() {
 
+    private val qualityViewModel: QualityViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -61,12 +64,18 @@ class ShareDialogActivity : ComponentActivity() {
             return
         }
 
+        // Kick off extraction immediately in onCreate before Compose inflates the first frame.
+        qualityViewModel.resolve(initialUrl)
+
         setContent {
             var currentUrl by remember { mutableStateOf(initialUrl) }
 
             DisposableEffect(Unit) {
                 val listener = Consumer<Intent> { newIntent ->
-                    extractUrl(newIntent)?.let { currentUrl = it }
+                    extractUrl(newIntent)?.let { nextUrl ->
+                        currentUrl = nextUrl
+                        qualityViewModel.resolve(nextUrl)
+                    }
                 }
                 addOnNewIntentListener(listener)
                 onDispose { removeOnNewIntentListener(listener) }
@@ -78,6 +87,7 @@ class ShareDialogActivity : ComponentActivity() {
             MediaDownloaderTheme(themeMode = themeMode) {
                 ShareOverlaySheet(
                     url = currentUrl,
+                    viewModel = qualityViewModel,
                     onQueued = { count ->
                         val message = if (count > 1) {
                             getString(R.string.toast_batch_download_started, count)

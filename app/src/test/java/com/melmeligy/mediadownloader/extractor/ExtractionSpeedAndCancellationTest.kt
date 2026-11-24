@@ -372,16 +372,17 @@ class ExtractionSpeedAndCancellationTest {
     }
 
     @Test
-    fun headlessWebExtractor_resourceBlocker_blocksAuxiliaryAssets_neverBlocksRealMediaOrMainFrame() {
-        // Blocked non-essential assets
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://www.google-analytics.com/analytics.js", "*/*", false))
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://www.googletagmanager.com/gtag/js?id=G-123", "*/*", false))
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://fonts.gstatic.com/s/cairo/v28/font.woff2", "*/*", false))
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/assets/banner.jpg", "image/webp,*/*", false))
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/thumb/no-ext", "image/avif,image/webp,*/*", false))
-        assertTrue(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://doubleclick.net/pagead/js/adsbygoogle.js", "*/*", false))
+    fun headlessWebExtractor_resourceBlocker_doesNotBlockSubResources_soAntiAdblockNeverTriggers() {
+        // HeadlessWebExtractor must NOT block page/ad/bait sub-resources so anti-adblock overlays never block players
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://www.google-analytics.com/analytics.js", "*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://www.googletagmanager.com/gtag/js?id=G-123", "*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://fonts.gstatic.com/s/cairo/v28/font.woff2", "*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/assets/banner.jpg", "image/webp,*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/thumb/no-ext", "image/avif,image/webp,*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://doubleclick.net/pagead/js/adsbygoogle.js", "*/*", false))
+        assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js", "*/*", false))
 
-        // Allowed critical navigations, player scripts, and real media streams (including extensionless CDN URLs)
+        // Allowed critical navigations, player scripts, and real media streams
         assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://wecima.here/watch/ep1/", "text/html", true))
         assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/hls/master.m3u8", "*/*", false))
         assertFalse(HeadlessWebExtractor.shouldBlockAuxiliaryResource("https://cdn.example.com/video/1080p.mp4", "*/*", false))

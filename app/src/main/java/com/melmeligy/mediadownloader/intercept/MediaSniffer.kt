@@ -242,6 +242,7 @@ object MediaSniffer {
             url.startsWith("blob:") -> StreamType.BLOB
             mime == "video/mp2t" || ext == "ts" -> StreamType.UNKNOWN
             isSegment(url) -> StreamType.UNKNOWN
+            isDisguisedHlsUrl(cleaned) -> StreamType.HLS
             ext in PROGRESSIVE_EXT -> StreamType.PROGRESSIVE
             mime != null && (mime.startsWith("video/") || mime.startsWith("audio/")) ->
                 StreamType.PROGRESSIVE
@@ -251,6 +252,88 @@ object MediaSniffer {
             else -> StreamType.UNKNOWN
         }
     }
+
+    /**
+     * Strict HLS playlist body check: strips an optional UTF-8 BOM and leading whitespace,
+     * then verifies the response body actually starts with `#EXTM3U`.
+     * Prevents non-media `.txt`, JSON, or analytics payloads from polluting the format list.
+     */
+    fun isValidHlsPlaylistBody(body: String?): Boolean {
+        if (body.isNullOrBlank()) return false
+        val trimmed = body.trimStart('\uFEFF').trimStart()
+        return trimmed.startsWith("#EXTM3U")
+    }
+
+    /**
+     * Recognises disguised `.txt` or extensionless HLS master playlist URLs used by embed
+     * hosts (e.g. `.../hls2/.../master.txt`, `.../hls/.../index.txt`, `.../hls3/.../master`).
+     * Excludes standard non-media text files (`robots.txt`, `ads.txt`, etc.) and ad URLs.
+     */
+    fun isDisguisedHlsUrl(rawUrl: String): Boolean {
+        if (rawUrl.isBlank()) return false
+        val cleaned = cleanMediaUrl(rawUrl)
+        if (isPreviewOrAdUrl(cleaned) || isHexCipherUrl(cleaned)) return false
+        val lower = cleaned.lowercase()
+        val path = lower.substringBefore('?').substringBefore('#').trimEnd('/')
+        val cleanPath = path.substringAfter("://", path).substringAfter('/', "")
+        if (cleanPath.isEmpty()) return false
+        val fileName = cleanPath.substringAfterLast('/')
+        if (fileName in DISGUISED_HLS_EXCLUDED_TXT) return false
+
+        val ext = if ('.' in fileName) fileName.substringAfterLast('.') else ""
+        if (ext.isNotEmpty() && ext != "txt" && ext != "m3u") return false
+
+        val hasHlsDir = cleanPath.contains("/hls/") ||
+            cleanPath.contains("/hls2/") ||
+            cleanPath.contains("/hls3/") ||
+            cleanPath.contains("/hls4/") ||
+            cleanPath.contains("/m3u8/") ||
+            cleanPath.startsWith("hls/") ||
+            cleanPath.startsWith("hls2/") ||
+            cleanPath.startsWith("hls3/") ||
+            cleanPath.startsWith("hls4/")
+
+        val baseName = fileName.substringBeforeLast('.')
+        val isManifestFileName = baseName == "master" ||
+            baseName == "index" ||
+            baseName == "playlist" ||
+            baseName == "manifest" ||
+            baseName.startsWith("master_") ||
+            baseName.startsWith("master-") ||
+            baseName.startsWith("index-") ||
+            baseName.startsWith("index_")
+
+        return when {
+            ext == "m3u" -> true
+            ext == "txt" && (hasHlsDir || isManifestFileName) -> true
+            ext.isEmpty() && hasHlsDir && (isManifestFileName || lower.contains("t=") || lower.contains("token=") || lower.contains("s=")) -> true
+            else -> false
+        }
+    }
+
+    /**
+     * Body-aware classification for disguised `.txt` or extensionless HLS candidates.
+     * Requires strict `#EXTM3U` start-of-body validation before accepting them as [StreamType.HLS].
+     */
+    fun classifyWithBody(rawUrl: String, mimeType: String? = null, responseBody: String? = null): StreamType {
+        val baseType = classify(rawUrl, mimeType)
+        if (baseType == StreamType.HLS && isDisguisedHlsUrl(rawUrl) && !rawUrl.contains(".m3u8", ignoreCase = true)) {
+            return if (isValidHlsPlaylistBody(responseBody)) StreamType.HLS else StreamType.UNKNOWN
+        }
+        if (baseType == StreamType.UNKNOWN && !isPreviewOrAdUrl(rawUrl) && isValidHlsPlaylistBody(responseBody)) {
+            return StreamType.HLS
+        }
+        return baseType
+    }
+
+    private val DISGUISED_HLS_EXCLUDED_TXT = setOf(
+        "robots.txt",
+        "ads.txt",
+        "app-ads.txt",
+        "security.txt",
+        "humans.txt",
+        "sellers.txt"
+    )
 
     fun isSegment(url: String): Boolean {
         if (url.isBlank()) return false
@@ -267,7 +350,7 @@ object MediaSniffer {
 
     /** True when the playlist body advertises multiple quality variants. */
     fun isMasterPlaylist(body: String): Boolean =
-        body.contains("#EXT-X-STREAM-INF", ignoreCase = true)
+        isValidHlsPlaylistBody(body) && body.contains("#EXT-X-STREAM-INF", ignoreCase = true)
 
     /** Container extension to persist with a task for a given transport. */
     fun containerFor(type: StreamType, url: String, mimeType: String?): String = when (type) {

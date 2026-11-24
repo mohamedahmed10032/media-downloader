@@ -103,6 +103,8 @@
     <string name="error_no_media_found">No downloadable media was found at this link.</string>
     <string name="error_unsupported_site">This source isn\'t supported yet. You can still paste a direct media link.</string>
     <string name="error_geo_blocked">This content appears to be unavailable in your region.</string>
+    <string name="error_access_denied">Access was denied by the host server. Refresh or retry to get a fresh link.</string>
+    <string name="error_server_error">The host server is busy or temporarily unavailable. Please try again shortly.</string>
     <string name="error_expired_link">This link has expired. Please refresh the source and try again.</string>
     <string name="error_insufficient_storage">Not enough free storage to complete this download.</string>
     <string name="error_generic">Something went wrong. Please try again.</string>
