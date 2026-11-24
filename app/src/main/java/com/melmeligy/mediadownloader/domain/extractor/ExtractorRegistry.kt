@@ -140,12 +140,22 @@ class ExtractorRegistry @Inject constructor(
         return if (hasFreshIntercepted) null else cached.media
     }
 
-    /** Removes any cached result for [rawUrl] (used on explicit user Retry or fresh browser capture). */
+    /** Removes any cached result and cancels any active in-flight extraction for [rawUrl] (used on explicit user Retry or fresh browser capture). */
     fun invalidate(rawUrl: String) {
         val trimmed = rawUrl.trim()
         if (trimmed.isNotEmpty()) {
+            val normalized = UrlUtils.normalize(trimmed)
             cache.remove(trimmed)
-            UrlUtils.normalize(trimmed)?.let { cache.remove(it) }
+            normalized?.let { cache.remove(it) }
+            synchronized(inFlightLock) {
+                listOfNotNull(trimmed, normalized).distinct().forEach { key ->
+                    inFlight.remove(key)?.let { entry ->
+                        if (!entry.deferred.isCompleted) {
+                            entry.deferred.cancel()
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -136,6 +136,27 @@ class MediaInterceptionEngine @Inject constructor() {
         currentPageThumbnail = null
     }
 
+    /** Removes a dead or expired media candidate URL from detections, registry, and dedupe state. */
+    fun evictPayloadUrl(rawMediaUrl: String) {
+        val trimmed = rawMediaUrl.trim()
+        if (trimmed.isEmpty()) return
+        val cleaned = MediaSniffer.cleanMediaUrl(trimmed)
+        val dedupe = MediaSniffer.dedupeKey(cleaned)
+        registry.remove(trimmed)
+        registry.remove(cleaned)
+        registry.entries.removeIf { MediaSniffer.dedupeKey(it.value.url) == dedupe }
+        seen.entries.removeIf { it.key.contains(dedupe) }
+        val current = _detections.value
+        if (current.isNotEmpty()) {
+            val filtered = current.filterNot {
+                it.url == trimmed || it.url == cleaned || MediaSniffer.dedupeKey(it.url) == dedupe
+            }
+            if (filtered.size != current.size) {
+                _detections.value = filtered
+            }
+        }
+    }
+
     // ---- Ingestion ----
 
     /** Entry point for every producer. Returns true when the payload was accepted. */

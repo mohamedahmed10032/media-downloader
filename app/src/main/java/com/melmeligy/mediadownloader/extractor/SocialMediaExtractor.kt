@@ -163,9 +163,10 @@ class SocialMediaExtractor @Inject constructor(
         }
 
         // Targeted social-fast-mode Headless WebView fallback (never clicks watch servers or promotes embeds)
+        val headlessTargetUrl = redirectCache[url.trim()]?.resolvedUrl ?: workingUrl
         val headlessResult = try {
             headlessWebExtractor.extract(
-                targetUrl = workingUrl,
+                targetUrl = headlessTargetUrl,
                 timeoutMs = HeadlessWebExtractor.SOCIAL_FAST_TIMEOUT_MS,
                 socialEmbedFastMode = true
             )
@@ -1401,8 +1402,15 @@ class SocialMediaExtractor @Inject constructor(
         // Hedged race: desktop HTML (405KB, multi-quality bitrateInfo) starts immediately;
         // mobile HTML (156KB, webapp.reflow.video.detail, ~500ms) fires ONLY if desktop fails
         // or hasn't finished within TIKTOK_MOBILE_HEDGE_DELAY_MS (0 extra requests when desktop is fast).
+        // If desktop HTML explicitly marks the post classified/gated (`isContentClassified: true` / empty video),
+        // skip waiting for mobile HTML (which returns 10249) and jump straight to the mobile feed API.
         val desktopDoneEarly = Channel<Unit>(Channel.CONFLATED)
         val resultCh = Channel<ResolvedMedia?>(capacity = 2)
+        val classifiedWebDetected = java.util.concurrent.atomic.AtomicBoolean(false)
+        val discoveredPostIdRef = java.util.concurrent.atomic.AtomicReference<String?>(
+            UrlUtils.extractPostId(canonicalUrl)?.takeIf { it.all(Char::isDigit) }
+                ?: UrlUtils.extractPostId(rawUrl)?.takeIf { it.all(Char::isDigit) }
+        )
 
         val desktopJob = launch(Dispatchers.IO) {
             val res = try {
@@ -1411,8 +1419,19 @@ class SocialMediaExtractor @Inject constructor(
                         runCatching { http.fetchHtmlWithCookies(canonicalUrl, desktopHeaders) }.getOrNull()
                     }
                 }
-                val parsed = parseTikTokHtmlDoc(fetched?.html.orEmpty(), buildCdnHeadersWithFetched(fetched))
-                if (parsed == null) desktopDoneEarly.trySend(Unit)
+                val html = fetched?.html.orEmpty()
+                if (discoveredPostIdRef.get().isNullOrBlank()) {
+                    val foundId = fetched?.finalUrl?.let { UrlUtils.extractPostId(it) }?.takeIf { it.all(Char::isDigit) }
+                        ?: SocialMediaGalleryParsers.extractTikTokPostIdFromHtml(html)
+                    if (!foundId.isNullOrBlank()) discoveredPostIdRef.compareAndSet(null, foundId)
+                }
+                val parsed = parseTikTokHtmlDoc(html, buildCdnHeadersWithFetched(fetched))
+                if (parsed == null) {
+                    if (SocialMediaGalleryParsers.isTikTokHydrationClassifiedOrGated(html)) {
+                        classifiedWebDetected.set(true)
+                    }
+                    desktopDoneEarly.trySend(Unit)
+                }
                 parsed
             } catch (ce: CancellationException) {
                 throw ce
@@ -1428,18 +1447,28 @@ class SocialMediaExtractor @Inject constructor(
                 withTimeoutOrNull(TIKTOK_MOBILE_HEDGE_DELAY_MS) {
                     desktopDoneEarly.receiveCatching()
                 }
-                val mobileHeaders = LinkedHashMap<String, String>(desktopHeaders).apply {
-                    put("User-Agent", TIKTOK_MOBILE_UA)
-                }
-                val fetchedMob = withTimeoutOrNull(TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
-                    withCancellableHttpCalls(timeoutMs = TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
-                        runCatching { http.fetchHtmlWithCookies(canonicalUrl, mobileHeaders) }.getOrNull()
+                if (classifiedWebDetected.get()) {
+                    null
+                } else {
+                    val mobileHeaders = LinkedHashMap<String, String>(desktopHeaders).apply {
+                        put("User-Agent", TIKTOK_MOBILE_UA)
                     }
+                    val fetchedMob = withTimeoutOrNull(TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = TIKTOK_MOBILE_HTML_TIMEOUT_MS) {
+                            runCatching { http.fetchHtmlWithCookies(canonicalUrl, mobileHeaders) }.getOrNull()
+                        }
+                    }
+                    val mobHtml = fetchedMob?.html.orEmpty()
+                    if (discoveredPostIdRef.get().isNullOrBlank()) {
+                        val foundId = fetchedMob?.finalUrl?.let { UrlUtils.extractPostId(it) }?.takeIf { it.all(Char::isDigit) }
+                            ?: SocialMediaGalleryParsers.extractTikTokPostIdFromHtml(mobHtml)
+                        if (!foundId.isNullOrBlank()) discoveredPostIdRef.compareAndSet(null, foundId)
+                    }
+                    parseTikTokHtmlDoc(
+                        mobHtml,
+                        buildCdnHeadersWithFetched(fetchedMob, uaOverride = TIKTOK_MOBILE_UA)
+                    )
                 }
-                parseTikTokHtmlDoc(
-                    fetchedMob?.html.orEmpty(),
-                    buildCdnHeadersWithFetched(fetchedMob, uaOverride = TIKTOK_MOBILE_UA)
-                )
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
@@ -1466,19 +1495,170 @@ class SocialMediaExtractor @Inject constructor(
 
         if (winner != null) return@coroutineScope winner
 
-        // Login-free TikTok embed/v2 fallback when main page returned an anti-bot JS shell
-        val postId = UrlUtils.extractPostId(canonicalUrl)?.takeIf { it.all(Char::isDigit) }
+        // Fallback race when web hydration returned classified/empty/anti-bot shell:
+        // race native TikTok Lite mobile feed API (`aweme/v1/feed`, `aid=1340`) against `embed/v2`.
+        val postId = discoveredPostIdRef.get()?.takeIf { it.all(Char::isDigit) }
         if (postId != null) {
-            val embedUrl = "https://www.tiktok.com/embed/v2/$postId"
-            val embedHtml = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
-                    runCatching { http.fetchString(embedUrl, desktopHeaders) }.getOrNull()
+            val fallbackCh = Channel<ResolvedMedia?>(capacity = 2)
+            val feedJob = launch(Dispatchers.IO) {
+                val res = try {
+                    extractTikTokViaMobileFeedApi(
+                        rawUrl = rawUrl,
+                        postId = postId,
+                        liveCookie = desktopHeaders["Cookie"]
+                    )
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
                 }
-            }.orEmpty()
-            parseTikTokHtmlDoc(embedHtml, tikTokBaseCdnHeaders)?.let { return@coroutineScope it }
+                fallbackCh.trySend(res)
+            }
+            val embedJob = launch(Dispatchers.IO) {
+                val res = try {
+                    val embedUrl = "https://www.tiktok.com/embed/v2/$postId"
+                    val embedHtml = withTimeoutOrNull(SOCIAL_API_TIMEOUT_MS) {
+                        withCancellableHttpCalls(timeoutMs = SOCIAL_API_TIMEOUT_MS) {
+                            runCatching { http.fetchString(embedUrl, desktopHeaders) }.getOrNull()
+                        }
+                    }.orEmpty()
+                    parseTikTokHtmlDoc(embedHtml, tikTokBaseCdnHeaders)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                fallbackCh.trySend(res)
+            }
+            var fallbackWinner: ResolvedMedia? = null
+            try {
+                for (i in 0 until 2) {
+                    val cand = fallbackCh.receiveCatching().getOrNull() ?: continue
+                    if (cand.streams.isNotEmpty() || cand.gallerySlides.isNotEmpty()) {
+                        fallbackWinner = cand
+                        break
+                    }
+                }
+            } finally {
+                feedJob.cancel()
+                embedJob.cancel()
+                fallbackCh.close()
+            }
+            if (fallbackWinner != null) return@coroutineScope fallbackWinner
         }
 
         null
+    }
+
+    /**
+     * Native TikTok Lite mobile feed API (`/aweme/v1/feed/?aweme_id=<id>&aid=1340`) that rescues
+     * web-classified (`isContentClassified: true` / `statusCode: 10249`) and region-gated posts
+     * without requiring WebView login. Runs a hedged race across regional API edges.
+     */
+    private suspend fun extractTikTokViaMobileFeedApi(
+        rawUrl: String,
+        postId: String,
+        liveCookie: String?
+    ): ResolvedMedia? = coroutineScope {
+        val rnd = java.util.Random()
+        val deviceId = (7_250_000_000_000_000_000L + (rnd.nextLong() and Long.MAX_VALUE) % 75_000_000_000_000_000L).toString()
+        val iid = (7_250_000_000_000_000_000L + (rnd.nextLong() and Long.MAX_VALUE) % 75_000_000_000_000_000L).toString()
+        val hexChars = "0123456789abcdef"
+        val odinTt = buildString(160) { repeat(160) { append(hexChars[rnd.nextInt(16)]) } }
+        val sidPart = liveCookie?.split(';')?.firstOrNull { it.trim().startsWith("sid_tt=") }?.trim()
+        val cookieHeader = if (!sidPart.isNullOrBlank()) "odin_tt=$odinTt; $sidPart" else "odin_tt=$odinTt"
+
+        val apiHeaders = mapOf(
+            "User-Agent" to TIKTOK_LITE_APP_UA,
+            "Accept" to "application/json",
+            "Cookie" to cookieHeader
+        )
+        val cdnHeaders = mapOf(
+            "User-Agent" to TIKTOK_LITE_APP_UA,
+            "Referer" to "https://www.tiktok.com/"
+        )
+
+        fun buildFeedUrl(host: String): String {
+            val nowMs = clockMs()
+            val ts = nowMs / 1_000L
+            val cdid = java.util.UUID.randomUUID().toString()
+            return "https://$host/aweme/v1/feed/?aweme_id=$postId&aid=1340&app_name=musically_go" +
+                "&version_code=370402&version_name=37.4.2&manifest_version_code=370402" +
+                "&device_platform=android&os=android&device_type=Pixel+7&device_brand=google" +
+                "&os_version=13&os_api=33&device_id=$deviceId&iid=$iid&channel=googleplay" +
+                "&_rticket=$nowMs&ts=$ts&cdid=$cdid"
+        }
+
+        suspend fun queryHost(host: String): ResolvedMedia? {
+            val jsonText = withTimeoutOrNull(TIKTOK_FEED_API_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = TIKTOK_FEED_API_TIMEOUT_MS) {
+                    runCatching { http.fetchString(buildFeedUrl(host), apiHeaders) }.getOrNull()
+                }
+            } ?: return null
+            val parsed = SocialMediaGalleryParsers.parseTikTokAwemeFeedJson(
+                jsonText = jsonText,
+                targetPostId = postId,
+                headers = cdnHeaders
+            ) ?: return null
+            if (parsed.slides.isNotEmpty()) {
+                return buildGalleryResolvedMedia(rawUrl, "TikTok", parsed)
+            }
+            val streams = parsed.videoStreams + parsed.audioStreams
+            if (streams.isEmpty()) return null
+            return ResolvedMedia(
+                sourceUrl = rawUrl,
+                title = parsed.title ?: "TikTok Video",
+                thumbnailUrl = parsed.thumbnailUrl,
+                streams = streams,
+                extractor = "TikTok",
+                postId = parsed.postId ?: postId
+            )
+        }
+
+        // Hedged race: primary edge starts immediately; secondary fires if primary fails or > 900ms
+        val primaryDone = Channel<Unit>(Channel.CONFLATED)
+        val ch = Channel<ResolvedMedia?>(capacity = 2)
+        val primaryJob = launch(Dispatchers.IO) {
+            val res = try {
+                queryHost(TIKTOK_FEED_API_HOSTS[0])
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (res == null) primaryDone.trySend(Unit)
+            ch.trySend(res)
+        }
+        val hedgeJob = launch(Dispatchers.IO) {
+            val res = try {
+                withTimeoutOrNull(TIKTOK_FEED_HEDGE_DELAY_MS) {
+                    primaryDone.receiveCatching()
+                }
+                queryHost(TIKTOK_FEED_API_HOSTS[1]) ?: queryHost(TIKTOK_FEED_API_HOSTS[2])
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            ch.trySend(res)
+        }
+
+        var winner: ResolvedMedia? = null
+        try {
+            for (i in 0 until 2) {
+                val cand = ch.receiveCatching().getOrNull() ?: continue
+                if (cand.streams.isNotEmpty() || cand.gallerySlides.isNotEmpty()) {
+                    winner = cand
+                    break
+                }
+            }
+        } finally {
+            primaryJob.cancel()
+            hedgeJob.cancel()
+            primaryDone.close()
+            ch.close()
+        }
+        winner
     }
 
     // =========================================================================
@@ -2202,6 +2382,15 @@ class SocialMediaExtractor @Inject constructor(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
         private const val TIKTOK_MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
+        private const val TIKTOK_LITE_APP_UA =
+            "com.zhiliaoapp.musically.go/370402 (Linux; U; Android 13; en_US; Pixel 7; Build/TD1A.220804.031; Cronet/TTNetVersion:58.0.2991.0)"
+        private val TIKTOK_FEED_API_HOSTS = listOf(
+            "api22-normal-c-alisg.tiktokv.com",
+            "api19-normal-c-alisg.tiktokv.com",
+            "api16-normal-c-alisg.tiktokv.com"
+        )
+        private const val TIKTOK_FEED_API_TIMEOUT_MS = 3_800L
+        private const val TIKTOK_FEED_HEDGE_DELAY_MS = 900L
         private const val REDIRECT_CACHE_TTL_MS = 120_000L
         private const val MAX_REDIRECT_CACHE_ENTRIES = 128
         private const val REDIRECT_PROBE_TIMEOUT_MS = 2_200L
