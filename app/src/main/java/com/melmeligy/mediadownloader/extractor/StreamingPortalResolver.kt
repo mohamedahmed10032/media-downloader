@@ -72,11 +72,11 @@ class StreamingPortalResolver(
     }
 
     private val myAjaxUrlRegex = Regex(
-        """(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\s*=\s*['"](https?://[^'"]+)['"]""",
+        """(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
         RegexOption.IGNORE_CASE
     )
     private val ajaxUrlRegex = Regex(
-        """(?:ajaxURL|ajax_url|ajaxUrl)\s*=\s*['"](https?://[^'"]+)['"]""",
+        """(?:ajaxURL|ajax_url|ajaxUrl)\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
         RegexOption.IGNORE_CASE
     )
     private val iframeSrcInHtmlRegex = Regex(
@@ -429,13 +429,13 @@ class StreamingPortalResolver(
     }
 
     private fun resolveServerAjaxEndpoint(pageUrl: String, html: String): String? {
-        myAjaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { base ->
-            val trimmed = base.trimEnd('/')
-            return if (trimmed.endsWith(".php", ignoreCase = true)) trimmed else "$trimmed/Single/Server.php"
+        myAjaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { rawBase ->
+            val resolved = normalizeEmbedUrl(pageUrl, rawBase)?.trimEnd('/') ?: return@let
+            return if (resolved.endsWith(".php", ignoreCase = true)) resolved else "$resolved/Single/Server.php"
         }
-        ajaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { base ->
-            val trimmed = base.trimEnd('/')
-            return if (trimmed.endsWith(".php", ignoreCase = true)) trimmed else "$trimmed/Single/Server.php"
+        ajaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { rawBase ->
+            val resolved = normalizeEmbedUrl(pageUrl, rawBase)?.trimEnd('/') ?: return@let
+            return if (resolved.endsWith(".php", ignoreCase = true)) resolved else "$resolved/Single/Server.php"
         }
         val origin = originOf(pageUrl) ?: return null
         return "$origin/Ajaxat/Single/Server.php"
@@ -610,13 +610,18 @@ class StreamingPortalResolver(
 
         // Direct media URL inside iframe/mirror (e.g. .m3u8 or WeCima .List--Download--Wecima--Single .mp4 link)
         val directExt = UrlUtils.fileExtension(embedUrl)?.lowercase()
+        val directHeadersBase = if (sameRegistrableDomain(parentUrl, embedUrl)) {
+            baseHeaders
+        } else {
+            baseHeaders.filterKeys { !it.equals("Cookie", ignoreCase = true) }
+        }
         if (directExt == "m3u8") {
-            val h = buildStreamHeadersForHost(parentUrl, baseHeaders)
+            val h = buildStreamHeadersForHost(parentUrl, directHeadersBase)
             val expanded = runCatching { hlsExtractor.extractVerified(embedUrl, h) }.getOrNull()
             return@coroutineScope PortalExtractionResult(expanded?.streams.orEmpty())
         }
         if (directExt in setOf("mp4", "mkv", "webm", "mov", "m4v")) {
-            val h = buildStreamHeadersForHost(parentUrl, baseHeaders)
+            val h = buildStreamHeadersForHost(parentUrl, directHeadersBase)
             val directStreams = materializeCandidate(
                 cand = JsUnpacker.ExtractedSource(url = embedUrl, label = serverName),
                 headers = h,
@@ -646,15 +651,25 @@ class StreamingPortalResolver(
         if (embedHtml.isBlank()) return@coroutineScope PortalExtractionResult(emptyList())
 
         // Preserve the post-redirect mirror URL (e.g. earnvids.pro/e/x -> dintezuvio.com/e/x)
-        // and any Set-Cookie tokens issued during the embed redirect chain.
+        // and any Set-Cookie tokens issued during the embed redirect chain, while NEVER leaking
+        // outer portal cookies (e.g. topcinemaa.one cf_clearance) onto unrelated cross-origin embeds.
         val effectiveEmbedUrl = fetchedEmbed.finalUrl.takeIf { it.startsWith("http", ignoreCase = true) } ?: embedUrl
-        val mergedBaseHeaders = if (!fetchedEmbed.cookieHeader.isNullOrBlank()) {
-            val existingCookie = baseHeaders["Cookie"].orEmpty()
-            val combinedCookie = if (existingCookie.isBlank()) fetchedEmbed.cookieHeader
-            else "$existingCookie; ${fetchedEmbed.cookieHeader}"
-            baseHeaders + ("Cookie" to combinedCookie)
+        val inheritedParentCookie = if (sameRegistrableDomain(parentUrl, effectiveEmbedUrl)) {
+            baseHeaders["Cookie"]?.takeIf { it.isNotBlank() }
         } else {
-            baseHeaders
+            null
+        }
+        val embedScopedCookie = when {
+            inheritedParentCookie != null && !fetchedEmbed.cookieHeader.isNullOrBlank() ->
+                "$inheritedParentCookie; ${fetchedEmbed.cookieHeader}"
+            !fetchedEmbed.cookieHeader.isNullOrBlank() -> fetchedEmbed.cookieHeader
+            else -> inheritedParentCookie
+        }
+        val mergedBaseHeaders = LinkedHashMap<String, String>(baseHeaders).apply {
+            remove("Cookie")
+            if (!embedScopedCookie.isNullOrBlank()) {
+                put("Cookie", embedScopedCookie)
+            }
         }
 
         // Critical: streams loaded BY this embed player must carry the POST-REDIRECT EMBED URL as Referer & Origin!
@@ -920,11 +935,17 @@ class StreamingPortalResolver(
 
         if (probe.contentLength in 1L..40_000L) return emptyList()
 
-        val finalUrl = MediaSniffer.cleanMediaUrl(probe.finalUrl.ifBlank { url })
+        val finalUrl = if (InterceptedMediaExtractor.shouldPreserveRedirectorUrl(url, probe.finalUrl)) {
+            url
+        } else {
+            MediaSniffer.cleanMediaUrl(probe.finalUrl.ifBlank { url })
+        }
         val ext = UrlUtils.fileExtension(finalUrl)?.takeIf { it in setOf("mp4", "mkv", "webm", "mov", "m4v") }
+            ?: UrlUtils.fileExtension(probe.finalUrl)?.takeIf { it in setOf("mp4", "mkv", "webm", "mov", "m4v") }
             ?: if (ct.contains("webm")) "webm" else "mp4"
         val normHeight = JsUnpacker.normalizeVideoHeight(cand.width, cand.height)
             ?: UrlUtils.inferResolution(finalUrl, cand.label)
+            ?: UrlUtils.inferResolution(probe.finalUrl, cand.label)
         val label = when {
             normHeight != null && normHeight >= 1080 -> "${normHeight}p FHD"
             normHeight != null && normHeight >= 720 -> "${normHeight}p HD"
@@ -1063,8 +1084,30 @@ class StreamingPortalResolver(
     private fun normalizeHost(host: String?): String? =
         host?.trim()?.lowercase()?.removePrefix("www.")?.takeIf { it.isNotEmpty() }
 
-    private fun normalizePath(path: String?): String =
-        path.orEmpty().trim().trimEnd('/').lowercase()
+    internal fun registrableDomain(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val host = runCatching { URI(UrlUtils.encodeNonAsciiUrl(url.trim())).host }.getOrNull()
+            ?.trim()?.lowercase()?.removePrefix("www.")?.trimEnd('.')
+            ?: return null
+        if (host.isEmpty()) return null
+        val parts = host.split('.')
+        return if (parts.size >= 2) "${parts[parts.size - 2]}.${parts[parts.size - 1]}" else host
+    }
+
+    internal fun sameRegistrableDomain(urlA: String?, urlB: String?): Boolean {
+        val a = registrableDomain(urlA) ?: return false
+        val b = registrableDomain(urlB) ?: return false
+        return a == b
+    }
+
+    private fun normalizePath(path: String?): String {
+        val raw = path.orEmpty().trim()
+        if (raw.isEmpty()) return ""
+        val decoded = runCatching {
+            java.net.URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8.name())
+        }.getOrDefault(raw)
+        return decoded.trim().trimEnd('/').lowercase()
+    }
 
     private fun urlEncode(value: String): String =
         URLEncoder.encode(value, StandardCharsets.UTF_8.name())

@@ -47,16 +47,32 @@ import javax.xml.parsers.DocumentBuilderFactory
  * 7. Reddit (Image Galleries, Single Images, Crossposts, Reddit Videos, redd.it).
  */
 @Singleton
-class SocialMediaExtractor @Inject constructor(
+class SocialMediaExtractor private constructor(
     private val http: ExtractorHttp,
     private val headlessWebExtractor: HeadlessWebExtractor,
-    private val progressTracker: ExtractionProgressTracker
+    private val progressTracker: ExtractionProgressTracker,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) : MediaExtractor {
+
+    @Inject
+    constructor(
+        http: ExtractorHttp,
+        headlessWebExtractor: HeadlessWebExtractor,
+        progressTracker: ExtractionProgressTracker,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(http, headlessWebExtractor, progressTracker, priorityCoordinator, true)
+
+    constructor(
+        http: ExtractorHttp,
+        headlessWebExtractor: HeadlessWebExtractor,
+        progressTracker: ExtractionProgressTracker
+    ) : this(http, headlessWebExtractor, progressTracker, null, false)
 
     constructor(
         http: ExtractorHttp,
         headlessWebExtractor: HeadlessWebExtractor
-    ) : this(http, headlessWebExtractor, ExtractionProgressTracker())
+    ) : this(http, headlessWebExtractor, ExtractionProgressTracker(), null, false)
 
     override val name = "Social Media"
     override val priority = 95
@@ -70,6 +86,8 @@ class SocialMediaExtractor @Inject constructor(
 
     @Volatile
     private var tikwmBlockedUntilMs: Long = 0L
+
+    private val tikwmContentionTimeouts = java.util.concurrent.atomic.AtomicInteger(0)
 
     internal var clockMs: () -> Long = { System.currentTimeMillis() }
     internal var cookieProvider: (String) -> String? = { target ->
@@ -1238,11 +1256,17 @@ class SocialMediaExtractor @Inject constructor(
 
         var jsonText = fetchTikwmOnce()
         if (jsonText.isNullOrBlank()) {
-            // Only arm cooldown if this branch genuinely timed out/failed (not cancelled by winning sibling)
+            // Only arm cooldown if this branch genuinely timed out/failed (not cancelled by winning sibling).
+            // When active downloads are running, tolerate a single transient contention timeout before
+            // arming the 60s circuit breaker so switching platforms never permanently disables tikwm.
             currentCoroutineContext().ensureActive()
-            tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
+            val underDownloadContention = priorityCoordinator?.hasActiveDownloads() == true
+            if (!underDownloadContention || tikwmContentionTimeouts.incrementAndGet() >= 2) {
+                tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
+            }
             return@coroutineScope null
         }
+        tikwmContentionTimeouts.set(0)
         if (jsonText.trimStart().startsWith("<")) {
             tikwmBlockedUntilMs = clockMs() + TIKWM_COOLDOWN_MS
             return@coroutineScope null
@@ -2204,14 +2228,14 @@ class SocialMediaExtractor @Inject constructor(
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
         private const val REDIRECT_CACHE_TTL_MS = 120_000L
         private const val MAX_REDIRECT_CACHE_ENTRIES = 128
-        private const val REDIRECT_PROBE_TIMEOUT_MS = 2_200L
-        private const val REDIRECT_GET_TIMEOUT_MS = 2_800L
+        private const val REDIRECT_PROBE_TIMEOUT_MS = 3_200L
+        private const val REDIRECT_GET_TIMEOUT_MS = 3_600L
         private const val TIKWM_API_TIMEOUT_MS = 2_000L
         private const val TIKWM_COOLDOWN_MS = 60_000L
         private const val TIKTOK_HTML_TIMEOUT_MS = 5_500L
         private const val TIKTOK_MOBILE_HEDGE_DELAY_MS = 1_600L
         private const val TIKTOK_MOBILE_HTML_TIMEOUT_MS = 3_500L
-        private const val SOCIAL_API_TIMEOUT_MS = 2_800L
+        private const val SOCIAL_API_TIMEOUT_MS = 4_000L
         private const val FAST_PROBE_TIMEOUT_MS = 1_800L
         private const val FAST_AUDIO_PROBE_TIMEOUT_MS = 1_200L
         internal const val IG_WEB_APP_ID = "936619743392459"

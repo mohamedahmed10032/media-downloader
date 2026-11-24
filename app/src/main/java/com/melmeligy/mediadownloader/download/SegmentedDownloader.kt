@@ -31,10 +31,24 @@ import javax.inject.Singleton
  * and surfaces permanent HTTP 403/404/410 errors immediately without wasteful retries.
  */
 @Singleton
-class SegmentedDownloader @Inject constructor(
+class SegmentedDownloader private constructor(
     private val client: OkHttpClient,
-    private val http: ExtractorHttp
+    private val http: ExtractorHttp,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(client, http, priorityCoordinator, true)
+
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp
+    ) : this(client, http, null, false)
 
     suspend fun probe(url: String, headers: Map<String, String>): HeadInfo? =
         withContext(Dispatchers.IO) {
@@ -239,7 +253,9 @@ class SegmentedDownloader @Inject constructor(
                         body.byteStream().use { input ->
                             while (positions[index] <= chunkEnd) {
                                 currentCoroutineContext().ensureActive()
-                                val maxToRead = minOf(buffer.size.toLong(), chunkEnd - positions[index] + 1L).toInt()
+                                priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                val maxToRead = minOf(targetRead.toLong(), chunkEnd - positions[index] + 1L).toInt()
                                 val read = input.read(buffer, 0, maxToRead)
                                 if (read == -1) break
                                 raf.write(buffer, 0, read)
@@ -343,7 +359,9 @@ class SegmentedDownloader @Inject constructor(
                             body.byteStream().use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
-                                    val read = input.read(buffer)
+                                    priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                    val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                    val read = input.read(buffer, 0, targetRead)
                                     if (read == -1) break
                                     output.write(buffer, 0, read)
                                     bytesInPass += read

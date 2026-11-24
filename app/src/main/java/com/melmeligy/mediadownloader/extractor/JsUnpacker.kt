@@ -97,6 +97,13 @@ object JsUnpacker {
         """MDCore\.wurl\s*=\s*(['"])([^'"]{6,2000})\1""",
         RegexOption.IGNORE_CASE
     )
+    private val SOURCES_STRING_ARRAY_REGEX = Regex(
+        """["']?sources["']?\s*:\s*\[([^\[\]]{6,4000})]""",
+        RegexOption.IGNORE_CASE
+    )
+    private val QUOTED_URL_ITEM_REGEX = Regex(
+        """(['"])((?:https?:)?//[^'"\s<>]+|/[^'"\s<>]+)\1"""
+    )
 
     private val STREAMTAPE_ASSIGN_REGEX = Regex(
         """getElementById\s*\(\s*['"](?:no)?robotlink['"]\s*\)\.innerHTML\s*=\s*([^\r\n;]+)|getElementById\s*\(\s*['"]ideoolink['"]\s*\)\.innerHTML\s*=\s*([^\r\n;]+)""",
@@ -377,6 +384,22 @@ object JsUnpacker {
             val w = WIDTH_REGEX.find(block)?.groupValues?.getOrNull(1)?.toIntOrNull()
             val h = HEIGHT_REGEX.find(block)?.groupValues?.getOrNull(1)?.toIntOrNull()
             addIfMedia(url, label, w ?: cfgWidth, h ?: cfgHeight)
+        }
+
+        // 1b. Clappr / Uqload string-array `sources: ["https://.../v.mp4", ...]`
+        SOURCES_STRING_ARRAY_REGEX.findAll(unescaped).forEach { arrMatch ->
+            val inner = arrMatch.groupValues[1]
+            if (!inner.contains('{')) {
+                QUOTED_URL_ITEM_REGEX.findAll(inner).forEach { urlMatch ->
+                    val rawUrl = urlMatch.groupValues[2].trim()
+                    addIfMedia(
+                        rawUrl = rawUrl,
+                        width = cfgWidth,
+                        height = cfgHeight,
+                        isHlsHint = rawUrl.contains(".m3u8", ignoreCase = true) || MediaSniffer.isDisguisedHlsUrl(rawUrl)
+                    )
+                }
+            }
         }
 
         // 2. PlayerJS & JWPlayer direct `file: "..."` / `source: "..."` / `hls2: "..."` properties

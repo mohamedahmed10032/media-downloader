@@ -46,10 +46,24 @@ import javax.inject.Singleton
  * - Retries transient `429`/`5xx`/network errors cleanly while respecting configured retry counts.
  */
 @Singleton
-class HlsSegmentDownloader @Inject constructor(
+class HlsSegmentDownloader private constructor(
     private val client: OkHttpClient,
-    private val http: ExtractorHttp
+    private val http: ExtractorHttp,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(client, http, priorityCoordinator, true)
+
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp
+    ) : this(client, http, null, false)
 
     internal data class HlsSegment(
         val url: String,
@@ -353,6 +367,7 @@ class HlsSegmentDownloader @Inject constructor(
         val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
         while (true) {
             currentCoroutineContext().ensureActive()
+            priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
             var attemptBytes = 0L
             try {
                 val reqBuilder = http.buildRequest(segment.url, activeHeaders)
@@ -408,7 +423,9 @@ class HlsSegmentDownloader @Inject constructor(
                             effectiveInput.use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
-                                    val read = input.read(buffer)
+                                    priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                    val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                    val read = input.read(buffer, 0, targetRead)
                                     if (read == -1) break
                                     if (!checkedSignature) {
                                         checkedSignature = true

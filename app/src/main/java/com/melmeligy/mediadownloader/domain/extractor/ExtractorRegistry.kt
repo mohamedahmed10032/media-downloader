@@ -34,11 +34,57 @@ import javax.inject.Singleton
  *   onto one extraction while still cancelling immediately if all waiters cancel.
  */
 @Singleton
-class ExtractorRegistry @Inject constructor(
+class ExtractorRegistry private constructor(
     private val extractors: Set<@JvmSuppressWildcards MediaExtractor>,
     private val networkMonitor: NetworkMonitor,
-    private val dispatchers: DispatcherProvider
+    private val dispatchers: DispatcherProvider,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    private val progressTracker: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        extractors: Set<@JvmSuppressWildcards MediaExtractor>,
+        networkMonitor: NetworkMonitor,
+        dispatchers: DispatcherProvider,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator,
+        progressTracker: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker
+    ) : this(
+        extractors = extractors,
+        networkMonitor = networkMonitor,
+        dispatchers = dispatchers,
+        priorityCoordinator = priorityCoordinator,
+        progressTracker = progressTracker,
+        marker = true
+    )
+
+    constructor(
+        extractors: Set<@JvmSuppressWildcards MediaExtractor>,
+        networkMonitor: NetworkMonitor,
+        dispatchers: DispatcherProvider
+    ) : this(
+        extractors = extractors,
+        networkMonitor = networkMonitor,
+        dispatchers = dispatchers,
+        priorityCoordinator = null,
+        progressTracker = null,
+        marker = false
+    )
+
+    internal constructor(
+        extractors: Set<@JvmSuppressWildcards MediaExtractor>,
+        networkMonitor: NetworkMonitor,
+        dispatchers: DispatcherProvider,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(
+        extractors = extractors,
+        networkMonitor = networkMonitor,
+        dispatchers = dispatchers,
+        priorityCoordinator = priorityCoordinator,
+        progressTracker = null,
+        marker = false
+    )
 
     private data class CachedEntry(
         val media: ResolvedMedia,
@@ -54,12 +100,28 @@ class ExtractorRegistry @Inject constructor(
     private val cache = ConcurrentHashMap<String, CachedEntry>()
     private val inFlight = HashMap<String, InFlightEntry>()
     private val inFlightLock = Any()
-    private val sharedScope = CoroutineScope(SupervisorJob() + dispatchers.io)
+    private val sharedScope = CoroutineScope(SupervisorJob() + dispatchers.extractionIo)
 
     internal var cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS
     internal var clockMs: () -> Long = { System.currentTimeMillis() }
 
-    suspend fun resolve(rawUrl: String): ResolvedMedia = withContext(dispatchers.io) {
+    suspend fun resolve(rawUrl: String): ResolvedMedia = resolveInternal(rawUrl, interactive = true)
+
+    /**
+     * Background re-extraction entry point (e.g. `DownloadManager.retry()` refreshing an expired
+     * stream URL): does NOT acquire the interactive priority lease and runs in silent progress
+     * mode so it never throttles sibling downloads or overwrites an active UI sheet's stage.
+     */
+    suspend fun resolveBackground(rawUrl: String): ResolvedMedia {
+        val tracker = progressTracker
+        return if (tracker != null) {
+            tracker.runSilentBackground { resolveInternal(rawUrl, interactive = false) }
+        } else {
+            resolveInternal(rawUrl, interactive = false)
+        }
+    }
+
+    private suspend fun resolveInternal(rawUrl: String, interactive: Boolean): ResolvedMedia = withContext(dispatchers.extractionIo) {
         val url = UrlUtils.normalize(rawUrl)
             ?: throw MediaException(AppError.INVALID_LINK)
 
@@ -81,48 +143,67 @@ class ExtractorRegistry @Inject constructor(
             }
         }
 
-        // 2. Coalesce concurrent requests for the same normalized URL onto one ref-counted Deferred
-        val entry = synchronized(inFlightLock) {
-            val existing = inFlight[url]
-            if (existing != null && !existing.deferred.isCompleted && !existing.deferred.isCancelled) {
-                existing.waiters++
-                existing
-            } else {
-                var holder: InFlightEntry? = null
-                val deferred = sharedScope.async(dispatchers.io, start = CoroutineStart.LAZY) {
-                    try {
-                        withCancellableHttpCalls {
-                            performResolve(url)
-                        }
-                    } finally {
-                        synchronized(inFlightLock) {
-                            if (holder != null && inFlight[url] === holder) {
-                                inFlight.remove(url)
+        val runner: suspend () -> ResolvedMedia = {
+            // 2. Coalesce concurrent requests for the same normalized URL onto one ref-counted Deferred
+            val entry = synchronized(inFlightLock) {
+                val existing = inFlight[url]
+                if (existing != null && !existing.deferred.isCompleted && !existing.deferred.isCancelled) {
+                    existing.waiters++
+                    existing
+                } else {
+                    var holder: InFlightEntry? = null
+                    val callerSession = progressTracker?.activeSessionId()
+                    val deferred = sharedScope.async(dispatchers.extractionIo, start = CoroutineStart.LAZY) {
+                        try {
+                            val execute: suspend () -> ResolvedMedia = {
+                                withCancellableHttpCalls {
+                                    performResolve(url)
+                                }
+                            }
+                            if (!interactive && progressTracker != null) {
+                                progressTracker.runSilentBackground(execute)
+                            } else if (interactive && progressTracker != null && callerSession != null && callerSession > 0L) {
+                                progressTracker.runInSession(callerSession, execute)
+                            } else {
+                                execute()
+                            }
+                        } finally {
+                            synchronized(inFlightLock) {
+                                if (holder != null && inFlight[url] === holder) {
+                                    inFlight.remove(url)
+                                }
                             }
                         }
                     }
+                    val created = InFlightEntry(deferred = deferred, waiters = 1)
+                    holder = created
+                    inFlight[url] = created
+                    created
                 }
-                val created = InFlightEntry(deferred = deferred, waiters = 1)
-                holder = created
-                inFlight[url] = created
-                created
+            }
+
+            try {
+                entry.deferred.await()
+            } finally {
+                synchronized(inFlightLock) {
+                    entry.waiters--
+                    if (entry.waiters <= 0) {
+                        if (!entry.deferred.isCompleted) {
+                            entry.deferred.cancel()
+                        }
+                        if (inFlight[url] === entry) {
+                            inFlight.remove(url)
+                        }
+                    }
+                }
             }
         }
 
-        try {
-            entry.deferred.await()
-        } finally {
-            synchronized(inFlightLock) {
-                entry.waiters--
-                if (entry.waiters <= 0) {
-                    if (!entry.deferred.isCompleted) {
-                        entry.deferred.cancel()
-                    }
-                    if (inFlight[url] === entry) {
-                        inFlight.remove(url)
-                    }
-                }
-            }
+        val coordinator = priorityCoordinator
+        if (interactive && coordinator != null) {
+            coordinator.withInteractiveExtraction(runner)
+        } else {
+            runner()
         }
     }
 
