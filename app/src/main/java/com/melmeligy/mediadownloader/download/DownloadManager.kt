@@ -227,6 +227,17 @@ class DownloadManager private constructor(
     private val jobIntents = ConcurrentHashMap<Job, ControlIntent>()
     private val controlLocks = ConcurrentHashMap<Long, Mutex>()
     private val queueSignal = Channel<Unit>(Channel.CONFLATED)
+    private val queueMutex = Mutex()
+    private val inProcessScope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + dispatchers.io)
+    private val inProcessQueueJob = java.util.concurrent.atomic.AtomicReference<Job?>(null)
+    private val activeForegroundUpdater = java.util.concurrent.atomic.AtomicReference<(suspend (ForegroundInfo) -> Unit)?>(null)
+
+    /**
+     * Enabled by default in production (`@Inject` constructor) so tapping Download starts
+     * transferring within milliseconds without waiting for WorkManager cold-start latency.
+     * Secondary test constructors default to `false` unless explicitly enabled by a test.
+     */
+    internal var enableInProcessQueue: Boolean = marker
 
     private fun lockFor(id: Long): Mutex = controlLocks.computeIfAbsent(id) { Mutex() }
 
@@ -517,8 +528,15 @@ class DownloadManager private constructor(
         cancel(id)
     }
 
-    /** Enqueues the foreground worker (idempotent — keeps an already-running instance). */
+    /**
+     * Starts in-process queue execution immediately (when enabled) to eliminate WorkManager
+     * cold-start latency, and also enqueues the WorkManager foreground worker (idempotent) to
+     * keep the download alive in the background with a foreground notification.
+     */
     fun schedule() {
+        if (enableInProcessQueue) {
+            triggerInProcessQueue()
+        }
         val request = OneTimeWorkRequestBuilder<DownloadQueueWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
@@ -528,66 +546,120 @@ class DownloadManager private constructor(
             .enqueueUniqueWork(Constants.DOWNLOAD_WORK_NAME, ExistingWorkPolicy.KEEP, request)
     }
 
+    private fun triggerInProcessQueue() {
+        while (true) {
+            val existing = inProcessQueueJob.get()
+            if (existing != null && existing.isActive) {
+                queueSignal.trySend(Unit)
+                return
+            }
+            val created = inProcessScope.launch(start = CoroutineStart.LAZY) {
+                val self = currentCoroutineContext()[Job]
+                try {
+                    drainQueueLocked(resetInterruptedIfIdle = false)
+                } finally {
+                    inProcessQueueJob.compareAndSet(self, null)
+                }
+            }
+            if (inProcessQueueJob.compareAndSet(existing, created)) {
+                created.start()
+                return
+            } else {
+                created.cancel()
+            }
+        }
+    }
+
+    internal suspend fun awaitInProcessQueueForTests() {
+        inProcessQueueJob.get()?.join()
+    }
+
     // ---- Queue execution (called by the worker) ----
 
-    suspend fun runQueue(updateForeground: suspend (ForegroundInfo) -> Unit) = coroutineScope {
-        repository.resetInterrupted()
-        runCatching { updateForeground(currentForegroundInfo()) }
-
-        // Wake the scheduler immediately whenever the user changes Max concurrent downloads in Settings.
-        val settingsObserver = launch {
-            runCatching {
-                settingsRepository.settings
-                    .map { it.maxConcurrentDownloads }
-                    .distinctUntilChanged()
-                    .drop(1)
-                    .collect { queueSignal.trySend(Unit) }
-            }
-        }
-
-        fun launchQueuedItem(item: DownloadItem) {
-            val job = launch(start = CoroutineStart.LAZY) {
-                runOne(item, this@coroutineScope)
-            }
-            runningJobs[item.id] = job
-            priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
-            job.invokeOnCompletion {
-                jobIntents.remove(job)
-                runningJobs.remove(item.id, job)
-                priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
-                queueSignal.trySend(Unit)
-            }
-            job.start()
-        }
-
+    suspend fun runQueue(updateForeground: suspend (ForegroundInfo) -> Unit) {
+        activeForegroundUpdater.set(updateForeground)
         try {
-            while (isActive) {
-                val maxConcurrent = settingsRepository.current()
-                    .maxConcurrentDownloads
-                    .coerceIn(AppSettings.MIN_CONCURRENT, AppSettings.MAX_CONCURRENT)
+            runCatching { updateForeground(currentForegroundInfo()) }
+            queueSignal.trySend(Unit)
+            // If the in-process fast-start runner is already draining the queue, keep this
+            // worker alive as its foreground notification host until it finishes.
+            val activeInProcess = inProcessQueueJob.get()
+            if (activeInProcess != null && activeInProcess.isActive) {
+                activeInProcess.join()
+            }
+            // Drain any remaining queued or cold-restart interrupted items under queueMutex.
+            drainQueueLocked(resetInterruptedIfIdle = true)
+        } finally {
+            activeForegroundUpdater.compareAndSet(updateForeground, null)
+        }
+    }
 
-                while (runningJobs.size < maxConcurrent) {
-                    val next = repository.claimNextQueued(1).firstOrNull() ?: break
-                    launchQueuedItem(next)
+    private suspend fun drainQueueLocked(resetInterruptedIfIdle: Boolean) = queueMutex.withLock {
+        coroutineScope {
+            if (resetInterruptedIfIdle && runningJobs.isEmpty() && retryingJobs.isEmpty()) {
+                repository.resetInterrupted()
+            }
+            activeForegroundUpdater.get()?.let { updater ->
+                runCatching { updater(currentForegroundInfo()) }
+            }
+
+            // Wake the scheduler immediately whenever the user changes Max concurrent downloads in Settings.
+            val settingsObserver = launch {
+                runCatching {
+                    settingsRepository.settings
+                        .map { it.maxConcurrentDownloads }
+                        .distinctUntilChanged()
+                        .drop(1)
+                        .collect { queueSignal.trySend(Unit) }
                 }
+            }
 
-                if (runningJobs.isEmpty() && retryingJobs.isEmpty()) {
-                    // Drain window check: re-check queue once right before exiting so newly enqueued items aren't missed
-                    val trailing = repository.claimNextQueued(1).firstOrNull()
-                    if (trailing != null) {
-                        launchQueuedItem(trailing)
-                    } else {
-                        break
+            fun launchQueuedItem(item: DownloadItem) {
+                val job = launch(start = CoroutineStart.LAZY) {
+                    runOne(item, this@coroutineScope)
+                }
+                runningJobs[item.id] = job
+                priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
+                job.invokeOnCompletion {
+                    jobIntents.remove(job)
+                    runningJobs.remove(item.id, job)
+                    priorityCoordinator?.setActiveDownloadCount(runningJobs.size)
+                    queueSignal.trySend(Unit)
+                }
+                job.start()
+            }
+
+            try {
+                while (isActive) {
+                    val maxConcurrent = settingsRepository.current()
+                        .maxConcurrentDownloads
+                        .coerceIn(AppSettings.MIN_CONCURRENT, AppSettings.MAX_CONCURRENT)
+
+                    while (runningJobs.size < maxConcurrent) {
+                        val next = repository.claimNextQueued(1).firstOrNull() ?: break
+                        launchQueuedItem(next)
+                    }
+
+                    if (runningJobs.isEmpty() && retryingJobs.isEmpty()) {
+                        // Drain window check: re-check queue once right before exiting so newly enqueued items aren't missed
+                        val trailing = repository.claimNextQueued(1).firstOrNull()
+                        if (trailing != null) {
+                            launchQueuedItem(trailing)
+                        } else {
+                            break
+                        }
+                    }
+                    activeForegroundUpdater.get()?.let { updater ->
+                        runCatching { updater(currentForegroundInfo()) }
+                    }
+                    withTimeoutOrNull(FOREGROUND_REFRESH_MS) {
+                        queueSignal.receive()
                     }
                 }
-                runCatching { updateForeground(currentForegroundInfo()) }
-                withTimeoutOrNull(FOREGROUND_REFRESH_MS) {
-                    queueSignal.receive()
-                }
+            } finally {
+                priorityCoordinator?.setActiveDownloadCount(0)
+                settingsObserver.cancel()
             }
-        } finally {
-            priorityCoordinator?.setActiveDownloadCount(0)
-            settingsObserver.cancel()
         }
     }
 

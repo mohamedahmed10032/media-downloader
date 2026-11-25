@@ -46,6 +46,7 @@ class QualityViewModel : ViewModel {
     private var resolveJob: Job? = null
     private var sizeRefineJob: Job? = null
     private var thumbCacheJob: Job? = null
+    private var hlsPrewarmJob: Job? = null
 
     val settings: StateFlow<AppSettings>
     val loadingStage: StateFlow<String>
@@ -149,6 +150,7 @@ class QualityViewModel : ViewModel {
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        hlsPrewarmJob?.cancel()
         val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
 
         // Synchronous cache fast-path: render immediately without flashing the skeleton loader.
@@ -158,6 +160,7 @@ class QualityViewModel : ViewModel {
                 _state.value = Resource.Success(cached)
                 launchBackgroundSizeRefinement(cached, normalizedTarget)
                 launchBackgroundThumbnailCaching(cached, normalizedTarget)
+                launchBackgroundHlsPrewarm(cached)
                 return
             }
         }
@@ -192,10 +195,22 @@ class QualityViewModel : ViewModel {
                 if (nextState is Resource.Success) {
                     launchBackgroundSizeRefinement(nextState.data, normalizedTarget)
                     launchBackgroundThumbnailCaching(nextState.data, normalizedTarget)
+                    launchBackgroundHlsPrewarm(nextState.data)
                 }
             }
         }
         resolveJob = job
+    }
+
+    private fun launchBackgroundHlsPrewarm(resolved: ResolvedMedia) {
+        val refiner = streamSizeRefiner ?: return
+        if (resolved.streams.none { it.isHls }) return
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = viewModelScope.launch {
+            runCatching {
+                refiner.prewarmDefaultHlsVariant(resolved, settings.value.defaultVideoQuality)
+            }
+        }
     }
 
     private fun launchBackgroundSizeRefinement(resolved: ResolvedMedia, expectedNormalizedUrl: String) {
@@ -264,6 +279,8 @@ class QualityViewModel : ViewModel {
         sizeRefineJob = null
         thumbCacheJob?.cancel()
         thumbCacheJob = null
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = null
         progressTracker.reset()
     }
 

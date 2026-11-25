@@ -287,6 +287,14 @@ class HlsExtractor @Inject constructor(
         PlaylistFetchOutcome(null, variants.first(), lastFailure, url)
     }
 
+    private data class SegmentProbeAttempt(
+        val fromRange: Boolean,
+        val headInfo: HeadInfo? = null,
+        val failureReason: String? = null,
+        val isDead404Or410: Boolean = false,
+        val rejectedRange: Boolean = false
+    )
+
     private suspend fun verifySegmentDownloadable(
         segmentUrl: String,
         headers: Map<String, String>,
@@ -299,90 +307,176 @@ class HlsExtractor @Inject constructor(
         var serverRejectsRange = HostHealthRegistry.shared.shouldSkipRangeProbeOnSegments(segmentUrl) ||
             isLikelyDisguisedSegmentUrl(segmentUrl)
         for (hdrs in candidates) {
-            var info: HeadInfo? = null
-            var probeThrewDead = false
-            if (!serverRejectsRange) {
-                var probeErr: Throwable? = null
-                info = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
-                    withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
-                        try {
-                            http.probe(segmentUrl, hdrs, VERIFY_SEGMENT_PROBE_TIMEOUT_MS)
-                        } catch (ce: kotlinx.coroutines.CancellationException) {
-                            throw ce
-                        } catch (t: Throwable) {
-                            probeErr = t
-                            null
-                        }
-                    }
+            if (serverRejectsRange) {
+                val peekAttempt = runPeekSegmentProbe(segmentUrl, hdrs, isAesEncrypted)
+                if (peekAttempt.headInfo != null) {
+                    return SegmentVerifyOutcome(hdrs, peekAttempt.headInfo, null)
                 }
-                if (info != null) {
-                    val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-                    val isHtmlOrJson = ct.startsWith("text/html") ||
-                        ct.startsWith("application/xhtml") ||
-                        ct.startsWith("application/json")
-                    if (info.code in 200..299 && !isHtmlOrJson) {
-                        return SegmentVerifyOutcome(hdrs, info, null)
-                    }
-                    lastReason = if (info.code in 200..299) "seg HTML/JSON" else "seg HTTP ${info.code}"
-                    if (info.code == 404 || info.code == 410) {
-                        return SegmentVerifyOutcome(null, null, lastReason)
-                    }
-                    if (info.code == 400 || info.code == 405 || info.code == 416) {
-                        serverRejectsRange = true
-                        HostHealthRegistry.shared.markRangeRejectedOnSegments(segmentUrl)
-                    }
-                } else if (probeErr != null) {
-                    val err = probeErr!!
-                    lastReason = describeException("seg", err)
-                    if (err is com.melmeligy.mediadownloader.core.MediaException &&
-                        (err.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
-                            err.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK)
-                    ) {
-                        probeThrewDead = true
-                    }
-                } else {
-                    lastReason = "seg timeout"
+                if (!peekAttempt.failureReason.isNullOrBlank()) {
+                    lastReason = peekAttempt.failureReason
                 }
-            }
-            if (probeThrewDead) {
-                return SegmentVerifyOutcome(null, null, lastReason ?: "seg HTTP 404")
+                if (peekAttempt.isDead404Or410) {
+                    return SegmentVerifyOutcome(null, null, lastReason ?: "seg HTTP 404")
+                }
+                continue
             }
 
-            // Many HLS segment CDNs (EarnVids, VidHide, Cloudflare workers) reject `Range: bytes=0-0`
-            // with HTTP 400/403/405/500 or timeout, even though plain unranged GET succeeds.
-            val shouldTryUnrangedGet = serverRejectsRange || info == null ||
-                info.code == 400 || info.code == 403 || info.code == 405 || info.code == 416 || info.code >= 500
-            if (shouldTryUnrangedGet) {
-                val getInfo = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
-                    withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
-                        runCatching {
-                            http.peekHlsSegmentGet(
-                                url = segmentUrl,
-                                headers = hdrs,
-                                timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS,
-                                isAesEncrypted = isAesEncrypted
-                            )
-                        }.getOrNull()
-                    }
-                }
-                if (getInfo != null) {
-                    val gct = getInfo.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-                    val isHtmlOrJson = gct.startsWith("text/html") ||
-                        gct.startsWith("application/xhtml") ||
-                        gct.startsWith("application/json")
-                    if (getInfo.code in 200..299 && !isHtmlOrJson) {
-                        return SegmentVerifyOutcome(hdrs, getInfo, null)
-                    }
-                    lastReason = if (getInfo.code in 200..299) "seg non-media" else "seg HTTP ${getInfo.code}"
-                    if (getInfo.code == 404 || getInfo.code == 410) {
-                        return SegmentVerifyOutcome(null, null, lastReason)
-                    }
-                } else if (lastReason == null) {
-                    lastReason = "seg timeout"
-                }
+            // Hedged Range + unranged GET verification: start Range:0-0 immediately and hedge
+            // peekHlsSegmentGet after HEDGE_SEGMENT_PEEK_DELAY_MS (or immediately on fast Range
+            // failure) so CDNs that stall or reject Range never add 2.6s to extraction.
+            val hedged = raceRangeAndPeekSegment(segmentUrl, hdrs, isAesEncrypted)
+            if (hedged.rejectedRange) {
+                serverRejectsRange = true
+                HostHealthRegistry.shared.markRangeRejectedOnSegments(segmentUrl)
+            }
+            if (hedged.headInfo != null) {
+                return SegmentVerifyOutcome(hdrs, hedged.headInfo, null)
+            }
+            if (!hedged.failureReason.isNullOrBlank()) {
+                lastReason = hedged.failureReason
+            }
+            if (hedged.isDead404Or410) {
+                return SegmentVerifyOutcome(null, null, lastReason ?: "seg HTTP 404")
             }
         }
         return SegmentVerifyOutcome(null, null, lastReason ?: "seg rejected")
+    }
+
+    private suspend fun runRangeSegmentProbe(
+        segmentUrl: String,
+        hdrs: Map<String, String>
+    ): SegmentProbeAttempt {
+        var probeErr: Throwable? = null
+        val info = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+            withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
+                try {
+                    http.probe(segmentUrl, hdrs, VERIFY_SEGMENT_PROBE_TIMEOUT_MS)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    probeErr = t
+                    null
+                }
+            }
+        }
+        if (info != null) {
+            val ct = info.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            val isHtmlOrJson = ct.startsWith("text/html") ||
+                ct.startsWith("application/xhtml") ||
+                ct.startsWith("application/json")
+            if (info.code in 200..299 && !isHtmlOrJson) {
+                return SegmentProbeAttempt(fromRange = true, headInfo = info)
+            }
+            val reason = if (info.code in 200..299) "seg HTML/JSON" else "seg HTTP ${info.code}"
+            val isDead = info.code == 404 || info.code == 410
+            val rejectedRange = info.code == 400 || info.code == 405 || info.code == 416
+            return SegmentProbeAttempt(
+                fromRange = true,
+                failureReason = reason,
+                isDead404Or410 = isDead,
+                rejectedRange = rejectedRange
+            )
+        }
+        if (probeErr != null) {
+            val err = probeErr!!
+            val reason = describeException("seg", err)
+            val isDead = err is com.melmeligy.mediadownloader.core.MediaException &&
+                (err.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND ||
+                    err.error == com.melmeligy.mediadownloader.core.AppError.EXPIRED_LINK)
+            return SegmentProbeAttempt(fromRange = true, failureReason = reason, isDead404Or410 = isDead)
+        }
+        return SegmentProbeAttempt(fromRange = true, failureReason = "seg timeout")
+    }
+
+    private suspend fun runPeekSegmentProbe(
+        segmentUrl: String,
+        hdrs: Map<String, String>,
+        isAesEncrypted: Boolean
+    ): SegmentProbeAttempt {
+        val getInfo = withTimeoutOrNull(VERIFY_SEGMENT_PROBE_TIMEOUT_MS + 250L) {
+            withCancellableHttpCalls(timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS) {
+                runCatching {
+                    http.peekHlsSegmentGet(
+                        url = segmentUrl,
+                        headers = hdrs,
+                        timeoutMs = VERIFY_SEGMENT_PROBE_TIMEOUT_MS,
+                        isAesEncrypted = isAesEncrypted
+                    )
+                }.getOrNull()
+            }
+        }
+        if (getInfo != null) {
+            val gct = getInfo.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            val isHtmlOrJson = gct.startsWith("text/html") ||
+                gct.startsWith("application/xhtml") ||
+                gct.startsWith("application/json")
+            if (getInfo.code in 200..299 && !isHtmlOrJson) {
+                return SegmentProbeAttempt(fromRange = false, headInfo = getInfo)
+            }
+            val reason = if (getInfo.code in 200..299) "seg non-media" else "seg HTTP ${getInfo.code}"
+            return SegmentProbeAttempt(
+                fromRange = false,
+                failureReason = reason,
+                isDead404Or410 = getInfo.code == 404 || getInfo.code == 410
+            )
+        }
+        return SegmentProbeAttempt(fromRange = false, failureReason = "seg timeout")
+    }
+
+    private suspend fun raceRangeAndPeekSegment(
+        segmentUrl: String,
+        hdrs: Map<String, String>,
+        isAesEncrypted: Boolean
+    ): SegmentProbeAttempt = coroutineScope {
+        val rangeFailed = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+        val results = kotlinx.coroutines.channels.Channel<SegmentProbeAttempt>(capacity = 2)
+        val rangeJob = async(Dispatchers.IO) {
+            val res = runRangeSegmentProbe(segmentUrl, hdrs)
+            if (res.headInfo == null) {
+                rangeFailed.trySend(Unit)
+            }
+            results.trySend(res)
+        }
+        val peekJob = async(Dispatchers.IO) {
+            withTimeoutOrNull(HEDGE_SEGMENT_PEEK_DELAY_MS) {
+                rangeFailed.receiveCatching()
+            }
+            val res = runPeekSegmentProbe(segmentUrl, hdrs, isAesEncrypted)
+            results.trySend(res)
+        }
+
+        var lastReason: String? = null
+        var sawRejectedRange = false
+        try {
+            repeat(2) {
+                val attempt = results.receiveCatching().getOrNull() ?: return@repeat
+                if (attempt.rejectedRange) {
+                    sawRejectedRange = true
+                }
+                if (attempt.headInfo != null) {
+                    // If unranged GET won while Range failed or stalled past the hedge window,
+                    // remember this host so future verifications finish in 1 RTT.
+                    val markNoRange = sawRejectedRange || !attempt.fromRange
+                    return@coroutineScope attempt.copy(rejectedRange = markNoRange)
+                }
+                if (!attempt.failureReason.isNullOrBlank()) {
+                    lastReason = attempt.failureReason
+                }
+                if (attempt.isDead404Or410) {
+                    return@coroutineScope attempt.copy(rejectedRange = sawRejectedRange)
+                }
+            }
+        } finally {
+            rangeJob.cancel()
+            peekJob.cancel()
+            rangeFailed.close()
+            results.close()
+        }
+        SegmentProbeAttempt(
+            fromRange = false,
+            failureReason = lastReason ?: "seg rejected",
+            rejectedRange = sawRejectedRange
+        )
     }
 
     private fun isLikelyDisguisedSegmentUrl(url: String): Boolean {
@@ -528,6 +622,16 @@ class HlsExtractor @Inject constructor(
                     ?: return HlsVerificationResult(null, lastSegFail ?: "seg rejected")
                 effectiveHeaders = winResult.first
                 verifiedSegProbe = winningSeg to winResult.second
+            }
+
+            HlsPlaylistCache.shared.put(url, text, effectiveMasterUrl, effectiveHeaders)
+            if (!variantText.isNullOrBlank() && probedVariant != null) {
+                HlsPlaylistCache.shared.put(
+                    url = probedVariant.variantUrl,
+                    text = variantText,
+                    finalUrl = probedVariantFinalUrl ?: probedVariant.variantUrl,
+                    headers = effectiveHeaders
+                )
             }
 
             val probedDurationSeconds = sanitizedFirstVariant?.totalDurationSec?.roundToLong() ?: 0L
@@ -748,6 +852,8 @@ class HlsExtractor @Inject constructor(
                     effectiveHeaders = verifiedHeaders
                         ?: return HlsVerificationResult(null, lastSegFail ?: "seg rejected")
                 }
+
+                HlsPlaylistCache.shared.put(url, text, effectiveMasterUrl, effectiveHeaders)
 
                 // 2. Otherwise probe representative media segment(s) — reusing the already-verified segment
                 //    when available so single-level playlists never pay a duplicate HTTP round-trip.
@@ -989,6 +1095,7 @@ class HlsExtractor @Inject constructor(
         const val SEGMENT_PROBE_TIMEOUT_MS = 1_200L
         const val DIRECT_SEGMENT_PROBE_TIMEOUT_MS = 1_800L
         const val HEDGE_RELAXED_HEADER_DELAY_MS = 150L
+        const val HEDGE_SEGMENT_PEEK_DELAY_MS = 220L
         const val TS_TO_MP4_CONTAINER_FACTOR = 0.94
         const val MIN_CALIBRATION_SCALE = 0.85
         const val MAX_CALIBRATION_SCALE = 1.35

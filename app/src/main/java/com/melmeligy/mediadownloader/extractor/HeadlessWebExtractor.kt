@@ -108,6 +108,7 @@ class HeadlessWebExtractor @Inject constructor(
         )
         val localCaptured = CopyOnWriteArrayList<MediaStreamPayload>()
         val discoveredEmbedUrls = CopyOnWriteArrayList<String>()
+        val discoveredEmbedLabels = ConcurrentHashMap<String, String>()
         val discoveredAjaxServers = CopyOnWriteArrayList<StreamingPortalResolver.AjaxServerSpec>()
         val prefetched = consumePrefetchedMetadataHint(targetUrl)
         val capturedTitleRef = AtomicReference<String?>(
@@ -124,6 +125,7 @@ class HeadlessWebExtractor @Inject constructor(
 
         val destroyed = AtomicBoolean(false)
         val pageFinished = AtomicBoolean(false)
+        val domCommitVisible = AtomicBoolean(false)
         val cloudflareChallengeActive = AtomicBoolean(false)
         val realContentSeenAtMs = AtomicLong(-1L)
         val metadataScrapeTriggered = AtomicBoolean(false)
@@ -252,27 +254,27 @@ class HeadlessWebExtractor @Inject constructor(
 
         suspend fun collectDomEmbedIframes(view: WebView): List<String> {
             if (destroyed.get()) return emptyList()
-            val resultCh = Channel<List<String>>(Channel.CONFLATED)
+            val resultCh = Channel<List<Pair<String, String>>>(Channel.CONFLATED)
             withContext(dispatchers.main) {
                 runCatching {
                     view.evaluateJavascript(EMBED_IFRAME_SCRAPE_JS) { jsonStr ->
-                        val parsed = runCatching {
-                            val unquoted = (org.json.JSONTokener(jsonStr ?: "").nextValue() as? String)
-                                ?: jsonStr?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"")
-                            if (!unquoted.isNullOrBlank() && unquoted.startsWith("[")) {
-                                val arr = org.json.JSONArray(unquoted)
-                                List(arr.length()) { idx -> arr.optString(idx) }.filter { it.isNotBlank() }
-                            } else {
-                                emptyList()
-                            }
-                        }.getOrDefault(emptyList())
-                        resultCh.trySend(parsed)
+                        resultCh.trySend(parseScrapedEmbedsJson(jsonStr))
                     }
                 }.onFailure { resultCh.trySend(emptyList()) }
             }
-            val list = withTimeoutOrNull(450L) { resultCh.receiveCatching().getOrNull() }.orEmpty()
+            val pairs = withTimeoutOrNull(450L) { resultCh.receiveCatching().getOrNull() }.orEmpty()
             resultCh.close()
-            return list
+            return pairs.map { (rawUrl, label) ->
+                if (label.isNotBlank()) {
+                    discoveredEmbedLabels.putIfAbsent(rawUrl, label)
+                    discoveredEmbedLabels.putIfAbsent(rawUrl.substringBefore('#').trimEnd('/').lowercase(), label)
+                    StreamingPortalResolver.decodePortalEmbedUrl(rawUrl)?.let { dec ->
+                        discoveredEmbedLabels.putIfAbsent(dec, label)
+                        discoveredEmbedLabels.putIfAbsent(dec.substringBefore('#').trimEnd('/').lowercase(), label)
+                    }
+                }
+                rawUrl
+            }
         }
 
         suspend fun collectDomAjaxServers(view: WebView, pageUrlForResolve: String): List<StreamingPortalResolver.AjaxServerSpec> {
@@ -474,12 +476,16 @@ class HeadlessWebExtractor @Inject constructor(
                             )
                             return
                         }
-                        if (promoted == null && cloudflareChallengeActive.getAndSet(false)) {
+                        if (promoted == null) {
+                            if (cloudflareChallengeActive.getAndSet(false)) {
+                                progressTracker.update(
+                                    ExtractionProgressTracker.STAGE_SERVERS,
+                                    sessionId = boundSessionId
+                                )
+                            }
                             realContentSeenAtMs.compareAndSet(-1L, System.currentTimeMillis())
-                            progressTracker.update(
-                                ExtractionProgressTracker.STAGE_SERVERS,
-                                sessionId = boundSessionId
-                            )
+                            domCommitVisible.set(true)
+                            wakeSignal.trySend(Unit)
                         }
                         if (!url.isNullOrBlank() && url.startsWith("http")) {
                             if (promoted == null) {
@@ -620,6 +626,7 @@ class HeadlessWebExtractor @Inject constructor(
                     cookieLookup(currentPageUrl)?.takeIf { it.isNotBlank() }?.let { put("Cookie", it) }
                 }
                 val mainsJsHint = discoveredMainsJsUrl.get()
+                val labelSnapshot = discoveredEmbedLabels.toMap()
 
                 if (promotableNow.isNotEmpty() && ajaxSnapshot.isNotEmpty() && portalAvailable && ajaxAvailable) {
                     com.melmeligy.mediadownloader.core.AppLogger.d(
@@ -627,15 +634,18 @@ class HeadlessWebExtractor @Inject constructor(
                         "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s) + ${ajaxSnapshot.size} AJAX server(s)"
                     )
                     val combined = async(dispatchers.extractionIo) {
-                        runCatching {
+                        val res = runCatching {
                             portalResolver.resolveHybridDomAndAjax(
                                 pageUrl = currentPageUrl,
                                 embedUrls = promotableNow,
                                 ajaxServers = ajaxSnapshot,
                                 baseHeaders = hybridHeaders,
-                                mainsJsUrl = mainsJsHint
+                                mainsJsUrl = mainsJsHint,
+                                embedLabels = labelSnapshot
                             )
                         }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                        if (res.streams.isNotEmpty()) wakeSignal.trySend(Unit)
+                        res
                     }
                     hybridPortalJob = combined
                     hybridAjaxJob = combined
@@ -648,15 +658,18 @@ class HeadlessWebExtractor @Inject constructor(
                         "Hybrid parallel StreamingPortalResolver launched for ${promotableNow.size} DOM embed(s)"
                     )
                     hybridPortalJob = async(dispatchers.extractionIo) {
-                        runCatching {
+                        val res = runCatching {
                             portalResolver.resolveHybridDomAndAjax(
                                 pageUrl = currentPageUrl,
                                 embedUrls = promotableNow,
                                 ajaxServers = emptyList(),
                                 baseHeaders = hybridHeaders,
-                                mainsJsUrl = mainsJsHint
+                                mainsJsUrl = mainsJsHint,
+                                embedLabels = labelSnapshot
                             )
                         }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                        if (res.streams.isNotEmpty()) wakeSignal.trySend(Unit)
+                        res
                     }
                 }
 
@@ -666,15 +679,18 @@ class HeadlessWebExtractor @Inject constructor(
                         "Hybrid parallel StreamingPortalResolver launched for ${ajaxSnapshot.size} newly discovered AJAX server(s)"
                     )
                     hybridAjaxJob = async(dispatchers.extractionIo) {
-                        runCatching {
+                        val res = runCatching {
                             portalResolver.resolveHybridDomAndAjax(
                                 pageUrl = currentPageUrl,
                                 embedUrls = emptyList(),
                                 ajaxServers = ajaxSnapshot,
                                 baseHeaders = hybridHeaders,
-                                mainsJsUrl = mainsJsHint
+                                mainsJsUrl = mainsJsHint,
+                                embedLabels = labelSnapshot
                             )
                         }.getOrElse { StreamingPortalResolver.PortalExtractionResult(emptyList()) }
+                        if (res.streams.isNotEmpty()) wakeSignal.trySend(Unit)
+                        res
                     }
                 }
             }
@@ -752,16 +768,16 @@ class HeadlessWebExtractor @Inject constructor(
                     EarlyExitDecision.CONTINUE_WAITING -> Unit
                 }
 
-                // Fast DOM-ready polling (every ~300ms once real pageFinished or >= 1.2s):
-                // skip polling while a Cloudflare interstitial is active, and keep polling until BOTH
-                // DOM embeds and AJAX server tabs have been checked.
+                // Fast DOM-ready polling (as soon as real content commits visible or >= 350ms):
+                // skip polling while a Cloudflare interstitial is active, and decouple from
+                // unverified Server #0 captures so a broken default embed never stalls parallel
+                // OkHttp resolution of sibling servers & WeCima direct download links.
                 if (!isSocialFastMode &&
                     !cfActive &&
-                    firstVidAt == null &&
                     (hybridPortalJob == null || hybridAjaxJob == null) &&
                     webViewRef != null &&
-                    (pageFinished.get() || elapsed >= 1_200L) &&
-                    elapsed - lastDomPollAtMs >= DOM_READY_POLL_INTERVAL_MS
+                    (pageFinished.get() || domCommitVisible.get() || contentElapsed >= EARLY_DOM_POLL_START_MS) &&
+                    (lastDomPollAtMs == 0L || elapsed - lastDomPollAtMs >= DOM_READY_POLL_INTERVAL_MS)
                 ) {
                     lastDomPollAtMs = elapsed
                     val domEmbeds = collectDomEmbedIframes(webViewRef!!)
@@ -817,10 +833,35 @@ class HeadlessWebExtractor @Inject constructor(
                 ensureOuterMetadataScraped(webViewRef, tempEngineRef)
             }
 
+            // Check if fast hybrid OkHttp resolver already completed while scraping metadata or verifying
+            collectCompletedHybridResult()
+
             // Inline-verify any outer-page candidates BEFORE deciding whether to promote embed servers!
             if (verifiedStreams.isEmpty() && localCaptured.isNotEmpty()) {
                 progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES, sessionId = boundSessionId)
                 verifyNewCapturedPayloads(embedContextUrl = lastEmbedIframeUrl.get())
+            }
+
+            // Give an already-running OkHttp hybrid race a brief finish window before tearing down
+            // the outer page for heavy top-level WebView embed promotion.
+            if (verifiedStreams.none { it.type == MediaType.VIDEO } && !collectCompletedHybridResult()) {
+                val runningHybrid = listOfNotNull(hybridPortalJob, hybridAjaxJob)
+                    .distinct()
+                    .filter { !it.isCompleted && !it.isCancelled }
+                if (runningHybrid.isNotEmpty()) {
+                    for (job in runningHybrid) {
+                        val quickRes = withTimeoutOrNull(HYBRID_PRE_PROMOTE_GRACE_MS) {
+                            runCatching { job.await() }.getOrNull()
+                        }
+                        if (quickRes != null && quickRes.streams.isNotEmpty()) {
+                            verifiedStreams.addAll(quickRes.streams)
+                            if (!quickRes.posterUrl.isNullOrBlank() && capturedThumbRef.get().isNullOrBlank()) {
+                                capturedThumbRef.set(quickRes.posterUrl)
+                            }
+                            break
+                        }
+                    }
+                }
             }
 
             // Bounded top-level embed <iframe> promotion when no VERIFIED video stream has been found yet
@@ -1063,18 +1104,23 @@ class HeadlessWebExtractor @Inject constructor(
                 )
                 return@withTimeoutOrNull null
             }
-            val videos = filteredVideos
+            val normalizedVideos = filteredVideos.map { s ->
+                val durSec = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                val normH = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
+                    url = s.url,
+                    label = s.label,
+                    width = s.width,
+                    height = s.height,
+                    bitrateKbps = s.bitrateKbps,
+                    sizeBytes = s.sizeBytes,
+                    durationSeconds = durSec
+                )
+                s.copy(height = normH ?: s.height)
+            }
+            val collapsedVideos = collapseHeadlessVideosWithBackup(normalizedVideos)
+            val videos = collapsedVideos
                 .mapIndexed { i, s ->
-                    val durSec = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
-                    val normH = com.melmeligy.mediadownloader.core.util.FormatUtils.inferStandardQualityFromMetadata(
-                        url = s.url,
-                        label = s.label,
-                        width = s.width,
-                        height = s.height,
-                        bitrateKbps = s.bitrateKbps,
-                        sizeBytes = s.sizeBytes,
-                        durationSeconds = durSec
-                    )
+                    val normH = s.height
                     val label = when {
                         normH != null && normH >= 1080 -> "${normH}p FHD"
                         normH != null && normH >= 720 -> "${normH}p HD"
@@ -1088,7 +1134,7 @@ class HeadlessWebExtractor @Inject constructor(
                         val combined = if (vSize > 0 && aSize > 0) vSize + aSize else s.sizeBytes
                         s.copy(
                             id = "hl-v-$i",
-                            height = normH ?: s.height,
+                            height = normH,
                             label = label,
                             sizeBytes = combined,
                             headers = s.headers + mapOf(
@@ -1098,7 +1144,7 @@ class HeadlessWebExtractor @Inject constructor(
                             )
                         )
                     } else {
-                        s.copy(id = "hl-v-$i", height = normH ?: s.height, label = label)
+                        s.copy(id = "hl-v-$i", height = normH, label = label)
                     }
                 }
 
@@ -1410,6 +1456,7 @@ class HeadlessWebExtractor @Inject constructor(
                 val finalHeaders = LinkedHashMap<String, String>(
                     workingHeaders.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
                 ).apply {
+                    put("X-Internal-Probed", "true")
                     if (info.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
                 }
                 val finalStreamUrl = if (InterceptedMediaExtractor.shouldPreserveRedirectorUrl(cleanUrl, info.finalUrl)) {
@@ -1507,7 +1554,9 @@ class HeadlessWebExtractor @Inject constructor(
         private const val METADATA_HINT_TTL_MS = 30_000L
         private const val MAX_METADATA_HINTS = 32
         private const val EARLY_EXIT_TICK_MS = 120L
-        private const val DOM_READY_POLL_INTERVAL_MS = 300L
+        private const val EARLY_DOM_POLL_START_MS = 350L
+        private const val HYBRID_PRE_PROMOTE_GRACE_MS = 600L
+        private const val DOM_READY_POLL_INTERVAL_MS = 280L
         private const val OUTER_EMBED_READY_EARLY_BREAK_MS = 2_200L
         private const val POST_TAB_CLICK_GRACE_MS = 3_400L
         private const val NEXT_SERVER_TAB_DELAY_MS = 1_800L
@@ -1521,6 +1570,48 @@ class HeadlessWebExtractor @Inject constructor(
         internal const val SOCIAL_FAST_TIMEOUT_MS = 3_800L
         internal const val MAX_TOTAL_EXTRACTION_MS = 22_000L
         internal const val MAX_SOCIAL_TOTAL_EXTRACTION_MS = 7_500L
+
+        internal fun collapseHeadlessVideosWithBackup(videos: List<MediaStream>): List<MediaStream> {
+            if (videos.size <= 1) return videos
+            val hasKnownHeight = videos.any { it.height != null }
+            return videos
+                .groupBy { it.height }
+                .flatMap { (h, group) ->
+                    if (h != null) {
+                        val best = StreamCandidateRanker.pickBestForResolution(group) ?: return@flatMap emptyList()
+                        val bestHost = UrlUtils.host(best.url)?.lowercase()
+                        val backup = group.firstOrNull { alt ->
+                            alt.url != best.url &&
+                                (bestHost == null || UrlUtils.host(alt.url)?.lowercase() != bestHost)
+                        } ?: group.firstOrNull { it.url != best.url }
+                        listOf(attachBackupMirrorStatic(best, backup))
+                    } else if (hasKnownHeight) {
+                        emptyList()
+                    } else {
+                        group.take(2)
+                    }
+                }
+                .sortedWith(
+                    compareByDescending<MediaStream> { it.height ?: it.bitrateKbps ?: 0 }
+                        .thenByDescending { it.sizeBytes ?: 0L }
+                )
+        }
+
+        private fun attachBackupMirrorStatic(primary: MediaStream, backup: MediaStream?): MediaStream {
+            if (backup == null || backup.url == primary.url) return primary
+            val cleanBackupHeaders = backup.headers.filterKeys { !it.startsWith("X-Internal-", ignoreCase = true) }
+            val extra = LinkedHashMap<String, String>(primary.headers).apply {
+                put("X-Internal-Fallback-Url", backup.url)
+                put("X-Internal-Fallback-IsHls", backup.isHls.toString())
+                if (backup.container.isNotBlank()) {
+                    put("X-Internal-Fallback-Container", backup.container)
+                }
+                if (cleanBackupHeaders.isNotEmpty()) {
+                    put("X-Internal-Fallback-Headers", com.melmeligy.mediadownloader.core.util.JsonUtils.mapToJson(cleanBackupHeaders))
+                }
+            }
+            return primary.copy(headers = extra)
+        }
 
         private data class MetadataHint(
             val title: String?,
@@ -1685,8 +1776,20 @@ class HeadlessWebExtractor @Inject constructor(
             if (valid.size <= 1) return valid.take(maxEmbeds)
             return valid.withIndex()
                 .sortedWith(
-                    compareByDescending<IndexedValue<String>> { HostHealthRegistry.shared.scoreForRanking(it.value) }
-                        .thenBy { it.index }
+                    compareByDescending<IndexedValue<String>> { (_, candidateUrl) ->
+                        var score = HostHealthRegistry.shared.scoreForRanking(candidateUrl)
+                        if (allowDirectMediaFiles) {
+                            val ext = UrlUtils.fileExtension(candidateUrl)?.lowercase()
+                            val host = UrlUtils.host(candidateUrl)?.lowercase().orEmpty()
+                            score += when {
+                                ext in setOf("mp4", "mkv", "webm", "m3u8") -> 25
+                                host.contains("vidara") || host.contains("byse") || host.contains("filemoon") ||
+                                    host.contains("moonplayer") || host.contains("uqload") -> 15
+                                else -> 0
+                            }
+                        }
+                        score
+                    }.thenBy { it.index }
                 )
                 .map { it.value }
                 .take(maxEmbeds)
@@ -1795,6 +1898,32 @@ class HeadlessWebExtractor @Inject constructor(
             else if (uri.port > 0) "$scheme://$host:${uri.port}" else "$scheme://$host"
         }.getOrNull()
 
+        internal fun parseScrapedEmbedsJson(rawJson: String?): List<Pair<String, String>> {
+            if (rawJson.isNullOrBlank() || rawJson == "null") return emptyList()
+            val unquoted = runCatching {
+                (org.json.JSONTokener(rawJson).nextValue() as? String)
+                    ?: rawJson.trim().removeSurrounding("\"").replace("\\\"", "\"")
+            }.getOrNull() ?: return emptyList()
+            if (!unquoted.startsWith("[")) return emptyList()
+            val arr = runCatching { org.json.JSONArray(unquoted) }.getOrNull() ?: return emptyList()
+            val out = ArrayList<Pair<String, String>>(arr.length())
+            for (idx in 0 until arr.length()) {
+                val item = arr.opt(idx)
+                when (item) {
+                    is org.json.JSONObject -> {
+                        val u = item.optString("u").trim()
+                        val l = item.optString("l").trim()
+                        if (u.isNotEmpty()) out.add(u to l)
+                    }
+                    is String -> {
+                        val u = item.trim()
+                        if (u.isNotEmpty()) out.add(u to "")
+                    }
+                }
+            }
+            return out
+        }
+
         val EMBED_IFRAME_SCRAPE_JS =
             "(function(){try{" +
                 "var out=[];var seen={};" +
@@ -1806,31 +1935,36 @@ class HeadlessWebExtractor @Inject constructor(
                 "try{var idx=u.toLowerCase().indexOf('play.php?to=');if(idx>=0){var enc=u.slice(idx+12).split('&')[0];var dec=decodeURIComponent(enc).trim();var li=Math.max(dec.lastIndexOf('https://'),dec.lastIndexOf('http://'));if(li>0)dec=dec.slice(li);if(/^https?:\\/\\//i.test(dec)||dec.indexOf('//')===0)return dec;}}catch(e){}" +
                 "return u;" +
                 "}" +
-                "function addUrl(raw){" +
-                "if(!raw)return;raw=raw.trim();" +
+                "function labelOf(el){" +
+                "if(!el)return '';" +
+                "try{var q=el.querySelector&&el.querySelector('quality');var qt=q&&(q.innerText||q.textContent||'').trim();if(qt)return qt.slice(0,32);" +
+                "var txt=(el.getAttribute('title')||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim();return txt.slice(0,32);}catch(e){return '';}" +
+                "}" +
+                "function addUrl(raw,lbl){" +
+                "if(!raw)return;raw=raw.trim();lbl=(lbl||'').trim();" +
                 "if(!raw||raw.indexOf('about:')===0||raw.indexOf('javascript:')===0||raw.indexOf('data:')===0)return;" +
                 "if(!/^https?:\\/\\//i.test(raw)&&raw.indexOf('//')!==0&&raw.charAt(0)!=='/'&&/^[A-Za-z0-9+/=_-]{10,}$/.test(raw)){" +
                 "var dec=tryB64Url(raw);" +
                 "if(!dec){var clean=raw.replace(/\\+/g,'').trim();var pref=clean.indexOf('aHR0c')===0?clean:('aHR0c'+clean);dec=tryB64Url(pref);}" +
-                "if(!dec){if(raw.length>=40&&!seen[raw]){seen[raw]=true;out.push(raw);}return;}" +
+                "if(!dec){if(raw.length>=40&&!seen[raw]){seen[raw]=true;out.push({u:raw,l:lbl});}return;}" +
                 "raw=dec;" +
                 "}" +
                 "raw=unwrapPlay(raw);" +
-                "try{var abs=new URL(raw,location.href).href;if(/^https?:\\/\\//i.test(abs)&&!seen[abs]){seen[abs]=true;out.push(abs);}}catch(e){}" +
+                "try{var abs=new URL(raw,location.href).href;if(/^https?:\\/\\//i.test(abs)&&!seen[abs]){seen[abs]=true;out.push({u:abs,l:lbl});}}catch(e){}" +
                 "}" +
                 "var frames=document.querySelectorAll('iframe[src],iframe[data-src],iframe[data-lazy-src]');" +
                 "for(var i=0;i<frames.length;i++){" +
-                "addUrl(frames[i].getAttribute('src')||frames[i].getAttribute('data-src')||frames[i].getAttribute('data-lazy-src')||'');" +
+                "addUrl(frames[i].getAttribute('src')||frames[i].getAttribute('data-src')||frames[i].getAttribute('data-lazy-src')||'',frames[i].getAttribute('title')||'');" +
                 "}" +
                 "var tabs=document.querySelectorAll('[data-url],[data-embed],[data-iframe],[data-watch],[data-link],[data-player],[data-src],[data-href]');" +
                 "for(var j=0;j<tabs.length;j++){" +
                 "var tag=(tabs[j].tagName||'').toLowerCase();" +
                 "if(tag==='img'||tag==='script'||tag==='link'||tag==='source'||tag==='video'||tag==='audio')continue;" +
-                "addUrl(tabs[j].getAttribute('data-url')||tabs[j].getAttribute('data-embed')||tabs[j].getAttribute('data-iframe')||tabs[j].getAttribute('data-watch')||tabs[j].getAttribute('data-link')||tabs[j].getAttribute('data-player')||tabs[j].getAttribute('data-src')||tabs[j].getAttribute('data-href')||'');" +
+                "addUrl(tabs[j].getAttribute('data-url')||tabs[j].getAttribute('data-embed')||tabs[j].getAttribute('data-iframe')||tabs[j].getAttribute('data-watch')||tabs[j].getAttribute('data-link')||tabs[j].getAttribute('data-player')||tabs[j].getAttribute('data-src')||tabs[j].getAttribute('data-href')||'',labelOf(tabs[j]));" +
                 "}" +
                 "var dlLinks=document.querySelectorAll('.List--Download--Wecima--Single a[href], .openLinkDown[data-href], a.downloadsLink[href]');" +
                 "for(var k=0;k<dlLinks.length;k++){" +
-                "addUrl(dlLinks[k].getAttribute('data-href')||dlLinks[k].getAttribute('href')||'');" +
+                "addUrl(dlLinks[k].getAttribute('data-href')||dlLinks[k].getAttribute('href')||'',labelOf(dlLinks[k]));" +
                 "}" +
                 "return JSON.stringify(out);" +
                 "}catch(e){return '[]';}})();"

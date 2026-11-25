@@ -60,6 +60,7 @@ class BrowserViewModel @Inject constructor(
     private var resolveJob: kotlinx.coroutines.Job? = null
     private var sizeRefineJob: kotlinx.coroutines.Job? = null
     private var thumbCacheJob: kotlinx.coroutines.Job? = null
+    private var hlsPrewarmJob: kotlinx.coroutines.Job? = null
     private var currentSheetUrl: String = ""
 
     init {
@@ -75,6 +76,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        hlsPrewarmJob?.cancel()
         progressTracker.reset()
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
@@ -86,6 +88,8 @@ class BrowserViewModel @Inject constructor(
         sizeRefineJob = null
         thumbCacheJob?.cancel()
         thumbCacheJob = null
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = null
         progressTracker.reset()
     }
 
@@ -94,6 +98,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        hlsPrewarmJob?.cancel()
         val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
@@ -126,6 +131,13 @@ class BrowserViewModel @Inject constructor(
             _formatState.value = nextState
             if (nextState is com.melmeligy.mediadownloader.core.Resource.Success) {
                 val resolved = nextState.data
+                if (resolved.streams.any { it.isHls }) {
+                    hlsPrewarmJob = viewModelScope.launch {
+                        runCatching {
+                            streamSizeRefiner.prewarmDefaultHlsVariant(resolved, settings.value.defaultVideoQuality)
+                        }
+                    }
+                }
                 if (streamSizeRefiner.needsRefinement(resolved)) {
                     sizeRefineJob = viewModelScope.launch {
                         val refined = runCatching { streamSizeRefiner.refineMissingSizes(resolved) }.getOrNull()

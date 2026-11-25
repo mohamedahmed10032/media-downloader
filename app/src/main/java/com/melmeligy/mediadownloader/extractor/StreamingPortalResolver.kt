@@ -140,7 +140,7 @@ class StreamingPortalResolver(
         if (directJobs.isNotEmpty()) {
             progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
             val (streams, poster) = executeServerJobs(
-                jobs = rankServerJobs(directJobs),
+                jobs = rankServerJobs(directJobs).take(MAX_SERVERS),
                 baseHeaders = baseHeaders,
                 visitedEmbeds = visitedEmbeds,
                 idCounter = idCounter
@@ -179,7 +179,7 @@ class StreamingPortalResolver(
             }
 
             val (streams, poster) = executeServerJobs(
-                jobs = rankServerJobs(subJobs),
+                jobs = rankServerJobs(subJobs).take(MAX_SERVERS),
                 baseHeaders = subHeaders,
                 visitedEmbeds = visitedEmbeds,
                 idCounter = idCounter
@@ -248,7 +248,8 @@ class StreamingPortalResolver(
         embedUrls: Collection<String>,
         ajaxServers: Collection<AjaxServerSpec>,
         baseHeaders: Map<String, String>,
-        mainsJsUrl: String? = null
+        mainsJsUrl: String? = null,
+        embedLabels: Map<String, String> = emptyMap()
     ): PortalExtractionResult = withContext(Dispatchers.IO) {
         if (embedUrls.isEmpty() && ajaxServers.isEmpty()) return@withContext PortalExtractionResult(emptyList())
         val visitedEmbeds = ConcurrentHashMap.newKeySet<String>()
@@ -262,7 +263,11 @@ class StreamingPortalResolver(
             val resolved = normalizeEmbedUrl(pageUrl, decoded) ?: return false
             if (isBlockedOrNonPlayerEmbed(resolved)) return false
             if (seen.add(dedupeEmbedKey(resolved))) {
-                jobs.add(ServerJob.DirectEmbed(resolved, "Embed ${idx + 1}", pageUrl))
+                val label = embedLabels[raw]?.takeIf { it.isNotBlank() }
+                    ?: embedLabels[resolved]?.takeIf { it.isNotBlank() }
+                    ?: embedLabels[resolved.substringBefore('#').trimEnd('/').lowercase()]?.takeIf { it.isNotBlank() }
+                    ?: "Embed ${idx + 1}"
+                jobs.add(ServerJob.DirectEmbed(resolved, label, pageUrl))
             }
             return true
         }
@@ -622,7 +627,7 @@ class StreamingPortalResolver(
                 }
         }
 
-        return jobs.take(MAX_SERVERS)
+        return jobs
     }
 
     internal fun resolveServerAjaxEndpoint(pageUrl: String, html: String): String? {
@@ -807,13 +812,17 @@ class StreamingPortalResolver(
                     val hasHdOrBetter = distinctHeights.any { it >= 720 }
                     val hasMultiQualityHls = collectedStreams.any { it.isHls } && distinctHeights.size >= 2
                     val hasDirectProgressive = collectedStreams.any { !it.isHls }
-                    if (hasMultiQualityHls && (hasDirectProgressive || remaining == 0)) {
+                    val hasMultiQualityProgressive = hasDirectProgressive && distinctHeights.size >= 2 && hasHdOrBetter
+                    if ((hasMultiQualityHls && hasHdOrBetter && (hasDirectProgressive || remaining == 0)) ||
+                        (hasMultiQualityProgressive && (collectedStreams.any { it.isHls } || remaining == 0))
+                    ) {
                         break
                     }
                     if (firstWinDeadlineMs == null) {
                         if (remaining == 0) break
                         val graceMs = when {
-                            hasMultiQualityHls || (distinctHeights.size >= 2 && hasHdOrBetter) -> 250L
+                            (hasMultiQualityHls && hasHdOrBetter) || hasMultiQualityProgressive -> FAST_COMPLETE_MERGE_GRACE_MS
+                            hasMultiQualityHls || (distinctHeights.size >= 2 && hasHdOrBetter) -> 220L
                             distinctHeights.isEmpty() -> UNKNOWN_HEIGHT_MERGE_GRACE_MS
                             else -> SIBLING_MERGE_GRACE_MS
                         }
@@ -1291,6 +1300,7 @@ class StreamingPortalResolver(
         }
 
         val finalHeaders = LinkedHashMap<String, String>(workingHeaders).apply {
+            put("X-Internal-Probed", "true")
             if (probe.acceptsRanges) put("X-Internal-Accepts-Ranges", "true")
         }
 
@@ -1582,7 +1592,7 @@ class StreamingPortalResolver(
             val jobs = collectServerJobs(mirrorUrl, mirrorHtml, mirrorDoc)
             if (jobs.isNotEmpty()) {
                 val (streams, poster) = executeServerJobs(
-                    jobs = rankServerJobs(jobs),
+                    jobs = rankServerJobs(jobs).take(MAX_SERVERS),
                     baseHeaders = mirrorHeaders,
                     visitedEmbeds = visitedEmbeds,
                     idCounter = idCounter
@@ -1758,6 +1768,7 @@ class StreamingPortalResolver(
         const val EMBED_HOP_TIMEOUT_MS = 3_500L
         const val PROGRESSIVE_PROBE_TIMEOUT_MS = 2_200L
         const val PORTAL_TOTAL_BUDGET_MS = 5_500L
+        const val FAST_COMPLETE_MERGE_GRACE_MS = 180L
         const val SIBLING_MERGE_GRACE_MS = 850L
         const val UNKNOWN_HEIGHT_MERGE_GRACE_MS = 1_450L
 

@@ -124,9 +124,23 @@ class HtmlMediaExtractor @Inject constructor(
             clearCloudflareChallengeHint(host)
         }
 
-        // Short-TTL Cloudflare fast-skip: if this host just returned HTTP 403 (cf-mitigated) and
-        // CookieManager has no cf_clearance yet, jump straight to HeadlessWebExtractor instead of
-        // wasting time on another blocked plain-HTTP fetch.
+        // Publish immediate human-readable title preview from URL slug for portal watch/download
+        // pages so the loading sheet shows the movie/episode title at 0ms before network I/O completes.
+        if (allowHeadlessFallback && host.isNotEmpty() && InterceptedMediaExtractor.isPortalWatchOrDownloadUrl(url)) {
+            val slugTitle = HtmlThumbnailExtractor.humanReadableTitleFromUrl(url)
+                ?.takeIf { !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url) }
+            if (slugTitle != null) {
+                progressTracker.updatePreview(
+                    title = slugTitle,
+                    sourceHost = host,
+                    sourceUrl = url
+                )
+            }
+        }
+
+        // 15-minute Cloudflare fast-skip: if this host recently returned HTTP 403 (cf-mitigated)
+        // and CookieManager still has no cf_clearance, jump straight to HeadlessWebExtractor
+        // instead of wasting another blocked plain-HTTP round-trip.
         if (allowHeadlessFallback && host.isNotEmpty() && !hasCfClearance && isCloudflareChallengeHintActive(host)) {
             com.melmeligy.mediadownloader.core.AppLogger.d(
                 "HtmlExtractor",
@@ -1655,7 +1669,7 @@ class HtmlMediaExtractor @Inject constructor(
         private const val INITIAL_PAGE_TIMEOUT_MS = 6_000L
         private const val IFRAME_FALLBACK_TIMEOUT_MS = 3_500L
         private const val DIRECT_PROBE_TIMEOUT_MS = 2_000L
-        internal const val CF_HINT_TTL_MS = 180_000L
+        internal const val CF_HINT_TTL_MS = 900_000L
         private val cfChallengeHints = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
         internal fun clearAllCloudflareHintsForTests() {
