@@ -132,7 +132,7 @@ class HtmlMediaExtractor @Inject constructor(
                 "HtmlExtractor",
                 "Skipping blocked static fetch for host=$host (active CF challenge hint, no cf_clearance)"
             )
-            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            progressTracker.update(ExtractionProgressTracker.STAGE_CLOUDFLARE)
             val headlessResult = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -152,6 +152,7 @@ class HtmlMediaExtractor @Inject constructor(
         }
 
         var staticFetchFailureNote: String? = null
+        var sawCloudflareChallenge = false
         val html = try {
             withTimeoutOrNull(INITIAL_PAGE_TIMEOUT_MS) {
                 withCancellableHttpCalls(timeoutMs = INITIAL_PAGE_TIMEOUT_MS) {
@@ -163,6 +164,7 @@ class HtmlMediaExtractor @Inject constructor(
         } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
             if (me.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED && host.isNotEmpty() && !hasCfClearance) {
                 markCloudflareChallengeHint(host)
+                sawCloudflareChallenge = true
             }
             staticFetchFailureNote = when (me.error) {
                 com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ->
@@ -184,7 +186,10 @@ class HtmlMediaExtractor @Inject constructor(
                 staticFetchFailureNote?.let { progressTracker.setDiagnosticReason(it) }
                 return@withContext null
             }
-            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            progressTracker.update(
+                if (sawCloudflareChallenge) ExtractionProgressTracker.STAGE_CLOUDFLARE
+                else ExtractionProgressTracker.STAGE_HEADLESS
+            )
             val headlessResult = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -230,6 +235,11 @@ class HtmlMediaExtractor @Inject constructor(
             val fallbackThumb = parsed?.thumbnailUrl?.takeIf { it.isNotBlank() }
                 ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractThumbnail(it, url, html) }
             HeadlessWebExtractor.hintPageMetadata(url, fallbackTitle, fallbackThumb)
+            progressTracker.updatePreview(
+                title = fallbackTitle,
+                thumbnailUrl = fallbackThumb,
+                sourceHost = host
+            )
             val headless = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -308,6 +318,17 @@ class HtmlMediaExtractor @Inject constructor(
     ): ResolvedMedia? = coroutineScope {
         if (html.isBlank()) return@coroutineScope null
         val doc = Jsoup.parse(html, pageUrl)
+        // Publish live preview title & poster immediately on top-level pages before slow embed/server probes
+        if (allowEmbedFollow) {
+            val earlyTitle = HtmlThumbnailExtractor.extractTitle(doc, pageUrl)
+                .takeIf { !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, pageUrl) }
+            val earlyThumb = HtmlThumbnailExtractor.extractThumbnail(doc, pageUrl, html)
+            progressTracker.updatePreview(
+                title = earlyTitle,
+                thumbnailUrl = earlyThumb,
+                sourceHost = UrlUtils.host(pageUrl)
+            )
+        }
         val found = LinkedHashMap<String, MediaStream>()
         var counter = 0
         var customTitle: String? = null

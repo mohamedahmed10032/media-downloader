@@ -227,6 +227,7 @@ class YouTubeExtractor @Inject constructor(
         val title = videoDetails?.optString("title")?.takeIf { it.isNotBlank() } ?: "YouTube Video"
         val durationSec = videoDetails?.optString("lengthSeconds")?.toLongOrNull() ?: 0L
         val thumbnail = extractBestThumbnail(videoDetails, videoId)
+        progressTracker.updatePreview(title = title, thumbnailUrl = thumbnail, sourceHost = "youtube.com")
 
         val streamingData = root.optJSONObject("streamingData") ?: return null
         val formatsArr = streamingData.optJSONArray("formats") ?: JSONArray()

@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -121,6 +122,54 @@ class ExtractorRegistry private constructor(
         }
     }
 
+    /**
+     * Speculatively prepares a clipboard/pasted URL before the user taps Download:
+     * - Always skips if an interactive extraction is active, the URL is already cached/in-flight,
+     *   or the device is offline.
+     * - Pre-warms DNS resolution on `extractionIo` for every valid HTTP(S) URL.
+     * - For fast API-only platforms (YouTube, TikTok, X/Twitter, Vimeo, Dailymotion, SoundCloud,
+     *   Internet Archive) when no downloads are actively competing, runs a silent bounded
+     *   background resolution into the 90s cache so tapping Download opens the sheet in 0ms.
+     */
+    fun prefetchSpeculative(rawUrl: String) {
+        val url = UrlUtils.normalize(rawUrl) ?: return
+        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return
+        if (!networkMonitor.isOnline()) return
+        if (priorityCoordinator?.isInteractiveExtractionActive() == true) return
+        if (peekCached(url) != null) return
+        val alreadyRunning = synchronized(inFlightLock) {
+            val existing = inFlight[url]
+            existing != null && !existing.deferred.isCompleted && !existing.deferred.isCancelled
+        }
+        if (alreadyRunning) return
+        if (!speculativePrefetched.add(url)) return
+        if (speculativePrefetched.size > MAX_CACHE_ENTRIES) {
+            speculativePrefetched.clear()
+            speculativePrefetched.add(url)
+        }
+
+        sharedScope.launch {
+            // 1. Lightweight DNS pre-warm for all sites (including movie portals like wecima.tips)
+            val host = UrlUtils.host(url)?.trim()?.takeIf { it.isNotEmpty() }
+            if (host != null) {
+                runCatching { java.net.InetAddress.getAllByName(host) }
+            }
+            // 2. Full API prefetch ONLY for fast JSON API platforms when idle (never launches heavy WebViews)
+            if (isSpeculativeApiPrefetchEligible(url) &&
+                priorityCoordinator?.isInteractiveExtractionActive() != true &&
+                priorityCoordinator?.hasActiveDownloads() != true
+            ) {
+                runCatching {
+                    kotlinx.coroutines.withTimeoutOrNull(SPECULATIVE_PREFETCH_TIMEOUT_MS) {
+                        resolveBackground(url)
+                    }
+                }
+            }
+        }
+    }
+
+    private val speculativePrefetched = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     private suspend fun resolveInternal(rawUrl: String, interactive: Boolean): ResolvedMedia = withContext(dispatchers.extractionIo) {
         val url = UrlUtils.normalize(rawUrl)
             ?: throw MediaException(AppError.INVALID_LINK)
@@ -221,12 +270,22 @@ class ExtractorRegistry private constructor(
         return if (hasFreshIntercepted) null else cached.media
     }
 
-    /** Removes any cached result for [rawUrl] (used on explicit user Retry or fresh browser capture). */
+    /** Removes any cached result and cancels any active in-flight extraction for [rawUrl] (used on explicit user Retry or fresh browser capture). */
     fun invalidate(rawUrl: String) {
         val trimmed = rawUrl.trim()
         if (trimmed.isNotEmpty()) {
+            val normalized = UrlUtils.normalize(trimmed)
             cache.remove(trimmed)
-            UrlUtils.normalize(trimmed)?.let { cache.remove(it) }
+            normalized?.let { cache.remove(it) }
+            synchronized(inFlightLock) {
+                listOfNotNull(trimmed, normalized).distinct().forEach { key ->
+                    inFlight.remove(key)?.let { entry ->
+                        if (!entry.deferred.isCompleted) {
+                            entry.deferred.cancel()
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -246,6 +305,7 @@ class ExtractorRegistry private constructor(
 
     fun clearCache() {
         cache.clear()
+        speculativePrefetched.clear()
     }
 
     private fun putCacheEntry(key: String, media: ResolvedMedia, now: Long, usedIntercepted: Boolean) {
@@ -351,9 +411,29 @@ class ExtractorRegistry private constructor(
 
     companion object {
         const val DEFAULT_CACHE_TTL_MS = 90_000L
+        const val SPECULATIVE_PREFETCH_TIMEOUT_MS = 4_500L
         private const val MAX_CACHE_ENTRIES = 64
         private const val INTERCEPTED_PRIORITY_THRESHOLD = 115
         private const val MAX_CONFIRMED_HTML = 256
+
+        /**
+         * Returns true only for fast JSON-API platforms (never heavy WebView/streaming portals)
+         * where speculative clipboard prefetch safely warms the 90s cache in background IO.
+         */
+        internal fun isSpeculativeApiPrefetchEligible(url: String): Boolean {
+            val host = UrlUtils.host(url)?.lowercase() ?: return false
+            return host.contains("youtube.com") ||
+                host.contains("youtu.be") ||
+                host.contains("youtube-nocookie.com") ||
+                host.contains("tiktok.com") ||
+                host.contains("twitter.com") ||
+                host.contains("x.com") ||
+                host.contains("vimeo.com") ||
+                host.contains("dailymotion.com") ||
+                host == "dai.ly" ||
+                host.contains("soundcloud.com") ||
+                host.contains("archive.org")
+        }
 
         private val confirmedHtmlUrls: MutableMap<String, Boolean> =
             java.util.Collections.synchronizedMap(

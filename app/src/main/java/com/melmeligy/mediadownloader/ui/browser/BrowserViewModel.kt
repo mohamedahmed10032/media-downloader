@@ -42,6 +42,8 @@ class BrowserViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     val loadingStage: StateFlow<String> = progressTracker.stage
+    val previewMetadata: StateFlow<com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker.PreviewMetadata?> =
+        progressTracker.preview
 
     /** Everything the interception layer found on the page currently being viewed. */
     val detections: StateFlow<List<MediaStreamPayload>> = interceptionEngine.detections

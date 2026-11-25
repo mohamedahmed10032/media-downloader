@@ -153,6 +153,7 @@ private fun ShareOverlaySheet(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
+    val previewMetadata by viewModel.previewMetadata.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
 
@@ -186,6 +187,7 @@ private fun ShareOverlaySheet(
                 url = url,
                 useShimmerLoading = true,
                 loadingMessage = loadingStage,
+                previewMetadata = previewMetadata,
                 defaultVideoQuality = settings.defaultVideoQuality,
                 defaultAudioBitrate = settings.defaultAudioBitrate,
                 onRetry = { viewModel.resolve(url, forceRetry = true) },

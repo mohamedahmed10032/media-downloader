@@ -1944,6 +1944,285 @@ internal object SocialMediaGalleryParsers {
         return null
     }
 
+    /**
+     * Returns true when TikTok's web hydration HTML explicitly signals a classified/gated post
+     * (e.g. `"isContentClassified": true` with an empty `video` object or mobile reflow
+     * `statusCode` 10249 / 100003 / 10204) so the extractor can jump straight to the mobile feed API.
+     */
+    fun isTikTokHydrationClassifiedOrGated(html: String): Boolean {
+        if (html.isBlank()) return false
+        val markerIdx = html.indexOf("__UNIVERSAL_DATA_FOR_REHYDRATION__")
+        if (markerIdx < 0) return false
+        val tagCloseIdx = html.indexOf('>', markerIdx)
+        val searchStart = if (tagCloseIdx >= 0) tagCloseIdx + 1 else markerIdx
+        val braceStart = html.indexOf('{', searchStart)
+        if (braceStart < 0) return false
+        val block = extractBalancedJson(html, braceStart) ?: return false
+        val root = runCatching { JSONObject(block) }.getOrNull() ?: return false
+        val scope = root.optJSONObject("__DEFAULT_SCOPE__") ?: return false
+        val detail = scope.optJSONObject("webapp.video-detail")
+            ?: scope.optJSONObject("webapp.reflow.video.detail")
+            ?: scope.optJSONObject("webapp.photo-detail")
+            ?: return false
+        val statusCode = detail.optInt("statusCode", 0)
+        if (statusCode in setOf(10249, 100003, 10204)) return true
+        val itemStruct = detail.optJSONObject("itemInfo")?.optJSONObject("itemStruct") ?: return false
+        val hasImages = (itemStruct.optJSONObject("imagePost")?.optJSONArray("images")?.length() ?: 0) > 0
+        val videoObj = itemStruct.optJSONObject("video")
+        val hasVideo = videoObj != null && (
+            (videoObj.optJSONArray("bitrateInfo")?.length() ?: 0) > 0 ||
+                videoObj.optString("playAddr").startsWith("http") ||
+                videoObj.optString("downloadAddr").startsWith("http")
+            )
+        return itemStruct.optBoolean("isContentClassified", false) && !hasImages && !hasVideo
+    }
+
+    /** Extracts a numeric post ID from TikTok hydration JSON if the URL lacked one. */
+    fun extractTikTokPostIdFromHtml(html: String): String? =
+        extractTikTokHydrationItemStruct(html)?.optString("id")?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }
+
+    /**
+     * Parses TikTok's native mobile feed API JSON (`/aweme/v1/feed/?aweme_id=<id>&aid=1340`).
+     * Enforces strict `aweme_id == targetPostId` matching when [targetPostId] is supplied so
+     * unrelated recommendation feed items are never surfaced if the target post was deleted.
+     */
+    fun parseTikTokAwemeFeedJson(
+        jsonText: String,
+        targetPostId: String?,
+        headers: Map<String, String>
+    ): ParsedPost? {
+        if (jsonText.isBlank() || !jsonText.trimStart().startsWith("{")) return null
+        val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: return null
+        val awemeList = root.optJSONArray("aweme_list") ?: return null
+        val cleanTarget = targetPostId?.trim()?.takeIf { it.isNotEmpty() }
+
+        var matched: JSONObject? = null
+        for (i in 0 until awemeList.length()) {
+            val item = awemeList.optJSONObject(i) ?: continue
+            val itemId = item.optString("aweme_id").trim()
+            if (cleanTarget == null || itemId == cleanTarget) {
+                matched = item
+                break
+            }
+        }
+        val aweme = matched ?: return null
+        val postId = aweme.optString("aweme_id").trim().takeIf { it.isNotBlank() } ?: cleanTarget
+
+        val desc = aweme.optString("desc").trim().takeIf { it.isNotBlank() }
+        val authorObj = aweme.optJSONObject("author")
+        val authorHandle = authorObj?.optString("unique_id")?.trim()?.takeIf { it.isNotBlank() }
+        val authorNick = authorObj?.optString("nickname")?.trim()?.takeIf { it.isNotBlank() }
+        val title = desc ?: authorHandle?.let { "TikTok (@$it)" } ?: authorNick?.let { "TikTok ($it)" } ?: "TikTok Video"
+
+        fun firstHttpFromUrlList(obj: JSONObject?): String? {
+            val arr = obj?.optJSONArray("url_list") ?: return null
+            var picked: String? = null
+            for (uIdx in 0 until arr.length()) {
+                val u = unescape(arr.optString(uIdx)).trim()
+                if (!u.startsWith("http")) continue
+                if (picked == null || (picked.contains(".heic", ignoreCase = true) && !u.contains(".heic", ignoreCase = true))) {
+                    picked = u
+                }
+            }
+            return picked
+        }
+
+        // Music / audio track (shared by both video posts and photo slideshows)
+        val musicObj = aweme.optJSONObject("music")
+        val musicUrl = firstHttpFromUrlList(musicObj?.optJSONObject("play_url"))
+            ?: musicObj?.optString("play_url")?.trim()?.takeIf { it.startsWith("http") }?.let { unescape(it) }
+        val musicDurSec = musicObj?.optLong("duration", 0L)?.takeIf { it > 0L }
+
+        // 1. Photo Mode Slideshow (`image_post_info.images`)
+        val imagePostInfo = aweme.optJSONObject("image_post_info")
+        val imageArr = imagePostInfo?.optJSONArray("images")
+        if (imageArr != null && imageArr.length() > 0) {
+            val slides = mutableListOf<GallerySlide>()
+            for (i in 0 until imageArr.length()) {
+                val img = imageArr.optJSONObject(i) ?: continue
+                val url = firstHttpFromUrlList(img.optJSONObject("display_image"))
+                    ?: firstHttpFromUrlList(img.optJSONObject("owner_watermark_image"))
+                    ?: firstHttpFromUrlList(img.optJSONObject("user_watermark_image"))
+                    ?: continue
+                val dispObj = img.optJSONObject("display_image")
+                slides += GallerySlide(
+                    id = "tt-feed-photo-${slides.size}",
+                    index = slides.size,
+                    mediaUrl = url,
+                    thumbnailUrl = url,
+                    type = MediaType.IMAGE,
+                    container = inferImageExt(url),
+                    width = dispObj?.optInt("width", 0)?.takeIf { it > 0 },
+                    height = dispObj?.optInt("height", 0)?.takeIf { it > 0 },
+                    headers = headers,
+                    postId = postId
+                )
+            }
+            if (slides.isNotEmpty()) {
+                val cover = firstHttpFromUrlList(imagePostInfo.optJSONObject("image_post_cover")?.optJSONObject("display_image"))
+                    ?: slides.first().thumbnailUrl
+                val audioStreams = if (musicUrl != null) {
+                    buildTikTokAudioStreamsFromUrl(
+                        musicUrl = musicUrl,
+                        musicDurationSec = musicDurSec,
+                        baseHeaders = headers,
+                        idPrefix = "tt-feed-photo-a"
+                    )
+                } else emptyList()
+                return ParsedPost(
+                    title = title,
+                    thumbnailUrl = cover,
+                    postId = postId,
+                    slides = slides,
+                    audioStreams = audioStreams
+                )
+            }
+        }
+
+        // 2. Video Post (`video.bit_rate`, `video.play_addr_h264`, `video.play_addr`)
+        val videoObj = aweme.optJSONObject("video") ?: return null
+        val rawDur = videoObj.optLong("duration", 0L)
+        // Mobile aweme feed reports video.duration in milliseconds (e.g. 20154ms -> 20s)
+        val durationSec = when {
+            rawDur >= 1_000L -> (rawDur + 500L) / 1_000L
+            rawDur > 0L -> rawDur
+            else -> musicDurSec
+        }
+        val durHeader = if (durationSec != null && durationSec > 0L) {
+            mapOf("X-Internal-Duration-Seconds" to durationSec.toString())
+        } else emptyMap()
+
+        val cover = firstHttpFromUrlList(videoObj.optJSONObject("cover"))
+            ?: firstHttpFromUrlList(videoObj.optJSONObject("origin_cover"))
+            ?: firstHttpFromUrlList(videoObj.optJSONObject("dynamic_cover"))
+
+        data class FeedBitrate(
+            val heightKey: Int,
+            val width: Int?,
+            val height: Int?,
+            val url: String,
+            val sizeBytes: Long?,
+            val bitrate: Long,
+            val isH264: Boolean
+        )
+
+        fun pickPlayUrl(playAddrObj: JSONObject?): String? {
+            val urls = playAddrObj?.optJSONArray("url_list") ?: return null
+            var chosen: String? = null
+            for (uIdx in 0 until urls.length()) {
+                val u = unescape(urls.optString(uIdx)).trim()
+                if (!u.startsWith("http")) continue
+                if (u.contains("/aweme/v1/play/")) {
+                    if (chosen == null) chosen = u
+                    continue
+                }
+                if (chosen == null || chosen.contains("/aweme/v1/play/") || u.contains("tiktokcdn")) {
+                    chosen = u
+                    if (u.contains("tiktokcdn")) break
+                }
+            }
+            return chosen
+        }
+
+        val candidates = mutableListOf<FeedBitrate>()
+        fun addPlayAddrObj(
+            playAddrObj: JSONObject?,
+            bitrate: Long,
+            isH264: Boolean
+        ) {
+            val u = pickPlayUrl(playAddrObj) ?: return
+            val w = playAddrObj?.optInt("width", 0)?.takeIf { it > 0 } ?: videoObj.optInt("width", 0).takeIf { it > 0 }
+            val h = playAddrObj?.optInt("height", 0)?.takeIf { it > 0 } ?: videoObj.optInt("height", 0).takeIf { it > 0 }
+            val shortSide = when {
+                w != null && h != null -> minOf(w, h)
+                h != null -> h
+                else -> 720
+            }
+            val size = playAddrObj?.optLong("data_size", 0L)?.takeIf { it > 0L }
+            candidates += FeedBitrate(
+                heightKey = shortSide,
+                width = w,
+                height = h,
+                url = u,
+                sizeBytes = size,
+                bitrate = bitrate,
+                isH264 = isH264
+            )
+        }
+
+        val bitRateArr = videoObj.optJSONArray("bit_rate")
+        if (bitRateArr != null) {
+            for (i in 0 until bitRateArr.length()) {
+                val entry = bitRateArr.optJSONObject(i) ?: continue
+                val gear = entry.optString("gear_name").lowercase()
+                val isByteVc1 = entry.optInt("is_bytevc1", 0) == 1 ||
+                    entry.optInt("is_h265", 0) == 1 ||
+                    gear.contains("bytevc1") ||
+                    gear.contains("h265")
+                addPlayAddrObj(
+                    playAddrObj = entry.optJSONObject("play_addr"),
+                    bitrate = entry.optLong("bit_rate", 0L),
+                    isH264 = !isByteVc1
+                )
+            }
+        }
+        // Include explicit H.264 stream (and default play_addr) so devices have guaranteed H.264 playback
+        addPlayAddrObj(videoObj.optJSONObject("play_addr_h264"), bitrate = 1L, isH264 = true)
+        addPlayAddrObj(videoObj.optJSONObject("play_addr"), bitrate = 0L, isH264 = videoObj.optInt("is_bytevc1", 0) != 1)
+
+        val bestByHeight = candidates
+            .groupBy { it.heightKey }
+            .entries
+            .sortedByDescending { it.key }
+            .mapNotNull { (_, group) ->
+                group.sortedWith(
+                    compareByDescending<FeedBitrate> { it.isH264 }
+                        .thenByDescending { it.bitrate }
+                        .thenByDescending { it.sizeBytes ?: 0L }
+                ).firstOrNull()
+            }
+
+        val videoStreams = bestByHeight.mapIndexed { idx, c ->
+            val res = c.heightKey
+            val label = when {
+                res >= 1080 -> "1080p FHD (No Watermark)"
+                res >= 720 -> "720p HD (No Watermark)"
+                else -> "${res}p (No Watermark)"
+            }
+            MediaStream(
+                id = "tt-feed-v-$idx",
+                url = c.url,
+                type = MediaType.VIDEO,
+                container = "mp4",
+                label = label,
+                width = c.width,
+                height = res,
+                sizeBytes = c.sizeBytes,
+                isHls = false,
+                headers = headers + durHeader + mapOf("X-Internal-Quick" to "true")
+            )
+        }
+
+        val audioStreams = if (musicUrl != null) {
+            buildTikTokAudioStreamsFromUrl(
+                musicUrl = musicUrl,
+                musicDurationSec = musicDurSec ?: durationSec,
+                baseHeaders = headers,
+                idPrefix = "tt-feed-a"
+            )
+        } else emptyList()
+
+        if (videoStreams.isEmpty() && audioStreams.isEmpty()) return null
+
+        return ParsedPost(
+            title = title,
+            thumbnailUrl = cover,
+            postId = postId,
+            videoStreams = videoStreams,
+            audioStreams = audioStreams
+        )
+    }
+
     private fun pickTikTokTitle(itemStruct: JSONObject?): String? {
         val desc = itemStruct?.optString("desc")?.trim()?.takeIf { it.isNotBlank() }
         if (desc != null) return desc

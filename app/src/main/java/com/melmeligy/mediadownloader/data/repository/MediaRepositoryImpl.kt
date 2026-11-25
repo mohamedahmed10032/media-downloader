@@ -19,4 +19,6 @@ class MediaRepositoryImpl @Inject constructor(
     fun invalidateCache(url: String) = registry.invalidate(url)
 
     fun updateCached(media: ResolvedMedia) = registry.updateCache(media)
+
+    fun prefetchSpeculative(url: String) = registry.prefetchSpeculative(url)
 }

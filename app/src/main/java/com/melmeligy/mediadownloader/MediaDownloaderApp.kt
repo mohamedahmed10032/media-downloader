@@ -40,6 +40,17 @@ class MediaDownloaderApp : Application(), Configuration.Provider, ImageLoaderFac
         appScope.launch {
             AdBlocker.init(this@MediaDownloaderApp)
         }
+        // Pre-warm system WebView User-Agent (and Chromium provider metadata) off the main thread
+        // so the very first Stage-1 HTTP fetch already matches installed Chromium and Tier-2 avoids cold startup lag.
+        appScope.launch {
+            runCatching {
+                val rawUa = android.webkit.WebSettings.getDefaultUserAgent(this@MediaDownloaderApp)
+                val sanitized = com.melmeligy.mediadownloader.extractor.HeadlessWebExtractor.sanitizeWebViewUserAgent(rawUa)
+                if (sanitized.isNotBlank()) {
+                    com.melmeligy.mediadownloader.extractor.HeadlessWebExtractor.lastWebViewUserAgent = sanitized
+                }
+            }
+        }
     }
 
     override val workManagerConfiguration: Configuration

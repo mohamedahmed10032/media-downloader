@@ -49,6 +49,7 @@ class QualityViewModel : ViewModel {
 
     val settings: StateFlow<AppSettings>
     val loadingStage: StateFlow<String>
+    val previewMetadata: StateFlow<ExtractionProgressTracker.PreviewMetadata?>
 
     private val _state = MutableStateFlow<Resource<ResolvedMedia>>(Resource.Loading)
     val state: StateFlow<Resource<ResolvedMedia>> = _state.asStateFlow()
@@ -78,6 +79,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 
@@ -96,6 +98,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 
@@ -115,6 +118,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 

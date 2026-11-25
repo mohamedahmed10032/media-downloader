@@ -109,6 +109,7 @@ fun QualityScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
+    val previewMetadata by viewModel.previewMetadata.collectAsStateWithLifecycle()
 
     LaunchedEffect(url) {
         if (url.isNotBlank()) viewModel.resolve(url)
@@ -138,6 +139,7 @@ fun QualityScreen(
             url = url,
             contentPadding = padding,
             loadingMessage = loadingStage,
+            previewMetadata = previewMetadata,
             defaultVideoQuality = settings.defaultVideoQuality,
             defaultAudioBitrate = settings.defaultAudioBitrate,
             onRetry = { viewModel.resolve(url, forceRetry = true) },
@@ -168,6 +170,7 @@ fun ChooseFormatStateContent(
     contentPadding: PaddingValues = PaddingValues(0.dp),
     useShimmerLoading: Boolean = false,
     loadingMessage: String = "Getting media formats…",
+    previewMetadata: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker.PreviewMetadata? = null,
     defaultVideoQuality: VideoQuality = VideoQuality.P720,
     defaultAudioBitrate: AudioBitrate = AudioBitrate.KBPS160,
     onRetry: () -> Unit,
@@ -204,20 +207,35 @@ fun ChooseFormatStateContent(
                             }
                         }
                     }
+                    if (previewMetadata != null &&
+                        (!previewMetadata.title.isNullOrBlank() || !previewMetadata.thumbnailUrl.isNullOrBlank())
+                    ) {
+                        LivePreviewLoadingHeader(preview = previewMetadata)
+                    }
                     when (loadingSkeletonStyleForUrl(url)) {
                         LoadingSkeletonStyle.IMAGE_GRID -> MultiImageSheetSkeleton(contentPadding = contentPadding)
                         LoadingSkeletonStyle.NEUTRAL -> NeutralSheetLoadingSkeleton(contentPadding = contentPadding)
                     }
                 }
             } else {
-                LoadingState(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(280.dp)
-                        .padding(contentPadding),
-                    message = loadingMessage,
-                    onCancel = onCancel
-                )
+                        .padding(contentPadding)
+                ) {
+                    if (previewMetadata != null &&
+                        (!previewMetadata.title.isNullOrBlank() || !previewMetadata.thumbnailUrl.isNullOrBlank())
+                    ) {
+                        LivePreviewLoadingHeader(preview = previewMetadata)
+                    }
+                    LoadingState(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp),
+                        message = loadingMessage,
+                        onCancel = onCancel
+                    )
+                }
             }
         }
         is Resource.Error -> Column(
@@ -1468,3 +1486,50 @@ internal fun normalizeAudioOptionSizes(music: List<MediaStream>): List<MediaStre
         stream
     }
 }
+
+@Composable
+private fun LivePreviewLoadingHeader(
+    preview: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker.PreviewMetadata
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (!preview.thumbnailUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = preview.thumbnailUrl,
+                contentDescription = preview.title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(width = 72.dp, height = 48.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            if (!preview.title.isNullOrBlank()) {
+                Text(
+                    text = preview.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (!preview.sourceHost.isNullOrBlank()) {
+                Text(
+                    text = preview.sourceHost,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+

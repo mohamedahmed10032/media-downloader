@@ -292,7 +292,12 @@ object JsUnpacker {
             isHlsHint: Boolean = false,
             allowOpaqueStreamPath: Boolean = false
         ) {
-            val resolved = resolveRelativeStreamUrl(unescapeJs(rawUrl.trim()), baseUrl) ?: return
+            val rawResolved = resolveRelativeStreamUrl(
+                rawUrl = unescapeJs(rawUrl.trim()),
+                baseUrl = baseUrl,
+                allowOpaqueStreamPath = allowOpaqueStreamPath
+            ) ?: return
+            val resolved = stripEmbedRefererQueryParam(rawResolved)
             if (!resolved.startsWith("http://") && !resolved.startsWith("https://")) return
             if (AdBlocker.isAd(resolved) || MediaSniffer.isPreviewOrAdUrl(resolved)) return
             if (MediaSniffer.isHexCipherUrl(resolved)) return
@@ -433,7 +438,23 @@ object JsUnpacker {
         )
     }
 
-    internal fun resolveRelativeStreamUrl(rawUrl: String, baseUrl: String?): String? {
+    private fun stripEmbedRefererQueryParam(url: String): String {
+        if (!url.contains("referer=", ignoreCase = true)) return url
+        val hashIdx = url.indexOf('#')
+        val withoutFrag = if (hashIdx >= 0) url.substring(0, hashIdx) else url
+        val frag = if (hashIdx >= 0) url.substring(hashIdx) else ""
+        val cleaned = Regex("""([?&])referer=[^&#]*""", RegexOption.IGNORE_CASE)
+            .replace(withoutFrag) { m -> if (m.groupValues[1] == "?") "?" else "" }
+            .replace("?&", "?")
+            .trimEnd('?', '&')
+        return cleaned + frag
+    }
+
+    internal fun resolveRelativeStreamUrl(
+        rawUrl: String,
+        baseUrl: String?,
+        allowOpaqueStreamPath: Boolean = false
+    ): String? {
         val trimmed = rawUrl.trim()
         if (trimmed.isEmpty()) return null
         if (trimmed.startsWith("javascript:", ignoreCase = true) ||
@@ -458,7 +479,8 @@ object JsUnpacker {
             !baseUrl.isNullOrBlank() &&
                 !trimmed.any { it.isWhitespace() } &&
                 !trimmed.substringBefore('/').contains(':') &&
-                (trimmed.contains(".m3u8", ignoreCase = true) ||
+                (allowOpaqueStreamPath ||
+                    trimmed.contains(".m3u8", ignoreCase = true) ||
                     trimmed.contains(".mpd", ignoreCase = true) ||
                     trimmed.contains(".mp4", ignoreCase = true) ||
                     trimmed.contains(".webm", ignoreCase = true) ||

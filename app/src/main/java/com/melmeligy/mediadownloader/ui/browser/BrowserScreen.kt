@@ -108,6 +108,7 @@ fun BrowserScreen(
     val detections by viewModel.detections.collectAsStateWithLifecycle()
     val formatState by viewModel.formatState.collectAsStateWithLifecycle()
     val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
+    val previewMetadata by viewModel.previewMetadata.collectAsStateWithLifecycle()
     val appSettings by viewModel.settings.collectAsStateWithLifecycle()
     val engine = remember { viewModel.engine() }
 
@@ -510,6 +511,7 @@ fun BrowserScreen(
                     url = currentUrl,
                     useShimmerLoading = true,
                     loadingMessage = loadingStage,
+                    previewMetadata = previewMetadata,
                     defaultVideoQuality = appSettings.defaultVideoQuality,
                     defaultAudioBitrate = appSettings.defaultAudioBitrate,
                     onRetry = { openChooseFormatSheet() },
