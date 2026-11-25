@@ -51,7 +51,7 @@ class HtmlMediaExtractor @Inject constructor(
         headlessWebExtractor: HeadlessWebExtractor
     ) : this(http, hlsExtractor, dashExtractor, headlessWebExtractor, ExtractionProgressTracker())
 
-    private val portalResolver = StreamingPortalResolver(
+    internal val portalResolver = StreamingPortalResolver(
         http = http,
         hlsExtractor = hlsExtractor,
         dashExtractor = dashExtractor,
@@ -226,9 +226,19 @@ class HtmlMediaExtractor @Inject constructor(
             return@withContext parsed
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
+            val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
+            if (fallbackDoc != null && portalResolver.isDecoyAdTrackerPortalPage(fallbackDoc, html)) {
+                progressTracker.setDiagnosticReason(
+                    "This page only links to external ad-redirect trackers and does not host a playable video stream."
+                )
+                com.melmeligy.mediadownloader.core.AppLogger.w(
+                    "HtmlExtractor",
+                    "Skipping headless fallback for decoy ad-tracker portal page host=$host"
+                )
+                return@withContext null
+            }
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
             com.melmeligy.mediadownloader.core.AppLogger.d("HtmlExtractor", "Stage 2 headless fallback start host=${UrlUtils.host(url)}")
-            val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
             val fallbackTitle = parsed?.title?.takeIf {
                 !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
             } ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractTitle(it, url) }
@@ -238,7 +248,8 @@ class HtmlMediaExtractor @Inject constructor(
             progressTracker.updatePreview(
                 title = fallbackTitle,
                 thumbnailUrl = fallbackThumb,
-                sourceHost = host
+                sourceHost = host,
+                sourceUrl = url
             )
             val headless = try {
                 headlessWebExtractor.extract(url)
@@ -326,7 +337,8 @@ class HtmlMediaExtractor @Inject constructor(
             progressTracker.updatePreview(
                 title = earlyTitle,
                 thumbnailUrl = earlyThumb,
-                sourceHost = UrlUtils.host(pageUrl)
+                sourceHost = UrlUtils.host(pageUrl),
+                sourceUrl = pageUrl
             )
         }
         val found = LinkedHashMap<String, MediaStream>()

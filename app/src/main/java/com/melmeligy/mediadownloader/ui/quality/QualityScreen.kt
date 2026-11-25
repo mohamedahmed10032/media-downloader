@@ -207,10 +207,8 @@ fun ChooseFormatStateContent(
                             }
                         }
                     }
-                    if (previewMetadata != null &&
-                        (!previewMetadata.title.isNullOrBlank() || !previewMetadata.thumbnailUrl.isNullOrBlank())
-                    ) {
-                        LivePreviewLoadingHeader(preview = previewMetadata)
+                    if (shouldShowLivePreviewForUrl(previewMetadata, url)) {
+                        LivePreviewLoadingHeader(preview = previewMetadata!!)
                     }
                     when (loadingSkeletonStyleForUrl(url)) {
                         LoadingSkeletonStyle.IMAGE_GRID -> MultiImageSheetSkeleton(contentPadding = contentPadding)
@@ -223,10 +221,8 @@ fun ChooseFormatStateContent(
                         .fillMaxWidth()
                         .padding(contentPadding)
                 ) {
-                    if (previewMetadata != null &&
-                        (!previewMetadata.title.isNullOrBlank() || !previewMetadata.thumbnailUrl.isNullOrBlank())
-                    ) {
-                        LivePreviewLoadingHeader(preview = previewMetadata)
+                    if (shouldShowLivePreviewForUrl(previewMetadata, url)) {
+                        LivePreviewLoadingHeader(preview = previewMetadata!!)
                     }
                     LoadingState(
                         modifier = Modifier
@@ -1486,6 +1482,12 @@ internal fun normalizeAudioOptionSizes(music: List<MediaStream>): List<MediaStre
         stream
     }
 }
+
+internal fun shouldShowLivePreviewForUrl(
+    preview: com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker.PreviewMetadata?,
+    url: String
+): Boolean = com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker
+    .isPreviewCompatibleWithUrl(preview, url)
 
 @Composable
 private fun LivePreviewLoadingHeader(

@@ -84,6 +84,15 @@ object AdBlocker {
         "gogukypynijoxy.com",
         "mulewosizeseha.com",
         "xvideo.com",
+        // Fake player / countdown ad-tracker gateways & associated VAST/popunder scripts
+        "free-wd.online",
+        "frapptents.com",
+        "kirantisalem.com",
+        "revayhystrix.com",
+        "ducatflapper.com",
+        "hampersmusaeus.com",
+        "rassledtutrice.com",
+        "gillyspencie.com",
         // Live-cam promo widgets embedded on tube pages
         "stripchat.com",
         "xlirdr.com",

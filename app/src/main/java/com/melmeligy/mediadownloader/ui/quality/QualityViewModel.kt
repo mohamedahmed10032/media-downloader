@@ -149,7 +149,7 @@ class QualityViewModel : ViewModel {
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
-        val sessionId = progressTracker.beginSession()
+        val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
 
         // Synchronous cache fast-path: render immediately without flashing the skeleton loader.
         if (!forceRetry) {

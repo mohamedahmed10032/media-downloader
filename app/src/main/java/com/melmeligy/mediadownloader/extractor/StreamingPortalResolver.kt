@@ -71,16 +71,35 @@ class StreamingPortalResolver(
             val endpointUrl: String,
             val formBody: String,
             override val serverName: String,
-            override val parentPageUrl: String
+            override val parentPageUrl: String,
+            val method: String = "POST"
         ) : ServerJob()
     }
 
+    internal var topCinemaMirrorOrigins: List<String> = CANONICAL_TOPCINEMA_MIRRORS
+
     private val myAjaxUrlRegex = Regex(
-        """(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
+        """(?:MyAjaxURL|AjaxtURL|themeAjaxUrl|ThemeAjax)\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
         RegexOption.IGNORE_CASE
     )
     private val ajaxUrlRegex = Regex(
         """(?:ajaxURL|ajax_url|ajaxUrl)\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
+        RegexOption.IGNORE_CASE
+    )
+    private val themeDirRegex = Regex(
+        """\bthemeDir\s*=\s*['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""",
+        RegexOption.IGNORE_CASE
+    )
+    private val voPostIdRegex = Regex(
+        """\bvo_postID\s*=\s*['"]?(\d+)['"]?""",
+        RegexOption.IGNORE_CASE
+    )
+    private val getServerOnClickRegex = Regex(
+        """getServer\s*\(\s*[^,)]+,\s*['"]?(\d+)['"]?\s*\)""",
+        RegexOption.IGNORE_CASE
+    )
+    private val getServer2OnClickRegex = Regex(
+        """getServer2\s*\(\s*[^,)]+,\s*['"]?(\d+)['"]?\s*,\s*['"]?([^'")\s]+)['"]?\s*\)""",
         RegexOption.IGNORE_CASE
     )
     private val wpThemeDirRegex = Regex(
@@ -111,6 +130,7 @@ class StreamingPortalResolver(
         val visitedEmbeds = ConcurrentHashMap.newKeySet<String>()
         val idCounter = AtomicInteger(0)
         var discoveredPoster: String? = null
+        var sawDecoySubPage = false
 
         // 1. Try servers & iframes directly on the current page first (auto-healing rotated WeCima mains.js key if needed)
         var directJobs = collectServerJobs(pageUrl, html, doc)
@@ -151,7 +171,12 @@ class StreamingPortalResolver(
             if (subJobs.isEmpty() && maybeRefreshWeCimaKeyForDoc(subUrl, subHtml, subDoc, subHeaders)) {
                 subJobs = collectServerJobs(subUrl, subHtml, subDoc)
             }
-            if (subJobs.isEmpty()) continue
+            if (subJobs.isEmpty()) {
+                if (isDecoyAdTrackerPortalPage(subDoc, subHtml)) {
+                    sawDecoySubPage = true
+                }
+                continue
+            }
 
             val (streams, poster) = executeServerJobs(
                 jobs = rankServerJobs(subJobs),
@@ -168,13 +193,31 @@ class StreamingPortalResolver(
             }
         }
 
+        // 3. Canonical TopCinema mirror failover when a TopCinema-family clone/decoy page (e.g. topcima.info)
+        //    replaces watch servers with ad-tracker links (`free-wd.online`) or has dead/empty servers.
+        if (isTopCinemaFamilyUrl(pageUrl) || sawDecoySubPage || isDecoyAdTrackerPortalPage(doc, html)) {
+            val mirrorRes = resolveTopCinemaCanonicalMirrors(
+                pageUrl = pageUrl,
+                baseHeaders = baseHeaders,
+                visitedEmbeds = visitedEmbeds,
+                idCounter = idCounter
+            )
+            if (mirrorRes.streams.isNotEmpty()) {
+                return@withContext PortalExtractionResult(
+                    streams = mirrorRes.streams,
+                    posterUrl = discoveredPoster ?: mirrorRes.posterUrl
+                )
+            }
+        }
+
         PortalExtractionResult(emptyList(), discoveredPoster)
     }
 
     data class AjaxServerSpec(
         val endpointUrl: String,
         val formBody: String,
-        val serverName: String
+        val serverName: String,
+        val method: String = "POST"
     )
 
     /**
@@ -243,14 +286,16 @@ class StreamingPortalResolver(
         val seenAjax = HashSet<String>()
         ajaxServers.forEach { spec ->
             if (spec.endpointUrl.startsWith("http://", true) || spec.endpointUrl.startsWith("https://", true)) {
-                val key = "${spec.endpointUrl}|${spec.formBody}"
-                if (spec.formBody.isNotBlank() && seenAjax.add(key)) {
+                val isGet = spec.method.equals("GET", ignoreCase = true)
+                val key = "${spec.method.uppercase()}|${spec.endpointUrl}|${spec.formBody}"
+                if ((isGet || spec.formBody.isNotBlank()) && seenAjax.add(key)) {
                     jobs.add(
                         ServerJob.AjaxServer(
                             endpointUrl = spec.endpointUrl,
                             formBody = spec.formBody,
                             serverName = spec.serverName.ifBlank { "Server" },
-                            parentPageUrl = pageUrl
+                            parentPageUrl = pageUrl,
+                            method = if (isGet) "GET" else "POST"
                         )
                     )
                 }
@@ -520,6 +565,49 @@ class StreamingPortalResolver(
             }
         }
 
+        // 4b. Dynamic AJAX server tabs: Pattern C (Cinema theme `onclick="getServer(this.id, <video>)"` -> GET `$themeDir/temp/ajax/iframe.php`)
+        val cinemaTabs = doc.select("[onclick*=getServer]")
+        if (cinemaTabs.isNotEmpty()) {
+            val rawThemeDir = themeDirRegex.find(html)?.groupValues?.getOrNull(1)
+            val themeDir = rawThemeDir?.let { normalizeEmbedUrl(pageUrl, it)?.trimEnd('/') }
+                ?: wpThemeDirRegex.find(html)?.groupValues?.getOrNull(1)?.let { themeName ->
+                    originOf(pageUrl)?.let { "$it/wp-content/themes/$themeName" }
+                }
+            val postId = voPostIdRegex.find(html)?.groupValues?.getOrNull(1)?.trim()
+                ?: doc.selectFirst("[data-id]")?.attr("data-id")?.trim()?.takeIf { it.all(Char::isDigit) }
+            if (!themeDir.isNullOrBlank() && !postId.isNullOrBlank()) {
+                val seenCinema = HashSet<String>()
+                cinemaTabs.forEach { tab ->
+                    val onClick = tab.attr("onclick").trim()
+                    val m2 = getServer2OnClickRegex.find(onClick)
+                    val m1 = if (m2 == null) getServerOnClickRegex.find(onClick) else null
+                    val endpointUrl = when {
+                        m2 != null -> {
+                            val video = m2.groupValues[1].trim()
+                            val serverId = m2.groupValues[2].trim()
+                            "$themeDir/temp/ajax/iframe2.php?id=${urlEncode(postId)}&video=${urlEncode(video)}&serverId=${urlEncode(serverId)}"
+                        }
+                        m1 != null -> {
+                            val video = m1.groupValues[1].trim()
+                            "$themeDir/temp/ajax/iframe.php?id=${urlEncode(postId)}&video=${urlEncode(video)}"
+                        }
+                        else -> null
+                    } ?: return@forEach
+                    if (!seenCinema.add(endpointUrl)) return@forEach
+                    val serverName = tab.text().trim().take(32).ifBlank { "Server ${seenCinema.size}" }
+                    jobs.add(
+                        ServerJob.AjaxServer(
+                            endpointUrl = endpointUrl,
+                            formBody = "",
+                            serverName = serverName,
+                            parentPageUrl = pageUrl,
+                            method = "GET"
+                        )
+                    )
+                }
+            }
+        }
+
         // 5. External download mirror links on `/download/` pages (when no watch tabs were found)
         if (jobs.isEmpty() && pageUrl.lowercase().contains("/download")) {
             doc.select(".DownloadBlock a[href], .DownloadsList a[href], .download-links a[href], a[href*=\"/d/\"], a[href*=\"/embed-\"]")
@@ -538,14 +626,25 @@ class StreamingPortalResolver(
     }
 
     internal fun resolveServerAjaxEndpoint(pageUrl: String, html: String): String? {
-        myAjaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { rawBase ->
-            val resolved = normalizeEmbedUrl(pageUrl, rawBase)?.trimEnd('/') ?: return@let
+        fun normalizeEndpoint(rawBase: String): String? {
+            val resolved = normalizeEmbedUrl(pageUrl, rawBase)?.trimEnd('/') ?: return null
             return if (resolved.endsWith(".php", ignoreCase = true)) resolved else "$resolved/Single/Server.php"
         }
-        ajaxUrlRegex.find(html)?.groupValues?.getOrNull(1)?.let { rawBase ->
-            val resolved = normalizeEmbedUrl(pageUrl, rawBase)?.trimEnd('/') ?: return@let
-            return if (resolved.endsWith(".php", ignoreCase = true)) resolved else "$resolved/Single/Server.php"
-        }
+
+        val myCandidates = myAjaxUrlRegex.findAll(html)
+            .mapNotNull { it.groupValues.getOrNull(1)?.let(::normalizeEndpoint) }
+            .distinct()
+            .toList()
+        myCandidates.firstOrNull { it.contains("/wp-content/themes/", ignoreCase = true) }?.let { return it }
+        myCandidates.firstOrNull()?.let { return it }
+
+        val ajaxCandidates = ajaxUrlRegex.findAll(html)
+            .mapNotNull { it.groupValues.getOrNull(1)?.let(::normalizeEndpoint) }
+            .distinct()
+            .toList()
+        ajaxCandidates.firstOrNull { it.contains("/wp-content/themes/", ignoreCase = true) }?.let { return it }
+        ajaxCandidates.firstOrNull()?.let { return it }
+
         val origin = originOf(pageUrl) ?: return null
         val themeName = wpThemeDirRegex.find(html)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
         if (themeName != null && (themeName.contains("movie", ignoreCase = true) || themeName.contains("cima", ignoreCase = true) || themeName.contains("top", ignoreCase = true))) {
@@ -596,19 +695,24 @@ class StreamingPortalResolver(
                                         )
                                     }
                                     is ServerJob.AjaxServer -> {
+                                        val isGet = job.method.equals("GET", ignoreCase = true)
                                         val ajaxHeaders = LinkedHashMap<String, String>(baseHeaders).apply {
                                             put("Referer", job.parentPageUrl)
                                             originOf(job.parentPageUrl)?.let { put("Origin", it) }
                                             put("X-Requested-With", "XMLHttpRequest")
                                         }
                                         var resp = try {
-                                            http.postForm(job.endpointUrl, job.formBody, ajaxHeaders)
+                                            if (isGet) {
+                                                http.fetchString(job.endpointUrl, ajaxHeaders)
+                                            } else {
+                                                http.postForm(job.endpointUrl, job.formBody, ajaxHeaders)
+                                            }
                                         } catch (ce: CancellationException) {
                                             throw ce
                                         } catch (_: Exception) {
                                             ""
                                         }
-                                        if (resp.isBlank() && job.endpointUrl.endsWith("/Ajaxat/Single/Server.php", ignoreCase = true)) {
+                                        if (!isGet && resp.isBlank() && job.endpointUrl.endsWith("/Ajaxat/Single/Server.php", ignoreCase = true)) {
                                             val origin = originOf(job.endpointUrl) ?: originOf(job.parentPageUrl)
                                             val altEndpoint = when {
                                                 origin == null -> null
@@ -1346,7 +1450,153 @@ class StreamingPortalResolver(
         val decoded = runCatching {
             java.net.URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8.name())
         }.getOrDefault(raw)
-        return decoded.trim().trimEnd('/').lowercase()
+        return decoded.trim().replace(Regex("/+"), "/").trimEnd('/').lowercase()
+    }
+
+    /**
+     * Returns `true` when a movie/episode portal watch page exposes watch-server tabs or player
+     * open buttons that point exclusively to blocked ad-tracker redirect gateways (e.g.
+     * `w1..w5.free-wd.online`, `a.cwd-open-server`) with zero legitimate playable embed targets
+     * or direct `<video>` sources.
+     */
+    internal fun isDecoyAdTrackerPortalPage(doc: Document, html: String): Boolean {
+        val baseUrl = doc.baseUri().orEmpty()
+        val hasDirectVideoTag = doc.select("video[src], video source[src]").any { el ->
+            val src = el.absUrl("src").ifBlank { el.attr("src") }.trim()
+            src.startsWith("http", ignoreCase = true) && !AdBlocker.isAd(src) && !MediaSniffer.isPreviewOrAdUrl(src)
+        }
+        if (hasDirectVideoTag) return false
+
+        val watchCandidates = LinkedHashSet<String>()
+        doc.select("ul#watch [data-watch], [data-watch], .WatchServersList [data-url], .WatchServersList [data-embed], .WatchServersList [data-iframe]").forEach { el ->
+            for (attr in listOf("data-watch", "data-url", "data-embed", "data-iframe")) {
+                val v = el.attr(attr).trim()
+                if (v.isNotEmpty()) watchCandidates.add(v)
+            }
+        }
+        doc.select(".WatchIframe a.cwd-open-server[href], a.cwd-open-server[href], .WatchIframe a[href]").forEach { el ->
+            val v = el.absUrl("href").ifBlank { el.attr("href") }.trim()
+            if (v.isNotEmpty()) watchCandidates.add(v)
+        }
+        doc.select(".WatchIframe iframe[src], .WatchIframe iframe[data-src]").forEach { el ->
+            val v = el.absUrl("src").ifBlank { el.absUrl("data-src") }.ifBlank { el.attr("src") }.trim()
+            if (v.isNotEmpty()) watchCandidates.add(v)
+        }
+
+        var adWatchCount = 0
+        var legitWatchCount = 0
+        for (raw in watchCandidates) {
+            val decoded = decodePortalEmbedUrl(raw) ?: continue
+            val resolved = if (baseUrl.isNotBlank()) normalizeEmbedUrl(baseUrl, decoded) else decoded
+            if (resolved.isNullOrBlank() || !resolved.startsWith("http", ignoreCase = true)) continue
+            if (AdBlocker.isAd(resolved)) {
+                adWatchCount++
+            } else if (!isBlockedOrNonPlayerEmbed(resolved)) {
+                legitWatchCount++
+            }
+        }
+        if (adWatchCount > 0 && legitWatchCount == 0) {
+            return true
+        }
+        val lowerHtml = html.lowercase()
+        return (lowerHtml.contains("free-wd.online") || lowerHtml.contains("cwd-open-server")) &&
+            legitWatchCount == 0
+    }
+
+    internal fun isTopCinemaFamilyUrl(url: String): Boolean {
+        val host = UrlUtils.host(url)?.lowercase()?.removePrefix("www.") ?: return false
+        return host.contains("topcima") || host.contains("topcinema")
+    }
+
+    internal fun buildCanonicalTopCinemaWatchUrls(
+        pageUrl: String,
+        mirrorOrigins: List<String> = topCinemaMirrorOrigins
+    ): List<String> {
+        val uri = runCatching { URI(UrlUtils.encodeNonAsciiUrl(pageUrl)) }.getOrNull() ?: return emptyList()
+        val rawPath = (uri.rawPath ?: return emptyList())
+            .trim()
+            .replace(Regex("/+"), "/")
+            .trimEnd('/')
+        if (rawPath.isEmpty() || rawPath == "/") return emptyList()
+
+        val watchPath = when {
+            rawPath.endsWith("/watch", ignoreCase = true) -> "$rawPath/"
+            rawPath.endsWith("/download", ignoreCase = true) ->
+                rawPath.substring(0, rawPath.length - "/download".length) + "/watch/"
+            else -> "$rawPath/watch/"
+        }
+
+        val currentOrigin = originOf(pageUrl)?.lowercase()?.trimEnd('/')
+        val currentHost = normalizeHost(uri.host)
+        val out = LinkedHashSet<String>()
+        for (rawOrigin in mirrorOrigins) {
+            val cleanOrigin = rawOrigin.trim().trimEnd('/')
+            if (!cleanOrigin.startsWith("http://", true) && !cleanOrigin.startsWith("https://", true)) continue
+            if (currentOrigin != null && cleanOrigin.lowercase() == currentOrigin) continue
+            val mirrorUri = runCatching { URI(cleanOrigin) }.getOrNull()
+            val mirrorHost = normalizeHost(mirrorUri?.host)
+            // Skip if exact same host AND same port (allows loopback tests on distinct ports)
+            if (currentHost != null && mirrorHost == currentHost && uri.port == (mirrorUri?.port ?: -1)) continue
+            out.add("$cleanOrigin$watchPath")
+        }
+        return out.toList()
+    }
+
+    private suspend fun resolveTopCinemaCanonicalMirrors(
+        pageUrl: String,
+        baseHeaders: Map<String, String>,
+        visitedEmbeds: MutableSet<String>,
+        idCounter: AtomicInteger
+    ): PortalExtractionResult {
+        val candidateUrls = buildCanonicalTopCinemaWatchUrls(pageUrl)
+        if (candidateUrls.isEmpty()) return PortalExtractionResult(emptyList())
+
+        val cleanBaseHeaders = LinkedHashMap<String, String>().apply {
+            baseHeaders.forEach { (k, v) ->
+                if (!k.equals("Cookie", ignoreCase = true) &&
+                    !k.equals("Referer", ignoreCase = true) &&
+                    !k.equals("Origin", ignoreCase = true) &&
+                    !k.equals("Host", ignoreCase = true)
+                ) {
+                    put(k, v)
+                }
+            }
+        }
+
+        for (mirrorUrl in candidateUrls) {
+            progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+            val mirrorOrigin = originOf(mirrorUrl)
+            val mirrorHeaders = LinkedHashMap<String, String>(cleanBaseHeaders).apply {
+                if (mirrorOrigin != null) put("Referer", "$mirrorOrigin/")
+            }
+            val mirrorHtml = withTimeoutOrNull(MIRROR_FETCH_TIMEOUT_MS) {
+                withCancellableHttpCalls(timeoutMs = MIRROR_FETCH_TIMEOUT_MS) {
+                    runCatching { http.fetchString(mirrorUrl, mirrorHeaders) }.getOrNull()
+                }
+            }.orEmpty()
+            if (mirrorHtml.isBlank()) continue
+
+            val mirrorDoc = Jsoup.parse(mirrorHtml, mirrorUrl)
+            if (isDecoyAdTrackerPortalPage(mirrorDoc, mirrorHtml)) continue
+
+            val jobs = collectServerJobs(mirrorUrl, mirrorHtml, mirrorDoc)
+            if (jobs.isNotEmpty()) {
+                val (streams, poster) = executeServerJobs(
+                    jobs = rankServerJobs(jobs),
+                    baseHeaders = mirrorHeaders,
+                    visitedEmbeds = visitedEmbeds,
+                    idCounter = idCounter
+                )
+                if (streams.isNotEmpty()) {
+                    com.melmeligy.mediadownloader.core.AppLogger.d(
+                        "Portal",
+                        "Canonical TopCinema mirror succeeded mirror=${UrlUtils.host(mirrorUrl)} streams=${streams.size}"
+                    )
+                    return PortalExtractionResult(streams = streams, posterUrl = poster)
+                }
+            }
+        }
+        return PortalExtractionResult(emptyList())
     }
 
     private fun urlEncode(value: String): String =
@@ -1491,11 +1741,17 @@ class StreamingPortalResolver(
         private val EMBED_CODE_PATH_REGEX = Regex("""/(?:e|d|v|f|embed)/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
         private val BASE64_LIKE_REGEX = Regex("""^[A-Za-z0-9+/=_-]+$""")
         private val STREAMWISH_FALLBACK_MIRRORS = listOf("vibuxer.com", "hanerix.com")
+        internal val CANONICAL_TOPCINEMA_MIRRORS = listOf(
+            "https://topcinemaa.tv",
+            "https://topcinemaa.one",
+            "https://topcimas.co"
+        )
 
         const val MAX_EMBED_HOPS = 3
         const val MAX_SERVERS = 8
         const val MAX_CONCURRENT_SERVERS = 6
         const val PAGE_FETCH_TIMEOUT_MS = 4_500L
+        const val MIRROR_FETCH_TIMEOUT_MS = 3_500L
         const val SERVER_PROBE_TIMEOUT_MS = 5_200L
         const val DEGRADED_SERVER_PROBE_TIMEOUT_MS = 2_400L
         const val MAINS_JS_FETCH_TIMEOUT_MS = 2_500L

@@ -93,12 +93,14 @@ class HeadlessWebExtractor @Inject constructor(
         timeoutMs: Long,
         socialEmbedFastMode: Boolean
     ): ResolvedMedia? = coroutineScope {
+        val boundSessionId = progressTracker.captureSessionId()
         val isSocialFastMode = socialEmbedFastMode || UrlUtils.isDedicatedSocialPlatformUrl(targetUrl)
         val effectiveTimeoutMs = if (isSocialFastMode) minOf(timeoutMs, SOCIAL_FAST_TIMEOUT_MS) else timeoutMs
         val hardCeilingMs = if (isSocialFastMode) MAX_SOCIAL_TOTAL_EXTRACTION_MS else MAX_TOTAL_EXTRACTION_MS
         progressTracker.update(
             if (isSocialFastMode) ExtractionProgressTracker.STAGE_QUALITIES
-            else ExtractionProgressTracker.STAGE_HEADLESS
+            else ExtractionProgressTracker.STAGE_HEADLESS,
+            sessionId = boundSessionId
         )
         com.melmeligy.mediadownloader.core.AppLogger.d(
             "Headless",
@@ -138,7 +140,9 @@ class HeadlessWebExtractor @Inject constructor(
             progressTracker.updatePreview(
                 title = capturedTitleRef.get(),
                 thumbnailUrl = capturedThumbRef.get(),
-                sourceHost = UrlUtils.host(targetUrl)
+                sourceHost = UrlUtils.host(targetUrl),
+                sourceUrl = targetUrl,
+                sessionId = boundSessionId
             )
         }
 
@@ -183,7 +187,10 @@ class HeadlessWebExtractor @Inject constructor(
                                 val scrapedTitle = obj.optString("t").trim()
                                 if (isCloudflareInterstitialTitle(scrapedTitle)) {
                                     cloudflareChallengeActive.set(true)
-                                    progressTracker.update(ExtractionProgressTracker.STAGE_CLOUDFLARE)
+                                    progressTracker.update(
+                                        ExtractionProgressTracker.STAGE_CLOUDFLARE,
+                                        sessionId = boundSessionId
+                                    )
                                 } else {
                                     scrapedTitle.takeIf {
                                         it.isNotBlank() && !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, targetUrl)
@@ -200,7 +207,9 @@ class HeadlessWebExtractor @Inject constructor(
                                     progressTracker.updatePreview(
                                         title = t,
                                         thumbnailUrl = th,
-                                        sourceHost = UrlUtils.host(targetUrl)
+                                        sourceHost = UrlUtils.host(targetUrl),
+                                        sourceUrl = targetUrl,
+                                        sessionId = boundSessionId
                                     )
                                 }
                             }
@@ -459,12 +468,18 @@ class HeadlessWebExtractor @Inject constructor(
                         if (isCfInterstitial) {
                             cloudflareChallengeActive.set(true)
                             pageFinished.set(false)
-                            progressTracker.update(ExtractionProgressTracker.STAGE_CLOUDFLARE)
+                            progressTracker.update(
+                                ExtractionProgressTracker.STAGE_CLOUDFLARE,
+                                sessionId = boundSessionId
+                            )
                             return
                         }
                         if (promoted == null && cloudflareChallengeActive.getAndSet(false)) {
                             realContentSeenAtMs.compareAndSet(-1L, System.currentTimeMillis())
-                            progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                            progressTracker.update(
+                                ExtractionProgressTracker.STAGE_SERVERS,
+                                sessionId = boundSessionId
+                            )
                         }
                         if (!url.isNullOrBlank() && url.startsWith("http")) {
                             if (promoted == null) {
@@ -493,12 +508,18 @@ class HeadlessWebExtractor @Inject constructor(
                         if (isCfInterstitial) {
                             cloudflareChallengeActive.set(true)
                             pageFinished.set(false)
-                            progressTracker.update(ExtractionProgressTracker.STAGE_CLOUDFLARE)
+                            progressTracker.update(
+                                ExtractionProgressTracker.STAGE_CLOUDFLARE,
+                                sessionId = boundSessionId
+                            )
                             return
                         }
                         if (promoted == null) {
                             if (cloudflareChallengeActive.getAndSet(false)) {
-                                progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                                progressTracker.update(
+                                    ExtractionProgressTracker.STAGE_SERVERS,
+                                    sessionId = boundSessionId
+                                )
                             }
                             realContentSeenAtMs.compareAndSet(-1L, System.currentTimeMillis())
                         }
@@ -585,7 +606,7 @@ class HeadlessWebExtractor @Inject constructor(
                 }
                 val ajaxSnapshot = if (ajaxAvailable) {
                     ajaxServers.filter {
-                        hybridSubmittedAjax.add("${it.endpointUrl}|${it.formBody}")
+                        hybridSubmittedAjax.add("${it.method.uppercase()}|${it.endpointUrl}|${it.formBody}")
                     }
                 } else {
                     emptyList()
@@ -777,7 +798,7 @@ class HeadlessWebExtractor @Inject constructor(
                     contentElapsed >= NEXT_SERVER_TAB_DELAY_MS
                 ) {
                     triedNextServerTab = true
-                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS, sessionId = boundSessionId)
                     withContext(dispatchers.main) {
                         runCatching { webViewRef?.evaluateJavascript(TRY_NEXT_SERVER_JS, null) }
                     }
@@ -798,7 +819,7 @@ class HeadlessWebExtractor @Inject constructor(
 
             // Inline-verify any outer-page candidates BEFORE deciding whether to promote embed servers!
             if (verifiedStreams.isEmpty() && localCaptured.isNotEmpty()) {
-                progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
+                progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES, sessionId = boundSessionId)
                 verifyNewCapturedPayloads(embedContextUrl = lastEmbedIframeUrl.get())
             }
 
@@ -828,7 +849,7 @@ class HeadlessWebExtractor @Inject constructor(
                 // If outer pass captured a candidate that failed verification and DOM only listed that same embed
                 // (e.g. portals that inject alternate server iframes only on tab click), click the next server tab once.
                 if (!untestedAlternateExists && localCaptured.isNotEmpty()) {
-                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS)
+                    progressTracker.update(ExtractionProgressTracker.STAGE_SERVERS, sessionId = boundSessionId)
                     withContext(dispatchers.main) {
                         runCatching { webViewRef?.evaluateJavascript(TRY_NEXT_SERVER_JS, null) }
                     }
@@ -879,7 +900,7 @@ class HeadlessWebExtractor @Inject constructor(
                     activePromotedEmbedUrl.set(embedUrl)
                     promotedVideoCaptured.set(false)
                     pageFinished.set(false)
-                    progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS)
+                    progressTracker.update(ExtractionProgressTracker.STAGE_EMBEDS, sessionId = boundSessionId)
                     com.melmeligy.mediadownloader.core.AppLogger.d(
                         "Headless",
                         "Promoting embed ${idx + 1}/${promotable.size} host=${UrlUtils.host(embedUrl)} refererHost=${UrlUtils.host(outerPageForReferer)} budgetMs=$thisEmbedTimeoutMs"
@@ -999,12 +1020,12 @@ class HeadlessWebExtractor @Inject constructor(
                     else ->
                         "Page loaded without exposing a playable video stream."
                 }
-                progressTracker.setDiagnosticReason(diag)
+                progressTracker.setDiagnosticReason(diag, sessionId = boundSessionId)
                 com.melmeligy.mediadownloader.core.AppLogger.w("Headless", "No verified streams for ${UrlUtils.host(targetUrl)}: $diag")
                 return@withTimeoutOrNull null
             }
 
-            progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES)
+            progressTracker.update(ExtractionProgressTracker.STAGE_QUALITIES, sessionId = boundSessionId)
 
             var capturedTitle = capturedTitleRef.get()
             var capturedThumb = capturedThumbRef.get()
@@ -1023,10 +1044,25 @@ class HeadlessWebExtractor @Inject constructor(
                 .sortedByDescending { it.bitrateKbps ?: (it.sizeBytes?.div(1024)?.toInt() ?: 0) }
             val bestAudio = rawAudios.firstOrNull()
 
-            val filteredVideos = StreamCandidateRanker.filterAndRankVideos(
+            val rankedVideos = StreamCandidateRanker.filterAndRankVideos(
                 resolved.filter { it.type == MediaType.VIDEO }
                     .distinctBy { it.url.substringBefore('?') }
             )
+            val hasPortalIndicators = discoveredEmbedUrls.isNotEmpty() ||
+                discoveredAjaxServers.isNotEmpty() ||
+                promotedEmbedsAttempted > 0
+            val filteredVideos = filterPortalTinyAdClips(
+                targetUrl = targetUrl,
+                videos = rankedVideos,
+                hasPortalIndicators = hasPortalIndicators
+            )
+            if (filteredVideos.isEmpty() && bestAudio == null) {
+                progressTracker.setDiagnosticReason(
+                    "Only short ad/promo clips were detected — no full video stream was exposed.",
+                    sessionId = boundSessionId
+                )
+                return@withTimeoutOrNull null
+            }
             val videos = filteredVideos
                 .mapIndexed { i, s ->
                     val durSec = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
@@ -1112,7 +1148,10 @@ class HeadlessWebExtractor @Inject constructor(
             )
             } ?: run {
                 if (progressTracker.peekDiagnosticReason().isNullOrBlank()) {
-                    progressTracker.setDiagnosticReason("Timed out waiting for embedded player — try again or open in browser.")
+                    progressTracker.setDiagnosticReason(
+                        "Timed out waiting for embedded player — try again or open in browser.",
+                        sessionId = boundSessionId
+                    )
                 }
                 null
             }
@@ -1818,13 +1857,15 @@ class HeadlessWebExtractor @Inject constructor(
             "(function(){try{" +
                 "var out=[];var seen={};" +
                 "var origin=location.origin||'';" +
-                "var ajaxBase=(typeof MyAjaxURL==='string'&&MyAjaxURL)||(typeof themeAjaxUrl==='string'&&themeAjaxUrl)||(typeof ThemeAjax==='string'&&ThemeAjax)||(typeof ajaxURL==='string'&&ajaxURL)||(typeof ajax_url==='string'&&ajax_url)||'';" +
-                "if(!ajaxBase){var sc=document.querySelectorAll('script');for(var si=0;si<sc.length&&!ajaxBase;si++){var tx=sc[si].textContent||'';var m=tx.match(/(?:MyAjaxURL|themeAjaxUrl|ThemeAjax)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i)||tx.match(/(?:ajaxURL|ajax_url|ajaxUrl)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i);if(m&&m[1])ajaxBase=m[1];}}" +
+                "var ajaxBase=(typeof MyAjaxURL==='string'&&MyAjaxURL)||(typeof AjaxtURL==='string'&&AjaxtURL)||(typeof themeAjaxUrl==='string'&&themeAjaxUrl)||(typeof ThemeAjax==='string'&&ThemeAjax)||(typeof ajaxURL==='string'&&ajaxURL)||(typeof ajax_url==='string'&&ajax_url)||'';" +
+                "if(!ajaxBase||ajaxBase.indexOf('/wp-content/themes/')<0){var sc=document.querySelectorAll('script');for(var si=0;si<sc.length;si++){var tx=sc[si].textContent||'';var m=tx.match(/(?:MyAjaxURL|AjaxtURL|themeAjaxUrl|ThemeAjax)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i)||tx.match(/(?:ajaxURL|ajax_url|ajaxUrl)\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i);if(m&&m[1]){if(!ajaxBase||m[1].indexOf('/wp-content/themes/')>=0){ajaxBase=m[1];if(ajaxBase.indexOf('/wp-content/themes/')>=0)break;}}}}" +
                 "if(!ajaxBase&&origin){var assets=document.querySelectorAll('link[href*=\"/wp-content/themes/\"],script[src*=\"/wp-content/themes/\"]');for(var ai=0;ai<assets.length&&!ajaxBase;ai++){var au=assets[ai].getAttribute('href')||assets[ai].getAttribute('src')||'';var tm=au.match(/\\/wp-content\\/themes\\/([A-Za-z0-9_-]+)\\//i);if(tm&&tm[1]&&/(movie|cima|top)/i.test(tm[1])){ajaxBase=origin+'/wp-content/themes/'+tm[1]+'/Ajaxat';}}}" +
                 "if(ajaxBase){try{ajaxBase=new URL(ajaxBase,location.href).href;}catch(e){}}" +
                 "var serverEndpoint=ajaxBase?(/\\.php$/i.test(ajaxBase.replace(/\\/+$/,''))?ajaxBase.replace(/\\/+$/,''):ajaxBase.replace(/\\/+$/,'')+'/Single/Server.php'):(origin?origin+'/Ajaxat/Single/Server.php':'');" +
-                "if(serverEndpoint){var tabs=document.querySelectorAll('[data-id][data-server]');for(var i=0;i<tabs.length&&out.length<8;i++){var t=tabs[i];var id=(t.getAttribute('data-id')||'').trim();var srv=(t.getAttribute('data-server')||'').trim();if(!id||!srv)continue;var key='a|'+id+'|'+srv;if(seen[key])continue;seen[key]=true;var nm=(t.innerText||t.textContent||'').trim().slice(0,32)||('Server '+srv);out.push({e:serverEndpoint,b:'id='+encodeURIComponent(id)+'&i='+encodeURIComponent(srv),n:nm,act:t.classList&&t.classList.contains('active')?1:0});}}" +
-                "if(origin){var doo=document.querySelectorAll('[data-post][data-nume]');for(var j=0;j<doo.length&&out.length<8;j++){var d=doo[j];var post=(d.getAttribute('data-post')||'').trim();var nume=(d.getAttribute('data-nume')||'').trim();var tp=(d.getAttribute('data-type')||'movie').trim()||'movie';if(!post||!nume||nume.toLowerCase()==='trailer')continue;var dk='d|'+post+'|'+nume+'|'+tp;if(seen[dk])continue;seen[dk]=true;var dn=(d.innerText||d.textContent||'').trim().slice(0,32)||('Server '+nume);out.push({e:origin+'/wp-admin/admin-ajax.php',b:'action=doo_player_ajax&post='+encodeURIComponent(post)+'&nume='+encodeURIComponent(nume)+'&type='+encodeURIComponent(tp),n:dn,act:0});}}" +
+                "if(serverEndpoint){var tabs=document.querySelectorAll('[data-id][data-server]');for(var i=0;i<tabs.length&&out.length<8;i++){var t=tabs[i];var id=(t.getAttribute('data-id')||'').trim();var srv=(t.getAttribute('data-server')||'').trim();if(!id||!srv)continue;var key='a|'+id+'|'+srv;if(seen[key])continue;seen[key]=true;var nm=(t.innerText||t.textContent||'').trim().slice(0,32)||('Server '+srv);out.push({e:serverEndpoint,b:'id='+encodeURIComponent(id)+'&i='+encodeURIComponent(srv),n:nm,m:'POST',act:t.classList&&t.classList.contains('active')?1:0});}}" +
+                "if(origin){var doo=document.querySelectorAll('[data-post][data-nume]');for(var j=0;j<doo.length&&out.length<8;j++){var d=doo[j];var post=(d.getAttribute('data-post')||'').trim();var nume=(d.getAttribute('data-nume')||'').trim();var tp=(d.getAttribute('data-type')||'movie').trim()||'movie';if(!post||!nume||nume.toLowerCase()==='trailer')continue;var dk='d|'+post+'|'+nume+'|'+tp;if(seen[dk])continue;seen[dk]=true;var dn=(d.innerText||d.textContent||'').trim().slice(0,32)||('Server '+nume);out.push({e:origin+'/wp-admin/admin-ajax.php',b:'action=doo_player_ajax&post='+encodeURIComponent(post)+'&nume='+encodeURIComponent(nume)+'&type='+encodeURIComponent(tp),n:dn,m:'POST',act:0});}}" +
+                "var cTabs=document.querySelectorAll('[onclick*=\"getServer\"]');" +
+                "if(cTabs.length>0){var td=(typeof themeDir==='string'&&themeDir)||'';var vp=(typeof vo_postID!=='undefined'&&vo_postID)?String(vo_postID):'';if(!td||!vp){var sc2=document.querySelectorAll('script');for(var s2=0;s2<sc2.length;s2++){var t2=sc2[s2].textContent||'';if(!td){var tm2=t2.match(/\\bthemeDir\\s*=\\s*['\"]((?:https?:)?\\/\\/[^'\"]+|\\/[^'\"]+)['\"]/i);if(tm2&&tm2[1])td=tm2[1];}if(!vp){var pm2=t2.match(/\\bvo_postID\\s*=\\s*['\"]?(\\d+)['\"]?/i);if(pm2&&pm2[1])vp=pm2[1];}}}if(td&&vp){try{td=new URL(td,location.href).href.replace(/\\/+$/,'');}catch(e){}for(var c=0;c<cTabs.length&&out.length<8;c++){var oc=cTabs[c].getAttribute('onclick')||'';var g2=oc.match(/getServer2\\s*\\(\\s*[^,)]+,\\s*['\"]?(\\d+)['\"]?\\s*,\\s*['\"]?([^'\")\\s]+)['\"]?\\s*\\)/i);var g1=!g2&&oc.match(/getServer\\s*\\(\\s*[^,)]+,\\s*['\"]?(\\d+)['\"]?\\s*\\)/i);var ep=g2?(td+'/temp/ajax/iframe2.php?id='+encodeURIComponent(vp)+'&video='+encodeURIComponent(g2[1])+'&serverId='+encodeURIComponent(g2[2])):(g1?(td+'/temp/ajax/iframe.php?id='+encodeURIComponent(vp)+'&video='+encodeURIComponent(g1[1])):'');if(ep&&!seen['c|'+ep]){seen['c|'+ep]=true;var cn=(cTabs[c].innerText||cTabs[c].textContent||'').trim().slice(0,32)||('Server '+(c+1));out.push({e:ep,b:'',n:cn,m:'GET',act:0});}}}}" +
                 "return JSON.stringify(out);" +
                 "}catch(e){return '[]';}})();"
 
@@ -1851,14 +1892,44 @@ class HeadlessWebExtractor @Inject constructor(
                     UrlUtils.resolveUrl(pageUrl, rawEndpoint)
                 } else ""
                 val body = obj.optString("b").trim()
+                val method = obj.optString("m").trim().uppercase().ifBlank { "POST" }
+                val isGet = method == "GET"
                 val name = obj.optString("n").trim().ifBlank { "Server ${i + 1}" }
                 if (!endpoint.startsWith("http://", true) && !endpoint.startsWith("https://", true)) continue
-                if (body.isEmpty() || !seen.add("$endpoint|$body")) continue
-                val spec = StreamingPortalResolver.AjaxServerSpec(endpoint, body, name)
+                if ((!isGet && body.isEmpty()) || !seen.add("$method|$endpoint|$body")) continue
+                val spec = StreamingPortalResolver.AjaxServerSpec(endpoint, body, name, if (isGet) "GET" else "POST")
                 if (obj.optInt("act", 0) == 1) active += spec else nonActive += spec
             }
             // Prioritize alternate (non-active) tabs first because the active Server #0 iframe is already in DOM
             return nonActive + active
+        }
+
+        /**
+         * Rejects tiny (< 2.5 MB, unknown or <= 30s duration) progressive third-party ad/promo
+         * clips on movie/episode portal watch/download pages (or pages with embedded watch servers)
+         * while preserving short solo clips on non-portal sites.
+         */
+        internal fun filterPortalTinyAdClips(
+            targetUrl: String,
+            videos: List<MediaStream>,
+            hasPortalIndicators: Boolean = false
+        ): List<MediaStream> {
+            if (videos.isEmpty()) return videos
+            if (!hasPortalIndicators && !InterceptedMediaExtractor.isPortalWatchOrDownloadUrl(targetUrl)) {
+                return videos
+            }
+            val pageFamily = extractHostFamilyStatic(targetUrl)
+            return videos.filterNot { s ->
+                if (s.type != MediaType.VIDEO || s.isHls) return@filterNot false
+                val size = s.sizeBytes ?: return@filterNot false
+                if (size !in 1L..InterceptedMediaExtractor.MAX_PORTAL_AD_CLIP_BYTES) return@filterNot false
+                val dur = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull()
+                val shortOrUnknownDur = dur == null || dur <= InterceptedMediaExtractor.MAX_PORTAL_AD_CLIP_DURATION_SEC
+                if (!shortOrUnknownDur) return@filterNot false
+                val streamFamily = extractHostFamilyStatic(s.url)
+                val isCrossHost = pageFamily.isEmpty() || streamFamily.isEmpty() || streamFamily != pageFamily
+                isCrossHost && s.headers["X-Internal-Authoritative"] != "true"
+            }
         }
 
         /**

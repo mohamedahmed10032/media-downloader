@@ -94,7 +94,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
-        val sessionId = progressTracker.beginSession()
+        val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
