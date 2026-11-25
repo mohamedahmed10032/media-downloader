@@ -480,6 +480,65 @@ class GuardrailCliEndToEndTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(allow_guardrail.stdout)["decision"], "allow")
 
+    def test_modify_mode_enforces_sha256_mutation_blocks_3_of_5(self) -> None:
+        files = []
+        for idx in range(1, 6):
+            fp = Path(self.ws) / f"item_{idx}.txt"
+            fp.write_text(f"initial_{idx}\n", encoding="utf-8")
+            files.append(fp)
+
+        open_res = run_cli(
+            GUARDRAIL_CLI,
+            [
+                "open",
+                "--mode",
+                "modify",
+                "--glob",
+                "item_*.txt",
+                "--root",
+                self.ws,
+                "--task-id",
+                "sha-batch-5",
+            ],
+            cwd=self.ws,
+        )
+        self.assertEqual(open_res.returncode, 0, msg=open_res.stdout + open_res.stderr)
+        open_json = json.loads(open_res.stdout)
+        self.assertEqual(open_json["gate_status"], "OPEN")
+        self.assertEqual(len(open_json["initial_hashes"]), 5)
+
+        # Modify only 3 of the 5 files -> verify MUST return BLOCKED
+        for idx in range(3):
+            files[idx].write_text(f"updated_{idx + 1}\n", encoding="utf-8")
+
+        verify_partial = run_cli(
+            GUARDRAIL_CLI,
+            ["verify", "--task-id", "sha-batch-5", "--root", self.ws],
+            cwd=self.ws,
+        )
+        self.assertNotEqual(verify_partial.returncode, 0)
+        partial_json = json.loads(verify_partial.stdout)
+        self.assertEqual(partial_json["gate_status"], "BLOCKED")
+        self.assertEqual(partial_json["modified_count"], 3)
+        self.assertEqual(partial_json["total_targets"], 5)
+        self.assertEqual(sorted(partial_json["unchanged_targets"]), ["item_4.txt", "item_5.txt"])
+
+        # Modify remaining 2 files -> verify MUST return PASSED
+        for idx in range(3, 5):
+            files[idx].write_text(f"updated_{idx + 1}\n", encoding="utf-8")
+
+        verify_all = run_cli(
+            GUARDRAIL_CLI,
+            ["verify", "--task-id", "sha-batch-5", "--root", self.ws],
+            cwd=self.ws,
+        )
+        self.assertEqual(verify_all.returncode, 0, msg=verify_all.stdout + verify_all.stderr)
+        all_json = json.loads(verify_all.stdout)
+        self.assertEqual(all_json["gate_status"], "PASSED")
+        self.assertEqual(all_json["modified_count"], 5)
+        self.assertEqual(all_json["total_targets"], 5)
+        self.assertEqual(all_json["remaining_open_gates"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

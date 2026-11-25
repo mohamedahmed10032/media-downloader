@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,17 @@ OUTPUT_TAIL_LINES = 25
 
 def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def compute_file_sha256(file_path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def find_workspace_root(start_dir: str) -> str:
@@ -556,6 +568,20 @@ def guardrail_open(
             "error": f"Task `{tid}` is already open in `{state_path}`. Verify it before reopening.",
         }
 
+    initial_hashes: dict[str, str] = {}
+    if mode == "modify":
+        for rel_t in resolved_targets:
+            full_t = _resolve_under_root(rel_t, root_dir)
+            try:
+                initial_hashes[rel_t] = compute_file_sha256(full_t)
+            except OSError as exc:
+                return {
+                    "gate_status": "BLOCKED",
+                    "operation": "open",
+                    "mode": mode,
+                    "error": f"Failed to hash target `{rel_t}`: {exc}",
+                }
+
     gate_entry: dict[str, Any] = {
         "task_id": tid,
         "mode": mode,
@@ -567,10 +593,13 @@ def guardrail_open(
         "status": "OPEN",
         "opened_at": utc_now_iso(),
     }
+    if mode == "modify":
+        gate_entry["initial_hashes"] = initial_hashes
+
     open_gates[tid] = gate_entry
     save_gate_state(state_path, state_data)
 
-    return {
+    open_res: dict[str, Any] = {
         "gate_status": "OPEN",
         "operation": "open",
         "task_id": tid,
@@ -580,6 +609,9 @@ def guardrail_open(
         "targets": resolved_targets,
         "state_file": state_path,
     }
+    if mode == "modify":
+        open_res["initial_hashes"] = initial_hashes
+    return open_res
 
 
 def _tail_lines(text: str, max_lines: int = OUTPUT_TAIL_LINES) -> str:
@@ -640,6 +672,20 @@ def guardrail_verify(
             "error": f"Gate `{tid}` has invalid or empty targets list.",
         }
 
+    initial_hashes: dict[str, str] = {}
+    if mode == "modify":
+        raw_hashes = gate.get("initial_hashes")
+        if not isinstance(raw_hashes, dict):
+            return {
+                "gate_status": "BLOCKED",
+                "operation": "verify",
+                "task_id": tid,
+                "mode": mode,
+                "targets": targets,
+                "error": f"Gate `{tid}` is missing initial SHA-256 hashes (fail-closed).",
+            }
+        initial_hashes = {str(k): str(v) for k, v in raw_hashes.items()}
+
     compiled_forbidden: list[tuple[str, re.Pattern[str]]] = []
     for raw_re in forbidden_regexes or []:
         try:
@@ -665,36 +711,56 @@ def guardrail_verify(
             }
 
     failures: list[str] = []
+    unchanged_targets: list[str] = []
+    modified_targets: list[str] = []
 
     for rel_target in targets:
-        full_target = _resolve_under_root(str(rel_target), gate_root)
+        rel_str = str(rel_target)
+        full_target = _resolve_under_root(rel_str, gate_root)
         if mode == "delete":
             if os.path.exists(full_target):
-                failures.append(f"Target still exists for delete mode: `{rel_target}`.")
+                failures.append(f"Target still exists for delete mode: `{rel_str}`.")
             continue
 
         if not os.path.isfile(full_target):
-            failures.append(f"Target file missing for {mode} mode: `{rel_target}`.")
+            failures.append(f"Target file missing for {mode} mode: `{rel_str}`.")
             continue
+
+        if mode == "modify":
+            expected_before = initial_hashes.get(rel_str)
+            if not expected_before:
+                failures.append(f"Missing initial SHA-256 baseline for `{rel_str}` (fail-closed).")
+            else:
+                try:
+                    current_hash = compute_file_sha256(full_target)
+                    if current_hash == expected_before:
+                        unchanged_targets.append(rel_str)
+                        failures.append(
+                            f"Target file was not modified (SHA-256 unchanged: {current_hash[:12]}): `{rel_str}`."
+                        )
+                    else:
+                        modified_targets.append(rel_str)
+                except OSError as exc:
+                    failures.append(f"Could not hash target `{rel_str}`: {exc}")
 
         if compiled_forbidden or compiled_required:
             try:
                 with open(full_target, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except OSError as exc:
-                failures.append(f"Could not read target `{rel_target}`: {exc}")
+                failures.append(f"Could not read target `{rel_str}`: {exc}")
                 continue
 
             for raw_re, pat in compiled_forbidden:
                 if pat.search(content):
                     failures.append(
-                        f"Forbidden regex `{raw_re}` matched in `{rel_target}`."
+                        f"Forbidden regex `{raw_re}` matched in `{rel_str}`."
                     )
 
             for raw_re, pat in compiled_required:
                 if not pat.search(content):
                     failures.append(
-                        f"Required regex `{raw_re}` missing in `{rel_target}`."
+                        f"Required regex `{raw_re}` missing in `{rel_str}`."
                     )
 
     cmd_results: list[dict[str, Any]] = []
@@ -743,6 +809,10 @@ def guardrail_verify(
             "failures": failures,
             "error": failures[0],
         }
+        if mode == "modify":
+            res["unchanged_targets"] = unchanged_targets
+            res["modified_count"] = len(modified_targets)
+            res["total_targets"] = len(targets)
         if cmd_results:
             res["command_results"] = cmd_results
         return res
@@ -759,6 +829,9 @@ def guardrail_verify(
         "remaining_open_gates": len(open_gates),
         "state_file": state_path,
     }
+    if mode == "modify":
+        res["modified_count"] = len(modified_targets)
+        res["total_targets"] = len(targets)
     if cmd_results:
         res["command_results"] = cmd_results
     return res
