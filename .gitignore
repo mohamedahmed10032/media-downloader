@@ -16,4 +16,9 @@ local.properties
 !debug.keystore
 keystore.properties
 .kotlin/
+.agents/gate_state.json
+.agents/run_contract.json
+__pycache__/
+*.pyc
+
 

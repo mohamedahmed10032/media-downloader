@@ -30,6 +30,7 @@ from typing import Any
 LOG_FILE = "/tmp/antigravity_run_policy.log"
 STATE_FILE = "/tmp/antigravity_run_policy_state.json"
 CONTRACT_REL_PATH = os.path.join(".agents", "run_contract.json")
+GATE_STATE_REL_PATH = os.path.join(".agents", "gate_state.json")
 MAX_RETRIES = 4
 CMD_TIMEOUT_SECONDS = 90
 OUTPUT_TAIL_LINES = 25
@@ -39,6 +40,7 @@ DEFAULT_FORBIDDEN_PATTERNS = [
     "*.keystore",
     ".env",
     ".agents/run_contract.json",
+    ".agents/gate_state.json",
 ]
 
 CODE_EXTENSIONS = {
@@ -134,8 +136,77 @@ def get_git_status_porcelain(workspace: str, is_git: bool) -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
-def compute_diff_fingerprint(workspace: str, is_git: bool, contract_path: str) -> str:
-    """Compute a deterministic fingerprint of the current workspace diff and contract."""
+def resolve_gate_state_path(workspace: str) -> str:
+    env_path = os.environ.get("GUARDRAIL_GATE_STATE_FILE", "").strip()
+    if env_path:
+        return os.path.abspath(env_path)
+    return os.path.join(workspace, GATE_STATE_REL_PATH)
+
+
+def check_guardrail_gate_state(gate_state_path: str) -> list[str]:
+    """Fail-closed check of .agents/gate_state.json for corruption or open gates."""
+    if not os.path.exists(gate_state_path):
+        return []
+
+    try:
+        with open(gate_state_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if not raw.strip():
+            return [
+                f"Guardrail gate state `{GATE_STATE_REL_PATH}` is empty/corrupted (fail-closed). "
+                "Restore valid state or verify pending tasks via `python3 tools/guardrail_mcp.py`."
+            ]
+        data = json.loads(raw)
+    except Exception as exc:
+        return [
+            f"Guardrail gate state `{GATE_STATE_REL_PATH}` contains corrupted JSON (fail-closed): {exc}"
+        ]
+
+    if not isinstance(data, dict):
+        return [
+            f"Guardrail gate state `{GATE_STATE_REL_PATH}` must be a JSON object (fail-closed)."
+        ]
+
+    failures: list[str] = []
+    if "open_gates" in data:
+        open_gates = data.get("open_gates")
+        if not isinstance(open_gates, dict):
+            return [
+                f"Guardrail gate state `{GATE_STATE_REL_PATH}` has invalid `open_gates` field (fail-closed)."
+            ]
+        for tid, info in open_gates.items():
+            if not isinstance(info, dict):
+                failures.append(
+                    f"Guardrail gate `{tid}` in `{GATE_STATE_REL_PATH}` has corrupted entry (fail-closed)."
+                )
+                continue
+            task_id = str(info.get("task_id") or tid)
+            targets = info.get("targets") if isinstance(info.get("targets"), list) else []
+            failures.append(
+                f"Open guardrail gate pending verification: task_id={task_id}, "
+                f"targets={json.dumps(targets)}. "
+                f"Run `python3 tools/guardrail_mcp.py verify --task-id {task_id}` before completing."
+            )
+
+    if str(data.get("status") or "").strip().upper() == "OPEN":
+        task_id = str(data.get("task_id") or "unknown")
+        targets = data.get("targets") if isinstance(data.get("targets"), list) else []
+        failures.append(
+            f"Open guardrail gate pending verification: task_id={task_id}, "
+            f"targets={json.dumps(targets)}. "
+            f"Run `python3 tools/guardrail_mcp.py verify --task-id {task_id}` before completing."
+        )
+
+    return failures
+
+
+def compute_diff_fingerprint(
+    workspace: str,
+    is_git: bool,
+    contract_path: str,
+    gate_state_path: str = "",
+) -> str:
+    """Compute a deterministic fingerprint of the current workspace diff, contract, and gate state."""
     hasher = hashlib.sha256()
     if is_git:
         for cmd in (
@@ -146,12 +217,14 @@ def compute_diff_fingerprint(workspace: str, is_git: bool, contract_path: str) -
             _, out, _ = run_cmd(cmd, cwd=workspace, timeout=15)
             hasher.update(out.encode("utf-8", "replace"))
             hasher.update(b"\0")
-    if os.path.isfile(contract_path):
-        try:
-            with open(contract_path, "rb") as f:
-                hasher.update(f.read())
-        except OSError:
-            pass
+    for extra_path in (contract_path, gate_state_path):
+        if extra_path and os.path.isfile(extra_path):
+            try:
+                with open(extra_path, "rb") as f:
+                    hasher.update(f.read())
+                hasher.update(b"\0")
+            except OSError:
+                pass
     return hasher.hexdigest()[:16]
 
 
@@ -456,10 +529,14 @@ def main() -> int:
     start_dir = args.workspace or os.getcwd()
     workspace, is_git = detect_workspace_root(start_dir)
     contract_path = os.path.join(workspace, CONTRACT_REL_PATH)
+    gate_state_path = resolve_gate_state_path(workspace)
     status_lines = get_git_status_porcelain(workspace, is_git)
 
-    if not os.path.isfile(contract_path) and len(status_lines) == 0:
-        log_message(f"Pure Q&A bypass in {workspace} (no contract, clean workspace)")
+    # 2a. Guardrail Gate State (fail-closed on corruption or open tasks)
+    gate_failures = check_guardrail_gate_state(gate_state_path)
+
+    if not os.path.isfile(contract_path) and len(status_lines) == 0 and not gate_failures:
+        log_message(f"Pure Q&A bypass in {workspace} (no contract, clean workspace, no open gates)")
         if cli_mode:
             return 0
         return emit_hook_decision("stop")
@@ -470,6 +547,7 @@ def main() -> int:
         contract_path=contract_path,
         has_changes=len(status_lines) > 0,
     )
+    failures.extend(gate_failures)
 
     # 4. Adaptive Verification Commands
     failures.extend(check_verification_commands(workspace, contract, status_lines))
@@ -484,7 +562,7 @@ def main() -> int:
     task_id = "no-contract"
     if isinstance(contract, dict) and contract.get("task_id"):
         task_id = str(contract["task_id"])
-    diff_fp = compute_diff_fingerprint(workspace, is_git, contract_path)
+    diff_fp = compute_diff_fingerprint(workspace, is_git, contract_path, gate_state_path)
     state_key = f"{workspace}::{task_id}::{diff_fp}"
     state_path = os.environ.get("RUN_POLICY_STATE_FILE", STATE_FILE)
 

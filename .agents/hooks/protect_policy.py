@@ -11,15 +11,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from typing import Any
 
-DENY_REASON = "Modifying or disabling Run Policy hooks or scripts is forbidden during task execution."
+DENY_REASON = "Modifying or disabling Run Policy hooks, guardrail CLI, or gate_state.json is forbidden during task execution."
 
 PROTECTED_FILES = (
     "hooks.json",
     "run_policy_gate.py",
     "protect_policy.py",
+    "gate_state.json",
+    "guardrail_mcp.py",
 )
 
 FILE_PATH_KEYS = {
@@ -108,6 +111,63 @@ def collect_values(obj: Any, keys: set[str], acc: list[str]) -> None:
             collect_values(item, keys, acc)
 
 
+def has_unquoted_shell_operators(cmd: str) -> bool:
+    """Return True if cmd contains unquoted chaining, redirection, or command substitution."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(cmd):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if not in_single and not in_double:
+            if ch in {";", "&", "|", ">", "<", "`", "\n"}:
+                return True
+        if not in_single and cmd[idx : idx + 2] == "$(":
+            return True
+    return False
+
+
+def is_safe_guardrail_cli_cmd(stripped: str) -> bool:
+    if has_unquoted_shell_operators(stripped):
+        return False
+    if re.search(r"\b(?:ALLOW_POLICY_EDIT|DISABLE_RUN_POLICY)\s*=\s*1\b", stripped):
+        return False
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        return False
+    if len(tokens) < 2:
+        return False
+    py_base = os.path.basename(tokens[0])
+    script_base = os.path.basename(tokens[1])
+    if py_base not in {"python", "python3"}:
+        return False
+    if script_base != "guardrail_mcp.py":
+        return False
+    if len(tokens) >= 3 and tokens[2] not in {"rename", "open", "verify", "-h", "--help"}:
+        return False
+    # Disallow targeting other protected policy files via guardrail args
+    for tok in tokens[2:]:
+        if os.path.basename(tok.replace("\\", "/")) in {
+            "hooks.json",
+            "run_policy_gate.py",
+            "protect_policy.py",
+            "guardrail_mcp.py",
+        }:
+            return False
+    return True
+
+
 def command_targets_policy(cmd: str) -> bool:
     stripped = cmd.strip()
     if not stripped:
@@ -119,6 +179,10 @@ def command_targets_policy(cmd: str) -> bool:
 
     # Allow clean invocation of run_policy_gate.py --cli
     if SAFE_GATE_RUN_RE.match(stripped):
+        return False
+
+    # Allow clean invocation of tools/guardrail_mcp.py rename|open|verify
+    if is_safe_guardrail_cli_cmd(stripped):
         return False
 
     mentions_protected = any(name in stripped for name in PROTECTED_FILES)

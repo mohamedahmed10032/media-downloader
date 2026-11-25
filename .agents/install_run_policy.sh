@@ -8,6 +8,9 @@ GLOBAL_CFG="${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/config}"
 mkdir -p "$GLOBAL_CFG/rules" "$GLOBAL_CFG/hooks"
 
 chmod +x "$SCRIPT_DIR/hooks/run_policy_gate.py" "$SCRIPT_DIR/hooks/protect_policy.py" "$SCRIPT_DIR/install_run_policy.sh"
+if [ -f "$WORKSPACE_ROOT/tools/guardrail_mcp.py" ]; then
+  chmod +x "$WORKSPACE_ROOT/tools/guardrail_mcp.py"
+fi
 
 # Mirror rules and hooks into global Antigravity config directory
 cp -f "$SCRIPT_DIR/rules/run-policy.md" "$GLOBAL_CFG/rules/run-policy.md"
@@ -112,9 +115,11 @@ if git -C "$WORKSPACE_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   mkdir -p "$GIT_DIR/info" "$GIT_DIR/hooks"
   EXCLUDE_FILE="$GIT_DIR/info/exclude"
   touch "$EXCLUDE_FILE"
-  if ! grep -qxF ".agents/run_contract.json" "$EXCLUDE_FILE"; then
-    printf "\n.agents/run_contract.json\n" >> "$EXCLUDE_FILE"
-  fi
+  for pattern in ".agents/run_contract.json" ".agents/gate_state.json"; do
+    if ! grep -qxF "$pattern" "$EXCLUDE_FILE"; then
+      printf "\n%s\n" "$pattern" >> "$EXCLUDE_FILE"
+    fi
+  done
 
   PRE_PUSH_HOOK="$GIT_DIR/hooks/pre-push"
   cat > "$PRE_PUSH_HOOK" <<'HOOK'
