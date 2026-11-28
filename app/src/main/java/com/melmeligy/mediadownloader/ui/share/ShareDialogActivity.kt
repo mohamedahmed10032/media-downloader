@@ -17,17 +17,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
-import androidx.core.util.Consumer
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.melmeligy.mediadownloader.MainActivity
@@ -53,70 +49,107 @@ import dagger.hilt.android.AndroidEntryPoint
 class ShareDialogActivity : ComponentActivity() {
 
     private val qualityViewModel: QualityViewModel by viewModels()
+    private val currentUrlState = mutableStateOf("")
+    private var awaitingFreshIntentAfterRestore = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val initialUrl = extractUrl(intent)
-        if (initialUrl.isNullOrBlank()) {
-            Toast.makeText(this, "No valid link found in shared text", Toast.LENGTH_SHORT).show()
-            finish()
-            return
+        if (savedInstanceState != null) {
+            // Reclaimed zombie task: never re-run the historical root intent in onCreate.
+            // If Android immediately delivers a fresh share via onNewIntent(), it will set
+            // currentUrlState and trigger resolve(); otherwise onResume() closes the stale shell.
+            awaitingFreshIntentAfterRestore = true
+        } else {
+            val initialUrl = extractUrl(intent)
+            if (initialUrl.isNullOrBlank()) {
+                Toast.makeText(this, "No valid link found in shared text", Toast.LENGTH_SHORT).show()
+                finish()
+                return
+            }
+            currentUrlState.value = initialUrl
+            // Kick off extraction immediately in onCreate before Compose inflates the first frame.
+            qualityViewModel.resolve(initialUrl)
         }
 
-        // Kick off extraction immediately in onCreate before Compose inflates the first frame.
-        qualityViewModel.resolve(initialUrl)
-
         setContent {
-            var currentUrl by remember { mutableStateOf(initialUrl) }
-
-            DisposableEffect(Unit) {
-                val listener = Consumer<Intent> { newIntent ->
-                    extractUrl(newIntent)?.let { nextUrl ->
-                        currentUrl = nextUrl
-                        qualityViewModel.resolve(nextUrl)
-                    }
-                }
-                addOnNewIntentListener(listener)
-                onDispose { removeOnNewIntentListener(listener) }
-            }
-
+            val currentUrl = currentUrlState.value
             val themeViewModel: ThemeViewModel = hiltViewModel()
             val themeMode by themeViewModel.themeMode.collectAsStateWithLifecycle()
 
             MediaDownloaderTheme(themeMode = themeMode) {
-                ShareOverlaySheet(
-                    url = currentUrl,
-                    viewModel = qualityViewModel,
-                    onQueued = { count ->
-                        val message = if (count > 1) {
-                            getString(R.string.toast_batch_download_started, count)
-                        } else {
-                            getString(R.string.toast_download_started)
+                if (currentUrl.isNotBlank()) {
+                    ShareOverlaySheet(
+                        url = currentUrl,
+                        viewModel = qualityViewModel,
+                        onQueued = { count ->
+                            val message = if (count > 1) {
+                                getString(R.string.toast_batch_download_started, count)
+                            } else {
+                                getString(R.string.toast_download_started)
+                            }
+                            Toast.makeText(
+                                this@ShareDialogActivity,
+                                message,
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            finish()
+                        },
+                        onOpenInBrowser = { targetUrl ->
+                            qualityViewModel.cancelResolve()
+                            val browserIntent = Intent(this@ShareDialogActivity, MainActivity::class.java).apply {
+                                action = Intent.ACTION_VIEW
+                                data = android.net.Uri.parse(targetUrl)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                            }
+                            startActivity(browserIntent)
+                            finish()
+                        },
+                        onDismiss = {
+                            qualityViewModel.cancelResolve()
+                            finish()
                         }
-                        Toast.makeText(
-                            this@ShareDialogActivity,
-                            message,
-                            Toast.LENGTH_SHORT
-                        ).show()
-                        finish()
-                    },
-                    onOpenInBrowser = { targetUrl ->
-                        val browserIntent = Intent(this@ShareDialogActivity, MainActivity::class.java).apply {
-                            action = Intent.ACTION_VIEW
-                            data = android.net.Uri.parse(targetUrl)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                        }
-                        startActivity(browserIntent)
-                        finish()
-                    },
-                    onDismiss = { finish() }
-                )
+                    )
+                }
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        awaitingFreshIntentAfterRestore = false
+        val nextUrl = extractUrl(intent)
+        if (nextUrl.isNullOrBlank()) {
+            if (currentUrlState.value.isBlank()) {
+                Toast.makeText(this, "No valid link found in shared text", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+            return
+        }
+        currentUrlState.value = nextUrl
+        qualityViewModel.resolve(nextUrl)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (awaitingFreshIntentAfterRestore && currentUrlState.value.isBlank()) {
+            finish()
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations && !isFinishing) {
+            // Prevent leaving a backgrounded translucent singleTask overlay alive across apps
+            // so future shares from other platforms always start cleanly with a fresh intent.
+            qualityViewModel.cancelResolve()
+            finish()
+        }
+    }
+
     override fun finish() {
+        qualityViewModel.cancelResolve()
         super.finish()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, android.R.anim.fade_out)
@@ -147,12 +180,9 @@ private fun ShareOverlaySheet(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val loadingStage by viewModel.loadingStage.collectAsStateWithLifecycle()
+    val previewMetadata by viewModel.previewMetadata.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.84f).dp
-
-    LaunchedEffect(url) {
-        viewModel.resolve(url)
-    }
 
     LaunchedEffect(Unit) {
         viewModel.queuedCount.collect { count -> onQueued(count) }
@@ -184,6 +214,7 @@ private fun ShareOverlaySheet(
                 url = url,
                 useShimmerLoading = true,
                 loadingMessage = loadingStage,
+                previewMetadata = previewMetadata,
                 defaultVideoQuality = settings.defaultVideoQuality,
                 defaultAudioBitrate = settings.defaultAudioBitrate,
                 onRetry = { viewModel.resolve(url, forceRetry = true) },

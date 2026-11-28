@@ -14,16 +14,37 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
-class HomeViewModel @Inject constructor(
+class HomeViewModel private constructor(
     private val downloadManager: DownloadManager,
-    downloadRepository: DownloadRepository
+    downloadRepository: DownloadRepository,
+    private val mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) : ViewModel() {
+
+    @Inject
+    constructor(
+        downloadManager: DownloadManager,
+        downloadRepository: DownloadRepository,
+        mediaRepository: com.melmeligy.mediadownloader.domain.repository.MediaRepository
+    ) : this(downloadManager, downloadRepository, mediaRepository, true)
+
+    constructor(
+        downloadManager: DownloadManager,
+        downloadRepository: DownloadRepository
+    ) : this(downloadManager, downloadRepository, null, false)
 
     val recent = downloadRepository.observeRecent(6)
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList<DownloadItem>())
 
     fun isUrl(input: String): Boolean = UrlUtils.isProbablyUrl(input)
+
+    /** Speculatively pre-warms DNS (and fast API cache when idle) for a newly detected clipboard link. */
+    fun onClipboardUrlDetected(url: String) {
+        if (url.isBlank()) return
+        (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)
+            ?.prefetchSpeculative(url)
+    }
 
     fun pause(id: Long) = viewModelScope.launch { downloadManager.pause(id) }
     fun resume(id: Long) = viewModelScope.launch { downloadManager.resume(id) }

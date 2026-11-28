@@ -103,6 +103,80 @@ class StreamSizeRefiner @Inject constructor(
         if (changed) media.copy(streams = updatedStreams) else null
     }
 
+    /**
+     * Silently pre-warms the default quality HLS variant playlist (and any split HLS companion
+     * audio playlist) into [HlsPlaylistCache.shared] while the user inspects the quality sheet
+     * so tapping Download starts segment transfers with zero extra manifest round-trips.
+     */
+    suspend fun prewarmDefaultHlsVariant(
+        media: ResolvedMedia,
+        defaultQuality: com.melmeligy.mediadownloader.domain.model.VideoQuality,
+        timeoutMs: Long = DEFAULT_PREWARM_TIMEOUT_MS
+    ) = withContext(dispatchers.io) {
+        val hlsVideos = media.streams.filter {
+            it.type == MediaType.VIDEO &&
+                it.isHls &&
+                (it.url.startsWith("http://", ignoreCase = true) || it.url.startsWith("https://", ignoreCase = true))
+        }
+        if (hlsVideos.isEmpty()) return@withContext
+
+        val target = selectDefaultHlsTarget(hlsVideos, defaultQuality) ?: return@withContext
+        val urlsToWarm = buildList {
+            if (HlsPlaylistCache.shared.get(target.url, target.headers) == null) {
+                add(target.url to target.headers)
+            }
+            val companionAudio = target.headers["X-Internal-Companion-Audio"]
+                ?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+            val companionIsHls = target.headers["X-Internal-Companion-Audio-Hls"] == "true" ||
+                companionAudio?.contains(".m3u8", ignoreCase = true) == true
+            if (companionAudio != null && companionIsHls &&
+                HlsPlaylistCache.shared.get(companionAudio, target.headers) == null
+            ) {
+                add(companionAudio to target.headers)
+            }
+        }
+        if (urlsToWarm.isEmpty()) return@withContext
+
+        withTimeoutOrNull(timeoutMs) {
+            withCancellableHttpCalls(timeoutMs = timeoutMs) {
+                urlsToWarm.map { (playlistUrl, hdrs) ->
+                    async(dispatchers.io) {
+                        try {
+                            val res = http.fetchTextWithFinalUrl(playlistUrl, hdrs)
+                            if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(res.text)) {
+                                HlsPlaylistCache.shared.put(
+                                    url = playlistUrl,
+                                    text = res.text,
+                                    finalUrl = res.finalUrl.ifBlank { playlistUrl },
+                                    headers = hdrs
+                                )
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Exception) {
+                            // Best-effort silent pre-warm; live download falls back to network fetch.
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+    }
+
+    private fun selectDefaultHlsTarget(
+        hlsVideos: List<MediaStream>,
+        defaultQuality: com.melmeligy.mediadownloader.domain.model.VideoQuality
+    ): MediaStream? {
+        if (hlsVideos.isEmpty()) return null
+        if (defaultQuality.maxHeight == Int.MAX_VALUE) {
+            return hlsVideos.maxByOrNull { it.height ?: it.bitrateKbps ?: 0 } ?: hlsVideos.first()
+        }
+        val atOrBelow = hlsVideos.filter { (it.height ?: 0) in 1..defaultQuality.maxHeight }
+        if (atOrBelow.isNotEmpty()) {
+            return atOrBelow.maxByOrNull { it.height ?: 0 }
+        }
+        return hlsVideos.minByOrNull { it.height ?: Int.MAX_VALUE } ?: hlsVideos.first()
+    }
+
     private fun isEligible(stream: MediaStream): Boolean =
         !stream.isHls &&
             stream.type != MediaType.IMAGE &&
@@ -128,5 +202,6 @@ class StreamSizeRefiner @Inject constructor(
         const val MAX_BACKGROUND_PROBES = 6
         const val DEFAULT_PER_STREAM_TIMEOUT_MS = 2_500L
         const val DEFAULT_TOTAL_BUDGET_MS = 3_500L
+        const val DEFAULT_PREWARM_TIMEOUT_MS = 2_500L
     }
 }

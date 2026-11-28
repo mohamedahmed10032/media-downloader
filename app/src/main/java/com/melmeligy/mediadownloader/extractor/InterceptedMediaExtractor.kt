@@ -97,6 +97,7 @@ class InterceptedMediaExtractor : MediaExtractor {
                 compareByDescending<MediaStreamPayload> { it.streamType == StreamType.HLS && looksLikeMasterPlaylistUrl(it.url) }
                     .thenByDescending { it.isAuthoritativePlayer }
                     .thenByDescending { it.streamType == StreamType.HLS }
+                    .thenByDescending { it.detectedAt }
             )
 
         if (rawCandidates.isEmpty()) return@coroutineScope null
@@ -136,58 +137,80 @@ class InterceptedMediaExtractor : MediaExtractor {
             }
         }
 
-        // Probe all candidates concurrently on IO with isolated per-candidate headers/cookies and bounded fast timeout
-        val outcomes = withCancellableHttpCalls(timeoutMs = CANDIDATE_PROBE_TIMEOUT_MS) {
-            rawCandidates.take(16).mapIndexed { idx, payload ->
-                async(Dispatchers.IO) {
-                    val cleanUrl = MediaSniffer.cleanMediaUrl(payload.url)
-                    val sanitizedHint = payload.qualityHint?.takeIf { it > 0 }
-                    val headers = isolateCandidateHeaders(
-                        payload = payload,
-                        pageUrl = url,
-                        sharedUserAgent = sharedUserAgent,
-                        pageDurationSec = pageDurationSec
-                    )
-                    when (payload.streamType) {
-                        StreamType.HLS -> {
-                            val list = runCatching {
-                                val res = runCatching {
-                                    hlsExtractor.extractVerified(cleanUrl, headers, sanitizedHint)
-                                }.getOrNull() ?: if (sanitizedHint != null) {
-                                    hlsExtractor.extract(cleanUrl, headers, sanitizedHint)
-                                } else {
-                                    hlsExtractor.extract(cleanUrl, headers)
-                                }
-                                res?.streams?.map { s ->
-                                    val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
-                                    if (payload.isAuthoritativePlayer) {
-                                        s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
-                                    } else {
-                                        s.copy(headers = cleanH)
+        // Probe the freshest candidates concurrently with a strict wall-clock ceiling so dead/expired
+        // URLs never stall the sheet on repeated attempts.
+        val outcomes = withTimeoutOrNull(INTERCEPTED_WALL_TIMEOUT_MS) {
+            withCancellableHttpCalls(timeoutMs = CANDIDATE_PROBE_TIMEOUT_MS) {
+                rawCandidates.take(MAX_INTERCEPTED_CANDIDATES).mapIndexed { idx, payload ->
+                    async(Dispatchers.IO) {
+                        val cleanUrl = MediaSniffer.cleanMediaUrl(payload.url)
+                        val sanitizedHint = payload.qualityHint?.takeIf { it > 0 }
+                        val headers = isolateCandidateHeaders(
+                            payload = payload,
+                            pageUrl = url,
+                            sharedUserAgent = sharedUserAgent,
+                            pageDurationSec = pageDurationSec
+                        )
+                        withTimeoutOrNull(PER_CANDIDATE_WALL_TIMEOUT_MS) {
+                            when (payload.streamType) {
+                                StreamType.HLS -> {
+                                    val verifiedAttempt = runCatching {
+                                        hlsExtractor.extractVerifiedDetailed(cleanUrl, headers, sanitizedHint)
                                     }
-                                }
-                            }.getOrNull().orEmpty()
-                            ProbeOutcome(list, null, payload.isAuthoritativePlayer)
-                        }
-                        StreamType.DASH -> {
-                            val list = runCatching {
-                                dashExtractor.extract(cleanUrl, headers)?.streams?.map { s ->
-                                    val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
-                                    if (payload.isAuthoritativePlayer) {
-                                        s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
+                                    val resolvedMedia = if (verifiedAttempt.isSuccess) {
+                                        verifiedAttempt.getOrNull()?.media
                                     } else {
-                                        s.copy(headers = cleanH)
+                                        // Only reached when a strict MockK test stubs `extract()` without `extractVerifiedDetailed()`.
+                                        runCatching {
+                                            if (sanitizedHint != null) {
+                                                hlsExtractor.extract(cleanUrl, headers, sanitizedHint)
+                                            } else {
+                                                hlsExtractor.extract(cleanUrl, headers)
+                                            }
+                                        }.getOrNull()
                                     }
+                                    val list = resolvedMedia?.streams?.map { s ->
+                                        val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                        if (payload.isAuthoritativePlayer) {
+                                            s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
+                                        } else {
+                                            s.copy(headers = cleanH)
+                                        }
+                                    }.orEmpty()
+                                    if (list.isEmpty() && verifiedAttempt.isSuccess) {
+                                        val reason = verifiedAttempt.getOrNull()?.failureReason.orEmpty()
+                                        if (reason.contains("HTTP 4") ||
+                                            reason.contains("HTTP 5") ||
+                                            reason.contains("HTML", ignoreCase = true) ||
+                                            reason.contains("DRM", ignoreCase = true) ||
+                                            reason.contains("not #EXTM3U", ignoreCase = true)
+                                        ) {
+                                            engine.evictPayloadUrl(payload.url)
+                                        }
+                                    }
+                                    ProbeOutcome(list, null, payload.isAuthoritativePlayer)
                                 }
-                            }.getOrNull().orEmpty()
-                            ProbeOutcome(list, null, payload.isAuthoritativePlayer)
-                        }
-                        StreamType.PROGRESSIVE -> probeProgressive(idx, payload.copy(url = cleanUrl, qualityHint = sanitizedHint), headers)
-                        StreamType.BLOB, StreamType.UNKNOWN -> ProbeOutcome(emptyList())
+                                StreamType.DASH -> {
+                                    val list = runCatching {
+                                        dashExtractor.extract(cleanUrl, headers)?.streams?.map { s ->
+                                            val cleanH = s.headers.filterKeys { !it.equals("X-Internal-Default", ignoreCase = true) }
+                                            if (payload.isAuthoritativePlayer) {
+                                                s.copy(headers = cleanH + ("X-Internal-Authoritative" to "true"))
+                                            } else {
+                                                s.copy(headers = cleanH)
+                                            }
+                                        }
+                                    }.getOrNull().orEmpty()
+                                    ProbeOutcome(list, null, payload.isAuthoritativePlayer)
+                                }
+                                StreamType.PROGRESSIVE -> probeProgressive(idx, payload.copy(url = cleanUrl, qualityHint = sanitizedHint), headers)
+                                StreamType.BLOB, StreamType.UNKNOWN -> ProbeOutcome(emptyList())
+                            }
+                        } ?: ProbeOutcome(emptyList(), null, payload.isAuthoritativePlayer)
                     }
-                }
-            }.awaitAll()
-        }
+                }.awaitAll()
+            }
+        }.orEmpty()
 
         val liveStreamsAll = outcomes.flatMap { it.streams }
         val timedOutFallbacks = outcomes.mapNotNull { it.timedOutFallback }
@@ -218,6 +241,15 @@ class InterceptedMediaExtractor : MediaExtractor {
         val ext = UrlUtils.fileExtension(url)?.lowercase()
         val isWebPage = ext == null ||
             (ext !in UrlUtils.VIDEO_EXTENSIONS && ext !in UrlUtils.AUDIO_EXTENSIONS && ext != "m3u8" && ext != "mpd")
+        val isPortalWatchPage = isPortalWatchOrDownloadUrl(url)
+        val liveOnlyHasTinyProgressiveClips = liveResolved.isNotEmpty() && liveResolved.all { s ->
+            !s.isHls &&
+                s.sizeBytes != null &&
+                s.sizeBytes in 1L..MAX_PORTAL_AD_CLIP_BYTES &&
+                (s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() ?: pageDurationSec).let { d ->
+                    d == null || d <= MAX_PORTAL_AD_CLIP_DURATION_SEC
+                }
+        }
 
         var htmlResolved: ResolvedMedia? = null
         if (isWebPage &&
@@ -226,8 +258,13 @@ class InterceptedMediaExtractor : MediaExtractor {
             distinctAuthHeights.size < 2 &&
             !UrlUtils.isDedicatedSocialPlatformUrl(url)
         ) {
-            htmlResolved = withTimeoutOrNull(HTML_ENRICH_TIMEOUT_MS) {
-                withCancellableHttpCalls(timeoutMs = HTML_ENRICH_TIMEOUT_MS) {
+            val enrichTimeoutMs = if (isPortalWatchPage || liveOnlyHasTinyProgressiveClips) {
+                PORTAL_HTML_ENRICH_TIMEOUT_MS
+            } else {
+                HTML_ENRICH_TIMEOUT_MS
+            }
+            htmlResolved = withTimeoutOrNull(enrichTimeoutMs) {
+                withCancellableHttpCalls(timeoutMs = enrichTimeoutMs) {
                     runCatching {
                         htmlMediaExtractor.extractWithHeaders(url, pageFetchHeaders, allowHeadlessFallback = false)
                     }.getOrNull()
@@ -301,19 +338,29 @@ class InterceptedMediaExtractor : MediaExtractor {
 
         if (filtered.isEmpty()) return@coroutineScope null
 
+        // On movie/episode portal watch/download pages, unconditionally drop tiny cross-host
+        // progressive ad/promo clips (< 2.5 MB, unknown or <= 30s duration) even if no main stream
+        // survived so ExtractorRegistry cleanly falls through to HtmlMediaExtractor / mirror failover.
+        val portalSanitized = dropPortalTinyAdClips(
+            pageUrl = url,
+            streams = filtered,
+            pageDurationSec = pageDurationSec
+        )
+        if (portalSanitized.isEmpty()) return@coroutineScope null
+
         val hasFullLengthMainVideo = (pageDurationSec != null && pageDurationSec >= 45L) ||
-            filtered.any { it.type == MediaType.VIDEO && (it.sizeBytes ?: 0L) >= 5_000_000L }
+            portalSanitized.any { it.type == MediaType.VIDEO && (it.sizeBytes ?: 0L) >= 5_000_000L }
 
         val cleanFiltered = if (hasFullLengthMainVideo) {
-            filtered.filterNot { s ->
+            portalSanitized.filterNot { s ->
                 s.type == MediaType.VIDEO &&
                     !s.isHls &&
                     s.headers["X-Internal-Authoritative"] != "true" &&
                     s.sizeBytes != null &&
                     s.sizeBytes in 1..1_200_000L
-            }.ifEmpty { filtered }
+            }.ifEmpty { portalSanitized }
         } else {
-            filtered
+            portalSanitized
         }
 
         val rawAudios = cleanFiltered.filter { it.type == MediaType.AUDIO }
@@ -474,12 +521,13 @@ class InterceptedMediaExtractor : MediaExtractor {
         val info: HeadInfo? = try {
             http.probe(url, headers)
         } catch (e: MediaException) {
-            // Explicit HTTP 401/403/404/410 -> dead stream, drop completely (never fall back)
+            // Explicit HTTP 401/403/404/410 -> dead stream, drop & evict so repeated attempts don't re-probe it
             if (e.error == AppError.NO_MEDIA_FOUND ||
                 e.error == AppError.EXPIRED_LINK ||
                 e.error == AppError.ACCESS_DENIED ||
                 e.error == AppError.GEO_BLOCKED
             ) {
+                engine.evictPayloadUrl(url)
                 return ProbeOutcome(emptyList(), null, payload.isAuthoritativePlayer)
             }
             // Network/timeout IOException -> allow fallback only if zero live streams survive
@@ -491,7 +539,8 @@ class InterceptedMediaExtractor : MediaExtractor {
         }
 
         if (info == null || info.code !in 200..299) {
-            // Explicit HTTP 400..599 (e.g. 502, 504) -> dead stream, drop completely!
+            // Explicit HTTP 400..599 (e.g. 502, 504) -> dead stream, drop & evict completely!
+            engine.evictPayloadUrl(url)
             return ProbeOutcome(emptyList(), null, payload.isAuthoritativePlayer)
         }
 
@@ -586,9 +635,63 @@ class InterceptedMediaExtractor : MediaExtractor {
     }
 
     companion object {
+        private const val MAX_INTERCEPTED_CANDIDATES = 8
+        private const val INTERCEPTED_WALL_TIMEOUT_MS = 4_500L
+        private const val PER_CANDIDATE_WALL_TIMEOUT_MS = 3_200L
         private const val CANDIDATE_PROBE_TIMEOUT_MS = 2_800L
         private const val HTML_ENRICH_TIMEOUT_MS = 3_000L
+        private const val PORTAL_HTML_ENRICH_TIMEOUT_MS = 5_500L
         private const val METADATA_FETCH_TIMEOUT_MS = 2_500L
+        internal const val MAX_PORTAL_AD_CLIP_BYTES = 2_500_000L
+        internal const val MAX_PORTAL_AD_CLIP_DURATION_SEC = 30L
+
+        internal fun isPortalWatchOrDownloadUrl(url: String): Boolean {
+            if (UrlUtils.isDedicatedSocialPlatformUrl(url)) return false
+            val host = UrlUtils.host(url)?.lowercase().orEmpty()
+            if (host.contains("topcima") || host.contains("topcinema") ||
+                host.contains("wecima") || host.contains("mycima") ||
+                host.contains("arabseed") || host.contains("cimawbas") ||
+                host.contains("faselhd") || host.contains("akwam") ||
+                host.contains("egybest") || host.contains("shahid")
+            ) {
+                return true
+            }
+            val path = runCatching {
+                java.net.URI(UrlUtils.encodeNonAsciiUrl(url)).path.orEmpty().lowercase()
+            }.getOrDefault(url.lowercase())
+            return path.contains("/watch") ||
+                path.contains("/download") ||
+                path.startsWith("/episode/") ||
+                path.startsWith("/film/") ||
+                path.startsWith("/movie/") ||
+                path.startsWith("/series/")
+        }
+
+        internal fun dropPortalTinyAdClips(
+            pageUrl: String,
+            streams: List<MediaStream>,
+            pageDurationSec: Long? = null
+        ): List<MediaStream> {
+            if (!isPortalWatchOrDownloadUrl(pageUrl)) return streams
+            val pageRoot = rootDomainStatic(UrlUtils.host(pageUrl))
+            return streams.filterNot { s ->
+                if (s.type != MediaType.VIDEO || s.isHls) return@filterNot false
+                val size = s.sizeBytes ?: return@filterNot false
+                if (size !in 1L..MAX_PORTAL_AD_CLIP_BYTES) return@filterNot false
+                val dur = s.headers["X-Internal-Duration-Seconds"]?.toLongOrNull() ?: pageDurationSec
+                val shortOrUnknownDur = dur == null || dur <= MAX_PORTAL_AD_CLIP_DURATION_SEC
+                if (!shortOrUnknownDur) return@filterNot false
+                val streamRoot = rootDomainStatic(UrlUtils.host(s.url))
+                val isCrossHost = pageRoot == null || streamRoot == null || streamRoot != pageRoot
+                isCrossHost && s.headers["X-Internal-Authoritative"] != "true"
+            }
+        }
+
+        private fun rootDomainStatic(host: String?): String? {
+            val clean = host?.lowercase()?.removePrefix("www.")?.trimEnd('.') ?: return null
+            val parts = clean.split('.')
+            return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else clean
+        }
 
         /**
          * Isolates per-candidate HTTP headers so cookies, Referer, and Origin from one host

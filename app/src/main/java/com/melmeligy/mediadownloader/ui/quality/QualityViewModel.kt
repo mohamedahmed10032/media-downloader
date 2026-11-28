@@ -46,9 +46,11 @@ class QualityViewModel : ViewModel {
     private var resolveJob: Job? = null
     private var sizeRefineJob: Job? = null
     private var thumbCacheJob: Job? = null
+    private var hlsPrewarmJob: Job? = null
 
     val settings: StateFlow<AppSettings>
     val loadingStage: StateFlow<String>
+    val previewMetadata: StateFlow<ExtractionProgressTracker.PreviewMetadata?>
 
     private val _state = MutableStateFlow<Resource<ResolvedMedia>>(Resource.Loading)
     val state: StateFlow<Resource<ResolvedMedia>> = _state.asStateFlow()
@@ -78,6 +80,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 
@@ -96,6 +99,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 
@@ -115,6 +119,7 @@ class QualityViewModel : ViewModel {
         this.settings = settingsRepository.settings
             .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
         this.loadingStage = progressTracker.stage
+        this.previewMetadata = progressTracker.preview
         initWithSavedState(savedStateHandle)
     }
 
@@ -145,7 +150,8 @@ class QualityViewModel : ViewModel {
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
-        progressTracker.reset()
+        hlsPrewarmJob?.cancel()
+        val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
 
         // Synchronous cache fast-path: render immediately without flashing the skeleton loader.
         if (!forceRetry) {
@@ -154,6 +160,7 @@ class QualityViewModel : ViewModel {
                 _state.value = Resource.Success(cached)
                 launchBackgroundSizeRefinement(cached, normalizedTarget)
                 launchBackgroundThumbnailCaching(cached, normalizedTarget)
+                launchBackgroundHlsPrewarm(cached)
                 return
             }
         }
@@ -163,13 +170,17 @@ class QualityViewModel : ViewModel {
 
         val job = viewModelScope.launch {
             val nextState = try {
-                Resource.Success(mediaRepository.resolve(targetUrl))
+                Resource.Success(
+                    progressTracker.runInSession(sessionId) {
+                        mediaRepository.resolve(targetUrl)
+                    }
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: MediaException) {
                 val explicit = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
                 val diagnostic = explicit
-                    ?: progressTracker.peekDiagnosticReason()
+                    ?: progressTracker.peekDiagnosticReasonForSession(sessionId)
                     ?: if (e.error == AppError.NO_MEDIA_FOUND) {
                         "No playable video or audio stream was exposed by this page."
                     } else null
@@ -177,15 +188,29 @@ class QualityViewModel : ViewModel {
             } catch (e: Exception) {
                 Resource.Error(AppError.GENERIC, e.message)
             }
-            if (currentCoroutineContext()[Job]?.isActive == true) {
+            if (currentCoroutineContext()[Job]?.isActive == true &&
+                sessionId == progressTracker.activeSessionId()
+            ) {
                 _state.value = nextState
                 if (nextState is Resource.Success) {
                     launchBackgroundSizeRefinement(nextState.data, normalizedTarget)
                     launchBackgroundThumbnailCaching(nextState.data, normalizedTarget)
+                    launchBackgroundHlsPrewarm(nextState.data)
                 }
             }
         }
         resolveJob = job
+    }
+
+    private fun launchBackgroundHlsPrewarm(resolved: ResolvedMedia) {
+        val refiner = streamSizeRefiner ?: return
+        if (resolved.streams.none { it.isHls }) return
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = viewModelScope.launch {
+            runCatching {
+                refiner.prewarmDefaultHlsVariant(resolved, settings.value.defaultVideoQuality)
+            }
+        }
     }
 
     private fun launchBackgroundSizeRefinement(resolved: ResolvedMedia, expectedNormalizedUrl: String) {
@@ -254,6 +279,8 @@ class QualityViewModel : ViewModel {
         sizeRefineJob = null
         thumbCacheJob?.cancel()
         thumbCacheJob = null
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = null
         progressTracker.reset()
     }
 

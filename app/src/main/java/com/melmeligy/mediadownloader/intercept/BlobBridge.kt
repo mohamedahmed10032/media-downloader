@@ -939,10 +939,10 @@ object BlobBridge {
       }
     });
 
-    // E2. Embed player globals: window.links ({hls2, hls3, hls4, hls}) & Mixdrop window.MDCore.wurl
+    // E2. Embed player globals: window.links ({hls4, hls2, hls3, hls}) & Mixdrop window.MDCore.wurl
     safe(function () {
       if (window.links && typeof window.links === 'object') {
-        var linkKeys = ['hls2', 'hls3', 'hls4', 'hls', 'file', 'src'];
+        var linkKeys = ['hls4', 'hls2', 'hls3', 'hls', 'file', 'src'];
         for (var lk = 0; lk < linkKeys.length; lk++) {
           var lKey = linkKeys[lk];
           var lVal = window.links[lKey];
@@ -1161,6 +1161,30 @@ object BlobBridge {
         attributes: true,
         attributeFilter: ['src', 'href']
       });
+    }
+  });
+
+  // Read-only SubtleCrypto decrypt observer: catches AES-GCM decrypted stream URLs on modern SPA/WeCima players
+  safe(function () {
+    if (window.crypto && window.crypto.subtle && typeof window.crypto.subtle.decrypt === 'function' && !window.crypto.subtle.__dlHooked) {
+      var origDecrypt = window.crypto.subtle.decrypt.bind(window.crypto.subtle);
+      window.crypto.subtle.__dlHooked = true;
+      window.crypto.subtle.decrypt = function () {
+        var p = origDecrypt.apply(window.crypto.subtle, arguments);
+        if (p && typeof p.then === 'function') {
+          p.then(function (buf) {
+            safe(function () {
+              if (!buf || buf.byteLength < 10 || buf.byteLength > 8192) return;
+              var txt = new TextDecoder('utf-8').decode(new Uint8Array(buf)).trim();
+              if (/^https?:\/\/\S+$/i.test(txt) && !adOrPreviewRe.test(txt) && /\.(m3u8|mpd|mp4|webm|mkv)(\?|#|$)/i.test(txt)) {
+                var meta = collectMetadata();
+                reportAuthoritative(txt, txt.indexOf('.m3u8') > -1 ? 'application/x-mpegURL' : '', 0, meta.title, meta.thumb, meta.duration);
+              }
+            });
+          }, function () {});
+        }
+        return p;
+      };
     }
   });
 

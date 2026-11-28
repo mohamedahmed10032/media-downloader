@@ -12,9 +12,13 @@ class MediaRepositoryImpl @Inject constructor(
 ) : MediaRepository {
     override suspend fun resolve(url: String): ResolvedMedia = registry.resolve(url)
 
+    suspend fun resolveBackground(url: String): ResolvedMedia = registry.resolveBackground(url)
+
     fun peekCached(url: String): ResolvedMedia? = registry.peekCached(url)
 
     fun invalidateCache(url: String) = registry.invalidate(url)
 
     fun updateCached(media: ResolvedMedia) = registry.updateCache(media)
+
+    fun prefetchSpeculative(url: String) = registry.prefetchSpeculative(url)
 }

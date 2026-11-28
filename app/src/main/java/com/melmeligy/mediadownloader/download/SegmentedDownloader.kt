@@ -31,10 +31,24 @@ import javax.inject.Singleton
  * and surfaces permanent HTTP 403/404/410 errors immediately without wasteful retries.
  */
 @Singleton
-class SegmentedDownloader @Inject constructor(
+class SegmentedDownloader private constructor(
     private val client: OkHttpClient,
-    private val http: ExtractorHttp
+    private val http: ExtractorHttp,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(client, http, priorityCoordinator, true)
+
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp
+    ) : this(client, http, null, false)
 
     suspend fun probe(url: String, headers: Map<String, String>): HeadInfo? =
         withContext(Dispatchers.IO) {
@@ -53,6 +67,7 @@ class SegmentedDownloader @Inject constructor(
         dest.parentFile?.mkdirs()
 
         val allowImageContentType = headers["X-Internal-Allow-Image"]?.equals("true", ignoreCase = true) == true
+        val preProbed = headers["X-Internal-Probed"]?.equals("true", ignoreCase = true) == true
         var effectiveHeaders = headers
         val isGoogleVideo = url.contains("googlevideo.com", ignoreCase = true)
         var total = knownTotal
@@ -60,7 +75,7 @@ class SegmentedDownloader @Inject constructor(
             total = Regex("[?&]clen=(\\d+)").find(url)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
         }
         var ranged = acceptsRanges || isGoogleVideo
-        if (total <= 0 || !ranged) {
+        if (total <= 0 || (!ranged && !preProbed)) {
             val probed = probeWithHeaderFallback(url, effectiveHeaders, allowImageContentType)
             if (probed != null) {
                 val (info, workingHeaders) = probed
@@ -102,9 +117,19 @@ class SegmentedDownloader @Inject constructor(
         val downloaded = AtomicLong(positions.indices.sumOf { positions[it] - bounds[it].first })
 
         val tracker = SpeedTracker(downloaded.get())
+        val firstBytesSignal = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+        val firstBytesNotified = java.util.concurrent.atomic.AtomicBoolean(downloaded.get() > 0L)
         val progressJob = launch(Dispatchers.Default) {
+            var firstTick = downloaded.get() <= 0L
             while (isActive) {
-                delay(Constants.PROGRESS_THROTTLE_MS)
+                if (firstTick) {
+                    firstTick = false
+                    kotlinx.coroutines.withTimeoutOrNull(Constants.PROGRESS_THROTTLE_MS) {
+                        firstBytesSignal.receiveCatching()
+                    }
+                } else {
+                    delay(Constants.PROGRESS_THROTTLE_MS)
+                }
                 emit(downloaded.get().coerceAtMost(total), total, tracker, onProgress)
                 persistPositions(idxFile, positions)
             }
@@ -115,7 +140,23 @@ class SegmentedDownloader @Inject constructor(
             coroutineScope {
                 val tasks = (0 until n).map { i ->
                     async(Dispatchers.IO) {
-                        downloadSegment(url, effectiveHeaders, dest, bounds[i], positions, i, downloaded, total, isGoogleVideo, allowImageContentType)
+                        downloadSegment(
+                            url = url,
+                            headers = effectiveHeaders,
+                            dest = dest,
+                            bound = bounds[i],
+                            positions = positions,
+                            index = i,
+                            downloaded = downloaded,
+                            total = total,
+                            isGoogleVideo = isGoogleVideo,
+                            allowImageContentType = allowImageContentType,
+                            onFirstBytes = {
+                                if (firstBytesNotified.compareAndSet(false, true)) {
+                                    firstBytesSignal.trySend(Unit)
+                                }
+                            }
+                        )
                     }
                 }
                 tasks.awaitAll()
@@ -126,6 +167,7 @@ class SegmentedDownloader @Inject constructor(
             fallbackToSingleStream = true
         } finally {
             progressJob.cancel()
+            firstBytesSignal.close()
             if (!fallbackToSingleStream) {
                 persistPositions(idxFile, positions)
             }
@@ -198,7 +240,8 @@ class SegmentedDownloader @Inject constructor(
         downloaded: AtomicLong,
         total: Long,
         isGoogleVideo: Boolean,
-        allowImageContentType: Boolean = false
+        allowImageContentType: Boolean = false,
+        onFirstBytes: (() -> Unit)? = null
     ) {
         val (_, endInclusive) = bound
         var attempt = 0
@@ -239,13 +282,16 @@ class SegmentedDownloader @Inject constructor(
                         body.byteStream().use { input ->
                             while (positions[index] <= chunkEnd) {
                                 currentCoroutineContext().ensureActive()
-                                val maxToRead = minOf(buffer.size.toLong(), chunkEnd - positions[index] + 1L).toInt()
+                                priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                val maxToRead = minOf(targetRead.toLong(), chunkEnd - positions[index] + 1L).toInt()
                                 val read = input.read(buffer, 0, maxToRead)
                                 if (read == -1) break
                                 raf.write(buffer, 0, read)
                                 positions[index] += read
                                 bytesInPass += read
                                 downloaded.addAndGet(read.toLong())
+                                onFirstBytes?.invoke()
                             }
                         }
                     }
@@ -290,9 +336,19 @@ class SegmentedDownloader @Inject constructor(
     ) = coroutineScope {
         val downloaded = AtomicLong(if (dest.exists()) dest.length() else 0L)
         val tracker = SpeedTracker(downloaded.get())
+        val firstBytesSignal = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+        val firstBytesNotified = java.util.concurrent.atomic.AtomicBoolean(downloaded.get() > 0L)
         val progressJob = launch(Dispatchers.Default) {
+            var firstTick = downloaded.get() <= 0L
             while (isActive) {
-                delay(Constants.PROGRESS_THROTTLE_MS)
+                if (firstTick) {
+                    firstTick = false
+                    kotlinx.coroutines.withTimeoutOrNull(Constants.PROGRESS_THROTTLE_MS) {
+                        firstBytesSignal.receiveCatching()
+                    }
+                } else {
+                    delay(Constants.PROGRESS_THROTTLE_MS)
+                }
                 emit(downloaded.get(), total, tracker, onProgress)
             }
         }
@@ -343,11 +399,16 @@ class SegmentedDownloader @Inject constructor(
                             body.byteStream().use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
-                                    val read = input.read(buffer)
+                                    priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                    val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                    val read = input.read(buffer, 0, targetRead)
                                     if (read == -1) break
                                     output.write(buffer, 0, read)
                                     bytesInPass += read
                                     downloaded.addAndGet(read.toLong())
+                                    if (firstBytesNotified.compareAndSet(false, true)) {
+                                        firstBytesSignal.trySend(Unit)
+                                    }
                                 }
                             }
                             output.flush()
@@ -389,6 +450,7 @@ class SegmentedDownloader @Inject constructor(
             }
         } finally {
             progressJob.cancel()
+            firstBytesSignal.close()
         }
         val actualFinal = dest.length()
         val finalTotal = if (total > 0L) maxOf(total, actualFinal) else actualFinal

@@ -51,7 +51,7 @@ class HtmlMediaExtractor @Inject constructor(
         headlessWebExtractor: HeadlessWebExtractor
     ) : this(http, hlsExtractor, dashExtractor, headlessWebExtractor, ExtractionProgressTracker())
 
-    private val portalResolver = StreamingPortalResolver(
+    internal val portalResolver = StreamingPortalResolver(
         http = http,
         hlsExtractor = hlsExtractor,
         dashExtractor = dashExtractor,
@@ -124,15 +124,29 @@ class HtmlMediaExtractor @Inject constructor(
             clearCloudflareChallengeHint(host)
         }
 
-        // Short-TTL Cloudflare fast-skip: if this host just returned HTTP 403 (cf-mitigated) and
-        // CookieManager has no cf_clearance yet, jump straight to HeadlessWebExtractor instead of
-        // wasting time on another blocked plain-HTTP fetch.
+        // Publish immediate human-readable title preview from URL slug for portal watch/download
+        // pages so the loading sheet shows the movie/episode title at 0ms before network I/O completes.
+        if (allowHeadlessFallback && host.isNotEmpty() && InterceptedMediaExtractor.isPortalWatchOrDownloadUrl(url)) {
+            val slugTitle = HtmlThumbnailExtractor.humanReadableTitleFromUrl(url)
+                ?.takeIf { !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url) }
+            if (slugTitle != null) {
+                progressTracker.updatePreview(
+                    title = slugTitle,
+                    sourceHost = host,
+                    sourceUrl = url
+                )
+            }
+        }
+
+        // 15-minute Cloudflare fast-skip: if this host recently returned HTTP 403 (cf-mitigated)
+        // and CookieManager still has no cf_clearance, jump straight to HeadlessWebExtractor
+        // instead of wasting another blocked plain-HTTP round-trip.
         if (allowHeadlessFallback && host.isNotEmpty() && !hasCfClearance && isCloudflareChallengeHintActive(host)) {
             com.melmeligy.mediadownloader.core.AppLogger.d(
                 "HtmlExtractor",
                 "Skipping blocked static fetch for host=$host (active CF challenge hint, no cf_clearance)"
             )
-            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            progressTracker.update(ExtractionProgressTracker.STAGE_CLOUDFLARE)
             val headlessResult = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -152,6 +166,7 @@ class HtmlMediaExtractor @Inject constructor(
         }
 
         var staticFetchFailureNote: String? = null
+        var sawCloudflareChallenge = false
         val html = try {
             withTimeoutOrNull(INITIAL_PAGE_TIMEOUT_MS) {
                 withCancellableHttpCalls(timeoutMs = INITIAL_PAGE_TIMEOUT_MS) {
@@ -163,6 +178,7 @@ class HtmlMediaExtractor @Inject constructor(
         } catch (me: com.melmeligy.mediadownloader.core.MediaException) {
             if (me.error == com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED && host.isNotEmpty() && !hasCfClearance) {
                 markCloudflareChallengeHint(host)
+                sawCloudflareChallenge = true
             }
             staticFetchFailureNote = when (me.error) {
                 com.melmeligy.mediadownloader.core.AppError.ACCESS_DENIED ->
@@ -184,7 +200,10 @@ class HtmlMediaExtractor @Inject constructor(
                 staticFetchFailureNote?.let { progressTracker.setDiagnosticReason(it) }
                 return@withContext null
             }
-            progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
+            progressTracker.update(
+                if (sawCloudflareChallenge) ExtractionProgressTracker.STAGE_CLOUDFLARE
+                else ExtractionProgressTracker.STAGE_HEADLESS
+            )
             val headlessResult = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -221,15 +240,31 @@ class HtmlMediaExtractor @Inject constructor(
             return@withContext parsed
         }
         if (allowHeadlessFallback && (parsed == null || looksLikeStreamingOrEmbedPage(html))) {
+            val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
+            if (fallbackDoc != null && portalResolver.isDecoyAdTrackerPortalPage(fallbackDoc, html)) {
+                progressTracker.setDiagnosticReason(
+                    "This page only links to external ad-redirect trackers and does not host a playable video stream."
+                )
+                com.melmeligy.mediadownloader.core.AppLogger.w(
+                    "HtmlExtractor",
+                    "Skipping headless fallback for decoy ad-tracker portal page host=$host"
+                )
+                return@withContext null
+            }
             progressTracker.update(ExtractionProgressTracker.STAGE_HEADLESS)
             com.melmeligy.mediadownloader.core.AppLogger.d("HtmlExtractor", "Stage 2 headless fallback start host=${UrlUtils.host(url)}")
-            val fallbackDoc = runCatching { Jsoup.parse(html, url) }.getOrNull()
             val fallbackTitle = parsed?.title?.takeIf {
                 !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, url)
             } ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractTitle(it, url) }
             val fallbackThumb = parsed?.thumbnailUrl?.takeIf { it.isNotBlank() }
                 ?: fallbackDoc?.let { HtmlThumbnailExtractor.extractThumbnail(it, url, html) }
             HeadlessWebExtractor.hintPageMetadata(url, fallbackTitle, fallbackThumb)
+            progressTracker.updatePreview(
+                title = fallbackTitle,
+                thumbnailUrl = fallbackThumb,
+                sourceHost = host,
+                sourceUrl = url
+            )
             val headless = try {
                 headlessWebExtractor.extract(url)
             } catch (ce: CancellationException) {
@@ -308,6 +343,18 @@ class HtmlMediaExtractor @Inject constructor(
     ): ResolvedMedia? = coroutineScope {
         if (html.isBlank()) return@coroutineScope null
         val doc = Jsoup.parse(html, pageUrl)
+        // Publish live preview title & poster immediately on top-level pages before slow embed/server probes
+        if (allowEmbedFollow) {
+            val earlyTitle = HtmlThumbnailExtractor.extractTitle(doc, pageUrl)
+                .takeIf { !HtmlThumbnailExtractor.isGenericHostOrPlaceholderTitle(it, pageUrl) }
+            val earlyThumb = HtmlThumbnailExtractor.extractThumbnail(doc, pageUrl, html)
+            progressTracker.updatePreview(
+                title = earlyTitle,
+                thumbnailUrl = earlyThumb,
+                sourceHost = UrlUtils.host(pageUrl),
+                sourceUrl = pageUrl
+            )
+        }
         val found = LinkedHashMap<String, MediaStream>()
         var counter = 0
         var customTitle: String? = null
@@ -1622,7 +1669,7 @@ class HtmlMediaExtractor @Inject constructor(
         private const val INITIAL_PAGE_TIMEOUT_MS = 6_000L
         private const val IFRAME_FALLBACK_TIMEOUT_MS = 3_500L
         private const val DIRECT_PROBE_TIMEOUT_MS = 2_000L
-        internal const val CF_HINT_TTL_MS = 180_000L
+        internal const val CF_HINT_TTL_MS = 900_000L
         private val cfChallengeHints = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
         internal fun clearAllCloudflareHintsForTests() {

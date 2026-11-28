@@ -42,6 +42,8 @@ class BrowserViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     val loadingStage: StateFlow<String> = progressTracker.stage
+    val previewMetadata: StateFlow<com.melmeligy.mediadownloader.extractor.ExtractionProgressTracker.PreviewMetadata?> =
+        progressTracker.preview
 
     /** Everything the interception layer found on the page currently being viewed. */
     val detections: StateFlow<List<MediaStreamPayload>> = interceptionEngine.detections
@@ -58,6 +60,7 @@ class BrowserViewModel @Inject constructor(
     private var resolveJob: kotlinx.coroutines.Job? = null
     private var sizeRefineJob: kotlinx.coroutines.Job? = null
     private var thumbCacheJob: kotlinx.coroutines.Job? = null
+    private var hlsPrewarmJob: kotlinx.coroutines.Job? = null
     private var currentSheetUrl: String = ""
 
     init {
@@ -73,6 +76,7 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
+        hlsPrewarmJob?.cancel()
         progressTracker.reset()
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
     }
@@ -84,6 +88,8 @@ class BrowserViewModel @Inject constructor(
         sizeRefineJob = null
         thumbCacheJob?.cancel()
         thumbCacheJob = null
+        hlsPrewarmJob?.cancel()
+        hlsPrewarmJob = null
         progressTracker.reset()
     }
 
@@ -92,20 +98,25 @@ class BrowserViewModel @Inject constructor(
         resolveJob?.cancel()
         sizeRefineJob?.cancel()
         thumbCacheJob?.cancel()
-        progressTracker.reset()
+        hlsPrewarmJob?.cancel()
+        val sessionId = progressTracker.beginSession(targetUrl = targetUrl)
         _formatState.value = com.melmeligy.mediadownloader.core.Resource.Loading
         if (interceptionEngine.payloadsFor(targetUrl).isNotEmpty()) {
             (mediaRepository as? com.melmeligy.mediadownloader.data.repository.MediaRepositoryImpl)?.invalidateCache(targetUrl)
         }
         resolveJob = viewModelScope.launch {
             val nextState = try {
-                com.melmeligy.mediadownloader.core.Resource.Success(mediaRepository.resolve(targetUrl))
+                com.melmeligy.mediadownloader.core.Resource.Success(
+                    progressTracker.runInSession(sessionId) {
+                        mediaRepository.resolve(targetUrl)
+                    }
+                )
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: com.melmeligy.mediadownloader.core.MediaException) {
                 val explicit = e.message?.takeIf { it.isNotBlank() && it != e.error.name }
                 val detail = explicit
-                    ?: progressTracker.peekDiagnosticReason()
+                    ?: progressTracker.peekDiagnosticReasonForSession(sessionId)
                     ?: if (e.error == com.melmeligy.mediadownloader.core.AppError.NO_MEDIA_FOUND) {
                         "No playable video or audio stream was exposed by this page."
                     } else null
@@ -116,9 +127,17 @@ class BrowserViewModel @Inject constructor(
                     e.message
                 )
             }
+            if (sessionId != progressTracker.activeSessionId()) return@launch
             _formatState.value = nextState
             if (nextState is com.melmeligy.mediadownloader.core.Resource.Success) {
                 val resolved = nextState.data
+                if (resolved.streams.any { it.isHls }) {
+                    hlsPrewarmJob = viewModelScope.launch {
+                        runCatching {
+                            streamSizeRefiner.prewarmDefaultHlsVariant(resolved, settings.value.defaultVideoQuality)
+                        }
+                    }
+                }
                 if (streamSizeRefiner.needsRefinement(resolved)) {
                     sizeRefineJob = viewModelScope.launch {
                         val refined = runCatching { streamSizeRefiner.refineMissingSizes(resolved) }.getOrNull()

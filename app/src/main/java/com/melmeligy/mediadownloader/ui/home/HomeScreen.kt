@@ -94,6 +94,7 @@ fun HomeScreen(
             val clean = UrlUtils.extractFirstUrl(raw) ?: if (viewModel.isUrl(raw)) UrlUtils.normalize(raw) else null
             if (clean != null) {
                 clipboardUrl = clean
+                viewModel.onClipboardUrlDetected(clean)
                 if (input.isBlank()) {
                     input = clean
                 }

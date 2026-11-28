@@ -15,7 +15,7 @@ object Constants {
     // Networking
     const val DEFAULT_USER_AGENT =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
-            "Chrome/124.0.0.0 Mobile Safari/537.36"
+            "Chrome/138.0.0.0 Mobile Safari/537.36"
     const val CONNECT_TIMEOUT_SECONDS = 20L
     const val READ_TIMEOUT_SECONDS = 30L
     const val WRITE_TIMEOUT_SECONDS = 30L

@@ -46,10 +46,24 @@ import javax.inject.Singleton
  * - Retries transient `429`/`5xx`/network errors cleanly while respecting configured retry counts.
  */
 @Singleton
-class HlsSegmentDownloader @Inject constructor(
+class HlsSegmentDownloader private constructor(
     private val client: OkHttpClient,
-    private val http: ExtractorHttp
+    private val http: ExtractorHttp,
+    private val priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator?,
+    @Suppress("UNUSED_PARAMETER") marker: Boolean
 ) {
+
+    @Inject
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp,
+        priorityCoordinator: com.melmeligy.mediadownloader.core.ExtractionPriorityCoordinator
+    ) : this(client, http, priorityCoordinator, true)
+
+    constructor(
+        client: OkHttpClient,
+        http: ExtractorHttp
+    ) : this(client, http, null, false)
 
     internal data class HlsSegment(
         val url: String,
@@ -84,20 +98,81 @@ class HlsSegmentDownloader @Inject constructor(
         expectedTotalBytes: Long,
         maxRetries: Int,
         onProgress: ProgressCallback
+    ) {
+        val usedCachedPlaylist = java.util.concurrent.atomic.AtomicBoolean(false)
+        val completedBeforeFailure = AtomicInteger(0)
+        val resolvedMediaUrl = java.util.concurrent.atomic.AtomicReference(playlistUrl)
+        try {
+            downloadInternal(
+                playlistUrl = playlistUrl,
+                headers = headers,
+                dest = dest,
+                expectedTotalBytes = expectedTotalBytes,
+                maxRetries = maxRetries,
+                allowPlaylistCache = true,
+                usedCachedPlaylistOut = usedCachedPlaylist,
+                completedMediaSegmentsOut = completedBeforeFailure,
+                resolvedMediaUrlOut = resolvedMediaUrl,
+                onProgress = onProgress
+            )
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (e: MediaException) {
+            val isStaleCacheFailure = usedCachedPlaylist.get() &&
+                completedBeforeFailure.get() == 0 &&
+                (e.error == AppError.ACCESS_DENIED || e.error == AppError.EXPIRED_LINK || e.error == AppError.NO_MEDIA_FOUND)
+            if (!isStaleCacheFailure) throw e
+            // Cached playlist segments expired/rejected before any segment completed -> invalidate & retry live once.
+            com.melmeligy.mediadownloader.extractor.HlsPlaylistCache.shared.invalidate(playlistUrl)
+            val finalMediaUrl = resolvedMediaUrl.get()
+            if (finalMediaUrl != playlistUrl) {
+                com.melmeligy.mediadownloader.extractor.HlsPlaylistCache.shared.invalidate(finalMediaUrl)
+            }
+            downloadInternal(
+                playlistUrl = playlistUrl,
+                headers = headers,
+                dest = dest,
+                expectedTotalBytes = expectedTotalBytes,
+                maxRetries = maxRetries,
+                allowPlaylistCache = false,
+                usedCachedPlaylistOut = java.util.concurrent.atomic.AtomicBoolean(false),
+                completedMediaSegmentsOut = AtomicInteger(0),
+                resolvedMediaUrlOut = java.util.concurrent.atomic.AtomicReference(playlistUrl),
+                onProgress = onProgress
+            )
+        }
+    }
+
+    private suspend fun downloadInternal(
+        playlistUrl: String,
+        headers: Map<String, String>,
+        dest: File,
+        expectedTotalBytes: Long,
+        maxRetries: Int,
+        allowPlaylistCache: Boolean,
+        usedCachedPlaylistOut: java.util.concurrent.atomic.AtomicBoolean,
+        completedMediaSegmentsOut: AtomicInteger,
+        resolvedMediaUrlOut: java.util.concurrent.atomic.AtomicReference<String>,
+        onProgress: ProgressCallback
     ) = coroutineScope {
         var effectiveHeaders = headers
         var mediaUrl = playlistUrl
-        val firstFetch = fetchPlaylistWithHeaderFallback(playlistUrl, effectiveHeaders)
-        var text = firstFetch.first
-        effectiveHeaders = firstFetch.second
+        val firstFetch = fetchPlaylistWithHeaderFallback(playlistUrl, effectiveHeaders, allowPlaylistCache)
+        var text = firstFetch.text
+        mediaUrl = firstFetch.finalUrl
+        effectiveHeaders = firstFetch.headers
+        if (firstFetch.fromCache) usedCachedPlaylistOut.set(true)
 
         if (text.contains("#EXT-X-STREAM-INF")) {
-            mediaUrl = firstVariantUrl(text, playlistUrl)
+            val nextVariant = firstVariantUrl(text, mediaUrl)
                 ?: throw MediaException(AppError.NO_MEDIA_FOUND, "No HLS variant found")
-            val variantFetch = fetchPlaylistWithHeaderFallback(mediaUrl, effectiveHeaders)
-            text = variantFetch.first
-            effectiveHeaders = variantFetch.second
+            val variantFetch = fetchPlaylistWithHeaderFallback(nextVariant, effectiveHeaders, allowPlaylistCache)
+            text = variantFetch.text
+            mediaUrl = variantFetch.finalUrl
+            effectiveHeaders = variantFetch.headers
+            if (variantFetch.fromCache) usedCachedPlaylistOut.set(true)
         }
+        resolvedMediaUrlOut.set(mediaUrl)
 
         val sanitized = HlsPlaylistSanitizer.parseAndSanitize(text, mediaUrl)
         if (sanitized.hasUnsupportedDrm) {
@@ -164,6 +239,8 @@ class HlsSegmentDownloader @Inject constructor(
         val written = AtomicLong(initialWritten)
         val completedMediaSegments = AtomicInteger(initialCompletedSegs)
         val tracker = SpeedTracker(initialWritten)
+        val firstBytesSignal = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+        val firstBytesNotified = java.util.concurrent.atomic.AtomicBoolean(initialWritten > 0L)
 
         fun computeSegmentDrivenTotal(currentWritten: Long): Long {
             if (exactByteRangeTotal > 0L) {
@@ -192,8 +269,16 @@ class HlsSegmentDownloader @Inject constructor(
         }
 
         val progressJob = launch(Dispatchers.Default) {
+            var firstTick = initialWritten <= 0L
             while (isActive) {
-                delay(Constants.PROGRESS_THROTTLE_MS)
+                if (firstTick) {
+                    firstTick = false
+                    kotlinx.coroutines.withTimeoutOrNull(Constants.PROGRESS_THROTTLE_MS) {
+                        firstBytesSignal.receiveCatching()
+                    }
+                } else {
+                    delay(Constants.PROGRESS_THROTTLE_MS)
+                }
                 val bytes = written.get()
                 val estTotal = computeSegmentDrivenTotal(bytes)
                 val speed = tracker.sample(bytes)
@@ -207,6 +292,7 @@ class HlsSegmentDownloader @Inject constructor(
         val maxConcurrent = if (cdnLimit != null) minOf(CONCURRENT_SEGMENTS, cdnLimit) else CONCURRENT_SEGMENTS
         val semaphore = Semaphore(maxConcurrent)
         val effectiveRetries = maxRetries.coerceAtLeast(0)
+        val canEmitImmediateFirstBytes = exactByteRangeTotal > 0L || hintedTotal > 0L
         val tasks = segments.mapIndexed { index, segment ->
             async(Dispatchers.IO) {
                 val partFile = File(partsDir, "seg_$index.part")
@@ -227,10 +313,21 @@ class HlsSegmentDownloader @Inject constructor(
                         keyBytes = keyBytes,
                         maxRetries = effectiveRetries,
                         partFile = partFile,
-                        written = written
+                        written = written,
+                        onFirstBytes = if (canEmitImmediateFirstBytes) {
+                            {
+                                if (firstBytesNotified.compareAndSet(false, true)) {
+                                    firstBytesSignal.trySend(Unit)
+                                }
+                            }
+                        } else null
                     )
                     if (!segment.isInitMap) {
-                        completedMediaSegments.incrementAndGet()
+                        val done = completedMediaSegments.incrementAndGet()
+                        completedMediaSegmentsOut.set(done)
+                        if (done == 1 && firstBytesNotified.compareAndSet(false, true)) {
+                            firstBytesSignal.trySend(Unit)
+                        }
                     }
                     partFile
                 }
@@ -256,6 +353,7 @@ class HlsSegmentDownloader @Inject constructor(
             succeeded = true
         } finally {
             progressJob.cancel()
+            firstBytesSignal.close()
             tasks.forEach { it.cancel() }
             if (succeeded) {
                 runCatching { partsDir.deleteRecursively() }
@@ -311,12 +409,37 @@ class HlsSegmentDownloader @Inject constructor(
         return keys
     }
 
+    private data class FetchedPlaylist(
+        val text: String,
+        val finalUrl: String,
+        val headers: Map<String, String>,
+        val fromCache: Boolean
+    )
+
     private suspend fun fetchPlaylistWithHeaderFallback(
         url: String,
-        primaryHeaders: Map<String, String>
-    ): Pair<String, Map<String, String>> {
+        primaryHeaders: Map<String, String>,
+        allowCache: Boolean = true
+    ): FetchedPlaylist {
+        if (allowCache) {
+            val cached = com.melmeligy.mediadownloader.extractor.HlsPlaylistCache.shared.take(url, primaryHeaders)
+            if (cached != null && com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(cached.text)) {
+                val mergedHeaders = LinkedHashMap<String, String>(primaryHeaders).apply {
+                    for ((k, v) in cached.headers) {
+                        putIfAbsent(k, v)
+                    }
+                }
+                return FetchedPlaylist(
+                    text = cached.text,
+                    finalUrl = cached.finalUrl.ifBlank { url },
+                    headers = mergedHeaders,
+                    fromCache = true
+                )
+            }
+        }
         try {
-            return http.fetchString(url, primaryHeaders) to primaryHeaders
+            val text = http.fetchString(url, primaryHeaders)
+            return FetchedPlaylist(text = text, finalUrl = url, headers = primaryHeaders, fromCache = false)
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
         } catch (e: MediaException) {
@@ -330,7 +453,7 @@ class HlsSegmentDownloader @Inject constructor(
                     null
                 }
                 if (com.melmeligy.mediadownloader.intercept.MediaSniffer.isValidHlsPlaylistBody(text)) {
-                    return text!! to alt
+                    return FetchedPlaylist(text = text!!, finalUrl = url, headers = alt, fromCache = false)
                 }
             }
             throw e
@@ -343,7 +466,8 @@ class HlsSegmentDownloader @Inject constructor(
         keyBytes: ByteArray?,
         maxRetries: Int,
         partFile: File,
-        written: AtomicLong
+        written: AtomicLong,
+        onFirstBytes: (() -> Unit)? = null
     ): Long {
         var activeHeaders = headers
         val relaxedHeaderQueue = ArrayDeque(
@@ -353,6 +477,7 @@ class HlsSegmentDownloader @Inject constructor(
         val buffer = ByteArray(Constants.DOWNLOAD_BUFFER_SIZE)
         while (true) {
             currentCoroutineContext().ensureActive()
+            priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
             var attemptBytes = 0L
             try {
                 val reqBuilder = http.buildRequest(segment.url, activeHeaders)
@@ -408,7 +533,9 @@ class HlsSegmentDownloader @Inject constructor(
                             effectiveInput.use { input ->
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
-                                    val read = input.read(buffer)
+                                    priorityCoordinator?.yieldDownloadChunkIfExtractionActive()
+                                    val targetRead = priorityCoordinator?.recommendedReadSize(buffer.size) ?: buffer.size
+                                    val read = input.read(buffer, 0, targetRead)
                                     if (read == -1) break
                                     if (!checkedSignature) {
                                         checkedSignature = true
@@ -438,11 +565,13 @@ class HlsSegmentDownloader @Inject constructor(
                                         output.write(buffer, 0, bufferedLen)
                                         attemptBytes += bufferedLen
                                         written.addAndGet(bufferedLen.toLong())
+                                        onFirstBytes?.invoke()
                                         continue
                                     }
                                     output.write(buffer, 0, read)
                                     attemptBytes += read
                                     written.addAndGet(read.toLong())
+                                    onFirstBytes?.invoke()
                                 }
                             }
                         }

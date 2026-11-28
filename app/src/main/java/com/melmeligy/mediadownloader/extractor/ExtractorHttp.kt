@@ -148,8 +148,21 @@ class ExtractorHttp {
     private val client: OkHttpClient
     private val service: RawContentService?
 
-    private val probeClient: OkHttpClient by lazy {
+    private val extractionDispatcher: okhttp3.Dispatcher by lazy {
+        okhttp3.Dispatcher().apply {
+            maxRequests = 48
+            maxRequestsPerHost = 16
+        }
+    }
+
+    private val extractionClient: OkHttpClient by lazy {
         client.newBuilder()
+            .dispatcher(extractionDispatcher)
+            .build()
+    }
+
+    private val probeClient: OkHttpClient by lazy {
+        extractionClient.newBuilder()
             .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(3, TimeUnit.SECONDS)
             .writeTimeout(3, TimeUnit.SECONDS)
@@ -158,7 +171,7 @@ class ExtractorHttp {
     }
 
     private val redirectClient: OkHttpClient by lazy {
-        client.newBuilder()
+        extractionClient.newBuilder()
             .connectTimeout(3, TimeUnit.SECONDS)
             .readTimeout(3, TimeUnit.SECONDS)
             .callTimeout(3500, TimeUnit.MILLISECONDS)
@@ -168,7 +181,7 @@ class ExtractorHttp {
     }
 
     private val noRedirectClient: OkHttpClient by lazy {
-        client.newBuilder()
+        extractionClient.newBuilder()
             .connectTimeout(2, TimeUnit.SECONDS)
             .readTimeout(2, TimeUnit.SECONDS)
             .callTimeout(2200, TimeUnit.MILLISECONDS)
@@ -251,33 +264,7 @@ class ExtractorHttp {
         val scopedTimeout = ExtractorHttpScope.currentTimeoutMs()
         val merged = withUserAgent(headers) + ("X-Internal-Download" to "true")
         if (service == null || scopedTimeout != null || ExtractorHttpScope.currentRegistry() != null) {
-            return withContext(Dispatchers.IO) {
-                val request = buildRequest(safeUrl, headers)
-                    .header("X-Internal-Download", "true")
-                    .get()
-                    .build()
-                val effectiveClient = clientWithScopedTimeout(client)
-                try {
-                    executeTracked(effectiveClient, request) { response ->
-                        val ct = response.header("Content-Type")
-                        markIfHtml(url, ct)
-                        if (!response.isSuccessful) throw mapHttpError(response.code)
-                        val text = response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
-                        markIfHtml(url, ct ?: text.take(128))
-                        text
-                    }
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (e: MediaException) {
-                    throw e
-                } catch (e: UnknownHostException) {
-                    currentCoroutineContext().ensureActive()
-                    throw MediaException(AppError.NO_INTERNET, e.message, e)
-                } catch (e: IOException) {
-                    currentCoroutineContext().ensureActive()
-                    throw MediaException(AppError.GENERIC, e.message, e)
-                }
-            }
+            return fetchTextWithFinalUrl(url, headers).text
         }
         val response = try {
             service.fetch(safeUrl, merged)
@@ -292,12 +279,79 @@ class ExtractorHttp {
         }
         response.body().use { body ->
             val ct = response.headers()["Content-Type"]
-            markIfHtml(url, ct)
-            if (!response.isSuccessful) throw mapHttpError(response.code())
+            val code = response.code()
+            markIfHtml(url, ct, code)
+            if (!response.isSuccessful) throw mapHttpError(code)
             val text = body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
-            markIfHtml(url, ct ?: text.take(128))
+            markIfHtml(url, ct ?: text.take(128), code)
             return text
         }
+    }
+
+    data class TextFetchResult(
+        val text: String,
+        val finalUrl: String
+    )
+
+    /**
+     * Fetches [url] as text over OkHttp and returns both the response body and the post-redirect
+     * final request URL so relative HLS/DASH playlist URIs resolve against the real CDN edge URL.
+     */
+    suspend fun fetchTextWithFinalUrl(
+        url: String,
+        headers: Map<String, String> = emptyMap()
+    ): TextFetchResult = withContext(Dispatchers.IO) {
+        val safeUrl = UrlUtils.encodeNonAsciiUrl(url.trim())
+        val request = buildRequest(safeUrl, headers)
+            .header("X-Internal-Download", "true")
+            .get()
+            .build()
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
+        try {
+            executeTracked(effectiveClient, request) { response ->
+                val ct = response.header("Content-Type")
+                val code = response.code
+                val isCfChallenge = isCloudflareChallengeHeaders(code, response.header("cf-mitigated"), response.header("server"))
+                if (isCfChallenge) {
+                    throw MediaException(AppError.ACCESS_DENIED, "Cloudflare challenge (HTTP $code)")
+                }
+                markIfHtml(url, ct, code)
+                if (!response.isSuccessful) throw mapHttpError(code)
+                val text = response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
+                markIfHtml(url, ct ?: text.take(128), code)
+                TextFetchResult(
+                    text = text,
+                    finalUrl = response.request.url.toString().ifBlank { url }
+                )
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: MediaException) {
+            throw e
+        } catch (e: UnknownHostException) {
+            currentCoroutineContext().ensureActive()
+            throw MediaException(AppError.NO_INTERNET, e.message, e)
+        } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
+            throw MediaException(AppError.GENERIC, e.message, e)
+        }
+    }
+
+    /**
+     * Lightweight non-blocking DNS pre-warm for a pasted/clipboard URL so the subsequent
+     * extraction saves DNS resolution latency without triggering heavy page loads.
+     */
+    suspend fun prewarmConnection(url: String) = withContext(Dispatchers.IO) {
+        val host = UrlUtils.host(url)?.trim()?.takeIf { it.isNotEmpty() } ?: return@withContext
+        runCatching {
+            client.dns.lookup(host)
+        }
+    }
+
+    private fun isCloudflareChallengeHeaders(code: Int, cfMitigated: String?, server: String?): Boolean {
+        if (code != 403 && code != 503) return false
+        if (cfMitigated?.contains("challenge", ignoreCase = true) == true) return true
+        return code == 503 && server?.contains("cloudflare", ignoreCase = true) == true
     }
 
     data class HtmlFetchResult(
@@ -314,7 +368,7 @@ class ExtractorHttp {
     }.getOrNull()
 
     /**
-     * Fetches [url] as HTML using [client] and returns the body alongside any session cookies
+     * Fetches [url] as HTML using [extractionClient] and returns the body alongside any session cookies
      * (`Set-Cookie` across redirects + active [okhttp3.CookieJar] cookies).
      */
     suspend fun fetchHtmlWithCookies(
@@ -326,14 +380,15 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .get()
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             executeTracked(effectiveClient, request) { response ->
                 val ct = response.header("Content-Type")
-                markIfHtml(url, ct)
-                if (!response.isSuccessful) throw mapHttpError(response.code)
+                val code = response.code
+                markIfHtml(url, ct, code)
+                if (!response.isSuccessful) throw mapHttpError(code)
                 val text = response.body?.string() ?: throw MediaException(AppError.NO_MEDIA_FOUND)
-                markIfHtml(url, ct ?: text.take(128))
+                markIfHtml(url, ct ?: text.take(128), code)
 
                 val cookieMap = LinkedHashMap<String, String>()
                 // Seed from CookieJar first
@@ -388,7 +443,7 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .post(jsonBody.toRequestBody(mediaType))
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             return executeTracked(effectiveClient, request) { response ->
                 if (!response.isSuccessful) throw mapHttpError(response.code)
@@ -412,7 +467,7 @@ class ExtractorHttp {
             .header("X-Internal-Download", "true")
             .post(formBody.toRequestBody(mediaType))
             .build()
-        val effectiveClient = clientWithScopedTimeout(client)
+        val effectiveClient = clientWithScopedTimeout(extractionClient)
         try {
             return executeTracked(effectiveClient, request) { response ->
                 if (!response.isSuccessful) throw mapHttpError(response.code)
@@ -645,7 +700,7 @@ class ExtractorHttp {
                     return@executeTracked executeTracked(headClient, headReq) { headResp ->
                         if (headResp.code == 404 || headResp.code == 410) throw mapHttpError(headResp.code)
                         val ct = headResp.header("Content-Type")?.substringBefore(';')?.trim()
-                        markIfHtml(url, ct)
+                        markIfHtml(url, ct, headResp.code)
                         val acceptsRanges = headResp.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
                         val total = headResp.header("Content-Length")?.toLongOrNull() ?: -1L
                         HeadInfo(
@@ -659,7 +714,7 @@ class ExtractorHttp {
                 }
 
                 val contentType = response.header("Content-Type")?.substringBefore(';')?.trim()
-                markIfHtml(url, contentType)
+                markIfHtml(url, contentType, response.code)
                 val acceptsRanges = response.code == 206 ||
                     response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
                 val total = parseTotalLength(
@@ -686,11 +741,25 @@ class ExtractorHttp {
         }
     }
 
-    private fun markIfHtml(url: String, contentTypeOrSnippet: String?) {
+    private fun markIfHtml(url: String, contentTypeOrSnippet: String?, statusCode: Int = 200) {
+        // Never poison confirmedHtmlUrls with transient 5xx gateway error pages (e.g. HTTP 502 Bad Gateway)
+        // or with HLS/DASH/disguised-HLS stream manifest URLs that may retry with alternate headers.
+        if (statusCode >= 500) return
+        if (isManifestCandidateUrl(url)) return
         val v = contentTypeOrSnippet?.trim()?.lowercase() ?: return
         if (v.startsWith("text/html") || v.startsWith("<!doctype html") || v.startsWith("<html")) {
             ExtractorRegistry.markConfirmedHtml(url)
         }
+    }
+
+    private fun isManifestCandidateUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        val ext = UrlUtils.fileExtension(url)?.lowercase()
+        return ext == "m3u8" ||
+            ext == "mpd" ||
+            lower.contains(".m3u8") ||
+            lower.contains(".mpd") ||
+            com.melmeligy.mediadownloader.intercept.MediaSniffer.isDisguisedHlsUrl(url)
     }
 
     private fun parseTotalLength(contentRange: String?, contentLength: String?, code: Int): Long {
@@ -701,7 +770,9 @@ class ExtractorHttp {
 
     fun buildRequest(url: String, headers: Map<String, String>): Request.Builder {
         val safeUrl = UrlUtils.encodeNonAsciiUrl(url.trim())
-        val builder = Request.Builder().url(safeUrl)
+        val builder = Request.Builder()
+            .url(safeUrl)
+            .header("X-Internal-Probe", "true")
         withUserAgent(headers).forEach { (k, v) -> builder.header(k, v) }
         return builder
     }
